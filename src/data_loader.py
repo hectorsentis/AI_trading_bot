@@ -11,6 +11,7 @@ from config import (
     PRICES_TABLE,
     INGESTION_LOG_TABLE,
     DATA_GAPS_TABLE,
+    DATA_COVERAGE_TABLE,
     QUALITY_LOGS_DIR,
 )
 
@@ -80,6 +81,19 @@ def init_db():
         gap_end_utc TEXT,
         missing_bars INTEGER,
         detected_at_utc TEXT
+    )
+    """)
+
+    conn.execute(f"""
+    CREATE TABLE IF NOT EXISTS {DATA_COVERAGE_TABLE} (
+        dataset TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        timeframe TEXT NOT NULL,
+        min_datetime_utc TEXT,
+        max_datetime_utc TEXT,
+        row_count INTEGER NOT NULL,
+        updated_at_utc TEXT NOT NULL,
+        PRIMARY KEY (dataset, symbol, timeframe)
     )
     """)
 
@@ -302,6 +316,47 @@ def export_gap_report(symbol: str, timeframe: str, gaps_df: pd.DataFrame):
     print(f"    → gap report: {output_path}")
 
 
+def update_price_coverage(symbol: str, timeframe: str):
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        row = pd.read_sql_query(
+            f"""
+            SELECT
+                MIN(datetime_utc) AS min_datetime_utc,
+                MAX(datetime_utc) AS max_datetime_utc,
+                COUNT(*) AS row_count
+            FROM {PRICES_TABLE}
+            WHERE symbol = ? AND timeframe = ?
+            """,
+            conn,
+            params=(symbol, timeframe),
+        )
+
+        min_dt = row.loc[0, "min_datetime_utc"]
+        max_dt = row.loc[0, "max_datetime_utc"]
+        row_count = int(row.loc[0, "row_count"])
+
+        conn.execute(
+            f"""
+            INSERT OR REPLACE INTO {DATA_COVERAGE_TABLE} (
+                dataset, symbol, timeframe, min_datetime_utc, max_datetime_utc, row_count, updated_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "prices",
+                symbol,
+                timeframe,
+                min_dt,
+                max_dt,
+                row_count,
+                pd.Timestamp.now(tz="UTC").isoformat(),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def run_gap_checks_for_symbols(symbol_timeframes: set[tuple[str, str]]):
     if not symbol_timeframes:
         print("\nNo hay símbolos nuevos que revisar.")
@@ -368,6 +423,9 @@ def process_all_raw():
     print("\n=== RESUMEN INGESTA ===")
     print(f"Archivos nuevos procesados: {total_files}")
     print(f"Filas cargadas/upsert: {total_rows_loaded}")
+
+    for symbol, timeframe in sorted(processed_symbols):
+        update_price_coverage(symbol, timeframe)
 
     return processed_symbols
 

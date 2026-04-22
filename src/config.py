@@ -24,8 +24,11 @@ PRICES_TABLE = "prices"
 FEATURES_TABLE = "features"
 SIGNALS_TABLE = "signals"
 ORDERS_TABLE = "orders"
+POSITIONS_TABLE = "positions"
 INGESTION_LOG_TABLE = "ingestion_log"
 DATA_GAPS_TABLE = "data_gaps"
+DATA_COVERAGE_TABLE = "data_coverage"
+MODEL_REGISTRY_TABLE = "model_registry"
 
 PRICE_PRIMARY_KEY = ["symbol", "timeframe", "datetime_utc"]
 
@@ -172,6 +175,9 @@ FEATURE_COLUMNS = [
     "hour_cos",
 ]
 
+FEATURE_VERSION = "v1"
+LABEL_VERSION = "triple_barrier_v1"
+
 LOOKAHEAD_BARS = 6
 TP_MULTIPLIER = 1.5
 SL_MULTIPLIER = 1.0
@@ -193,3 +199,5 @@ TRAIN_SIZE = 250
 TEST_SIZE = 50
 RETRAIN_STEP = 50
 COST_PER_TRADE = 0.0005
+
+MIN_TRAIN_ROWS = 1000

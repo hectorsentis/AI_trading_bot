@@ -10,6 +10,10 @@ __pycache__/
 # Data (NO subir datos)
 data/
 logs/
+models/
+reports/
+*.sqlite
+*.sqlite3
 
 # OS
 .DS_Store
@@ -20,3 +24,14 @@ Thumbs.db
 
 # Secrets
 .env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+
+# Local tooling / personal workspace
+.codex/
