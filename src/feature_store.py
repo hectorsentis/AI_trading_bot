@@ -1,6 +1,7 @@
 import argparse
 import sqlite3
 from typing import Iterable
+import re
 
 import pandas as pd
 
@@ -16,6 +17,8 @@ from config import (
     LOOKAHEAD_BARS,
     TP_MULTIPLIER,
     SL_MULTIPLIER,
+    FEATURE_STORE_RECALC_OVERLAP_BARS,
+    FEATURE_STORE_WARMUP_BARS,
 )
 from db_utils import init_research_tables, refresh_coverage_from_table
 from features import compute_features
@@ -29,6 +32,23 @@ def parse_args():
     parser.add_argument("--lookahead-bars", type=int, default=LOOKAHEAD_BARS)
     parser.add_argument("--tp-multiplier", type=float, default=TP_MULTIPLIER)
     parser.add_argument("--sl-multiplier", type=float, default=SL_MULTIPLIER)
+    parser.add_argument(
+        "--recalc-overlap-bars",
+        type=int,
+        default=FEATURE_STORE_RECALC_OVERLAP_BARS,
+        help="Number of latest bars to recompute on each run to keep rolling features/labels consistent.",
+    )
+    parser.add_argument(
+        "--warmup-bars",
+        type=int,
+        default=FEATURE_STORE_WARMUP_BARS,
+        help="Extra bars before the overlap window to compute rolling indicators correctly.",
+    )
+    parser.add_argument(
+        "--full-rebuild",
+        action="store_true",
+        help="Recompute and upsert full history for selected symbols/timeframe.",
+    )
     return parser.parse_args()
 
 
@@ -53,18 +73,74 @@ def available_symbols_for_timeframe(timeframe: str) -> list[str]:
     return df["symbol"].astype(str).tolist()
 
 
-def load_prices(symbol: str, timeframe: str) -> pd.DataFrame:
+def timeframe_to_timedelta(timeframe: str) -> pd.Timedelta:
+    match = re.fullmatch(r"(\d+)([mhdwM])", timeframe)
+    if not match:
+        raise ValueError(f"Unsupported timeframe format: {timeframe}")
+
+    value = int(match.group(1))
+    unit = match.group(2)
+
+    if unit == "m":
+        return pd.Timedelta(minutes=value)
+    if unit == "h":
+        return pd.Timedelta(hours=value)
+    if unit == "d":
+        return pd.Timedelta(days=value)
+    if unit == "w":
+        return pd.Timedelta(weeks=value)
+    if unit == "M":
+        return pd.Timedelta(days=30 * value)
+
+    raise ValueError(f"Unsupported timeframe unit: {timeframe}")
+
+
+def get_latest_feature_datetime(symbol: str, timeframe: str) -> pd.Timestamp | None:
     conn = sqlite3.connect(DB_FILE)
     try:
+        row = pd.read_sql_query(
+            f"""
+            SELECT MAX(datetime_utc) AS max_dt
+            FROM {FEATURES_TABLE}
+            WHERE symbol = ? AND timeframe = ?
+            """,
+            conn,
+            params=(symbol, timeframe),
+        )
+    finally:
+        conn.close()
+
+    if row.empty:
+        return None
+
+    raw = row.loc[0, "max_dt"]
+    if pd.isna(raw):
+        return None
+
+    ts = pd.to_datetime(raw, utc=True, errors="coerce")
+    if pd.isna(ts):
+        return None
+    return ts
+
+
+def load_prices(symbol: str, timeframe: str, start_dt: pd.Timestamp | None = None) -> pd.DataFrame:
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        params = [symbol, timeframe]
+        where_extra = ""
+        if start_dt is not None:
+            where_extra = " AND datetime_utc >= ?"
+            params.append(start_dt.isoformat())
+
         df = pd.read_sql_query(
             f"""
             SELECT symbol, timeframe, datetime_utc, open, high, low, close, volume
             FROM {PRICES_TABLE}
-            WHERE symbol = ? AND timeframe = ?
+            WHERE symbol = ? AND timeframe = ? {where_extra}
             ORDER BY datetime_utc
             """,
             conn,
-            params=(symbol, timeframe),
+            params=tuple(params),
         )
     finally:
         conn.close()
@@ -170,9 +246,21 @@ def build_feature_frame(
 
 def run_feature_store(symbols: Iterable[str], timeframe: str, args) -> None:
     init_research_tables()
+    timeframe_delta = timeframe_to_timedelta(timeframe)
 
     for symbol in symbols:
-        prices_df = load_prices(symbol, timeframe)
+        latest_feature_dt = None if args.full_rebuild else get_latest_feature_datetime(symbol, timeframe)
+
+        if latest_feature_dt is None:
+            write_start_dt = None
+            compute_start_dt = None
+            mode = "full"
+        else:
+            write_start_dt = latest_feature_dt - (timeframe_delta * args.recalc_overlap_bars)
+            compute_start_dt = write_start_dt - (timeframe_delta * args.warmup_bars)
+            mode = "incremental"
+
+        prices_df = load_prices(symbol, timeframe, start_dt=compute_start_dt)
         if prices_df.empty:
             print(f"[{symbol}] no data in prices table for timeframe={timeframe}.")
             continue
@@ -184,10 +272,18 @@ def run_feature_store(symbols: Iterable[str], timeframe: str, args) -> None:
             sl_multiplier=args.sl_multiplier,
         )
 
-        written = upsert_feature_rows(full_df)
-        usable_features = int(full_df[FEATURE_COLUMNS].dropna().shape[0])
-        labeled_rows = int(full_df["label_class"].notna().sum())
+        if write_start_dt is not None:
+            full_df = full_df[full_df["datetime_utc"] >= write_start_dt].copy()
 
+        written = upsert_feature_rows(full_df)
+        usable_features = int(full_df[FEATURE_COLUMNS].dropna().shape[0]) if not full_df.empty else 0
+        labeled_rows = int(full_df["label_class"].notna().sum()) if not full_df.empty else 0
+
+        print(f"[{symbol}] mode={mode}")
+        if mode == "incremental":
+            print(f"[{symbol}] latest feature dt in DB: {latest_feature_dt}")
+            print(f"[{symbol}] recomputed write window from: {write_start_dt}")
+            print(f"[{symbol}] compute warmup start from: {compute_start_dt}")
         print(f"[{symbol}] rows upserted into feature store: {written}")
         print(f"[{symbol}] rows with complete features: {usable_features}")
         print(f"[{symbol}] rows with label_class not null: {labeled_rows}")

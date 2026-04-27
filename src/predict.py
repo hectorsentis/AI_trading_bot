@@ -5,9 +5,17 @@ from pathlib import Path
 import joblib
 import pandas as pd
 
-from config import DB_FILE, FEATURES_TABLE, SYMBOLS, TIMEFRAME, SIGNALS_TABLE
+from config import (
+    DB_FILE,
+    FEATURES_TABLE,
+    SYMBOLS,
+    TIMEFRAME,
+    SIGNALS_TABLE,
+    MODEL_SELECTION_ACCEPTANCE_ORDER,
+    PREFER_ACTIVE_MODEL,
+)
 from db_utils import init_research_tables, ensure_project_directories
-from model_registry import get_latest_model
+from model_registry import get_latest_model, select_model_for_inference
 from modeling_utils import POSITION_TO_NAME, probabilities_to_signal
 
 
@@ -26,7 +34,15 @@ def resolve_model_path(model_path_arg: str | None, timeframe: str) -> Path:
             raise FileNotFoundError(f"Model path not found: {path}")
         return path
 
-    latest = get_latest_model(timeframe=timeframe)
+    preferred = select_model_for_inference(
+        timeframe=timeframe,
+        acceptance_order=MODEL_SELECTION_ACCEPTANCE_ORDER,
+        prefer_active=PREFER_ACTIVE_MODEL,
+    )
+    if preferred and Path(preferred["model_path"]).exists():
+        return Path(preferred["model_path"])
+
+    latest = get_latest_model(timeframe=timeframe, prefer_active=PREFER_ACTIVE_MODEL)
     if latest and Path(latest["model_path"]).exists():
         return Path(latest["model_path"])
 

@@ -1,4 +1,5 @@
 import argparse
+import base64
 import json
 import sqlite3
 
@@ -21,12 +22,19 @@ from config import (
     REPORTS_DIR,
     MIN_TRAIN_ROWS,
 )
-from db_utils import init_research_tables, ensure_project_directories
+from db_utils import init_research_tables, ensure_project_directories, save_validation_predictions
+from model_registry import (
+    get_latest_model,
+    get_model_by_id,
+    register_model,
+    update_model_evaluation,
+)
 from modeling_utils import (
     classification_metrics,
     compute_economic_metrics,
     probabilities_to_signal,
 )
+from strategy_evaluator import evaluate_model_acceptance
 
 
 def parse_args():
@@ -38,7 +46,38 @@ def parse_args():
     parser.add_argument("--step-size", type=int, default=RETRAIN_STEP, help="Step between folds in unique datetimes")
     parser.add_argument("--max-folds", type=int, default=25, help="Limit fold count to keep runtime reasonable")
     parser.add_argument("--min-train-rows", type=int, default=MIN_TRAIN_ROWS)
+    parser.add_argument("--model-id", type=str, default=None, help="Model id to attach validation results to")
+    parser.add_argument("--validation-run-id", type=str, default=None, help="Optional explicit validation run id")
+    parser.add_argument("--short-threshold", type=float, default=None, help="Override short probability threshold")
+    parser.add_argument("--long-threshold", type=float, default=None, help="Override long probability threshold")
+    parser.add_argument(
+        "--model-params-json",
+        type=str,
+        default=None,
+        help="JSON object to override LightGBM params, e.g. '{\"n_estimators\":500}'.",
+    )
+    parser.add_argument(
+        "--model-params-b64",
+        type=str,
+        default=None,
+        help="Base64-encoded JSON object for LightGBM params (PowerShell-safe alternative).",
+    )
     return parser.parse_args()
+
+
+def _resolve_model_params(model_params_json: str | None, model_params_b64: str | None) -> dict:
+    params = dict(MODEL_PARAMS)
+    payload = model_params_json
+    if model_params_b64:
+        payload = base64.b64decode(model_params_b64.encode("utf-8")).decode("utf-8")
+
+    if not payload:
+        return params
+    overrides = json.loads(payload)
+    if not isinstance(overrides, dict):
+        raise ValueError("--model-params-json must decode to a JSON object.")
+    params.update(overrides)
+    return params
 
 
 def load_dataset(symbols: list[str], timeframe: str) -> pd.DataFrame:
@@ -114,6 +153,47 @@ def walk_forward_splits(
     return splits
 
 
+def _resolve_model_for_validation(model_id_arg: str | None, timeframe: str, symbols: list[str]) -> tuple[str, dict | None]:
+    if model_id_arg:
+        existing = get_model_by_id(model_id_arg)
+        if existing:
+            return model_id_arg, existing
+        return model_id_arg, None
+
+    latest = get_latest_model(timeframe=timeframe, prefer_active=True)
+    if latest:
+        return str(latest["model_id"]), latest
+
+    model_id = f"wf_{timeframe}_{pd.Timestamp.now(tz='UTC').strftime('%Y%m%d_%H%M%S')}"
+    register_model(
+        model_id=model_id,
+        symbol_scope=",".join(sorted(symbols)),
+        timeframe=timeframe,
+        train_start=None,
+        train_end=None,
+        test_start=None,
+        test_end=None,
+        feature_version="unknown",
+        label_version="unknown",
+        model_path="N/A",
+        metrics={},
+        params={"model_params": MODEL_PARAMS},
+        status="candidate",
+        acceptance_status="candidate",
+        rejection_reasons=["no_trained_model_entry_found_for_validation"],
+        evaluation_scope="walk_forward",
+    )
+    return model_id, get_model_by_id(model_id)
+
+
+def _hit_ratio(predictions_df: pd.DataFrame) -> float:
+    active = predictions_df[predictions_df["signal_position"] != 0].copy()
+    if active.empty:
+        return 0.0
+    active["hit"] = (active["signal_position"] * active["fwd_return_1"]) > 0
+    return float(active["hit"].mean())
+
+
 def main():
     args = parse_args()
     ensure_project_directories()
@@ -124,6 +204,12 @@ def main():
     if df.empty:
         print("No usable rows found in features table for validation.")
         return
+
+    model_id, model_entry = _resolve_model_for_validation(args.model_id, args.timeframe, symbols)
+    validation_run_id = args.validation_run_id or f"{model_id}_wf_{pd.Timestamp.now(tz='UTC').strftime('%Y%m%d_%H%M%S')}"
+    model_params = _resolve_model_params(args.model_params_json, args.model_params_b64)
+    short_threshold = float(args.short_threshold) if args.short_threshold is not None else float(SHORT_THRESHOLD)
+    long_threshold = float(args.long_threshold) if args.long_threshold is not None else float(LONG_THRESHOLD)
 
     unique_dates = sorted(df["datetime_utc"].unique())
     if len(unique_dates) < args.train_size + args.test_size:
@@ -140,10 +226,12 @@ def main():
 
     fold_rows = []
     prediction_rows = []
+    persist_rows: list[dict] = []
+    created_at = pd.Timestamp.now(tz="UTC").isoformat()
 
     print(
         f"Running walk-forward validation: folds={len(splits)} "
-        f"train_size={args.train_size} test_size={args.test_size} step={args.step_size}"
+        f"train_size={args.train_size} test_size={args.test_size} step={args.step_size} model_id={model_id}"
     )
 
     for fold_id, (test_start, test_end) in enumerate(splits, start=1):
@@ -158,7 +246,7 @@ def main():
         if train_df.empty or test_df.empty:
             continue
 
-        model = LGBMClassifier(**MODEL_PARAMS)
+        model = LGBMClassifier(**model_params)
         model.fit(train_df[feature_cols], train_df["label_class"])
 
         y_true = test_df["label_class"].values
@@ -166,8 +254,8 @@ def main():
         probas = model.predict_proba(test_df[feature_cols])
         signal_position = probabilities_to_signal(
             probas=probas,
-            short_threshold=SHORT_THRESHOLD,
-            long_threshold=LONG_THRESHOLD,
+            short_threshold=short_threshold,
+            long_threshold=long_threshold,
         )
 
         accuracy, f1_macro = classification_metrics(y_true=y_true, y_pred=y_pred)
@@ -202,7 +290,7 @@ def main():
             }
         )
 
-        pred_frame = test_df[["symbol", "datetime_utc", "fwd_return_1", "label_class"]].copy()
+        pred_frame = test_df[["symbol", "timeframe", "datetime_utc", "fwd_return_1", "label_class"]].copy()
         pred_frame["fold_id"] = fold_id
         pred_frame["pred_class"] = y_pred
         pred_frame["signal_position"] = signal_position
@@ -210,6 +298,24 @@ def main():
         pred_frame["prob_flat"] = probas[:, 1]
         pred_frame["prob_long"] = probas[:, 2]
         prediction_rows.append(pred_frame)
+
+        for _, row in pred_frame.iterrows():
+            persist_rows.append(
+                {
+                    "model_id": model_id,
+                    "symbol": row["symbol"],
+                    "timeframe": row["timeframe"],
+                    "datetime_utc": row["datetime_utc"].isoformat(),
+                    "y_true": int(row["label_class"]),
+                    "y_pred": int(row["pred_class"]),
+                    "prob_short": float(row["prob_short"]),
+                    "prob_flat": float(row["prob_flat"]),
+                    "prob_long": float(row["prob_long"]),
+                    "signal_position": int(row["signal_position"]),
+                    "fold_id": int(row["fold_id"]),
+                    "created_at_utc": created_at,
+                }
+            )
 
         print(
             f"fold={fold_id} test=[{test_start} -> {test_end}] "
@@ -234,6 +340,8 @@ def main():
         cost_per_trade=COST_PER_TRADE,
     )
 
+    hit_ratio = _hit_ratio(predictions_df)
+
     stamp = pd.Timestamp.now(tz="UTC").strftime("%Y%m%d_%H%M%S")
     folds_path = REPORTS_DIR / f"validation_folds_{args.timeframe}_{stamp}.csv"
     preds_path = REPORTS_DIR / f"validation_predictions_{args.timeframe}_{stamp}.csv"
@@ -245,6 +353,8 @@ def main():
     portfolio_curve.to_csv(curve_path, index=False)
 
     summary = {
+        "model_id": model_id,
+        "validation_run_id": validation_run_id,
         "timeframe": args.timeframe,
         "symbols": sorted(df["symbol"].unique().tolist()),
         "folds": int(len(folds_df)),
@@ -252,6 +362,9 @@ def main():
         "test_size": args.test_size,
         "step_size": args.step_size,
         "max_folds": args.max_folds,
+        "short_threshold": short_threshold,
+        "long_threshold": long_threshold,
+        "model_params": model_params,
         "classification": {
             "overall_accuracy": overall_accuracy,
             "overall_f1_macro": overall_f1,
@@ -267,6 +380,7 @@ def main():
             "overall_max_drawdown": overall_econ.max_drawdown,
             "overall_profit_factor": overall_econ.profit_factor,
             "overall_trade_count": overall_econ.trade_count,
+            "overall_hit_ratio": hit_ratio,
             "fold_strategy_return_mean": float(folds_df["strategy_return"].mean()),
             "fold_strategy_return_median": float(folds_df["strategy_return"].median()),
             "fold_sharpe_mean": float(folds_df["sharpe"].mean()),
@@ -283,12 +397,44 @@ def main():
         },
     }
 
+    persisted_count = save_validation_predictions(rows=persist_rows, validation_run_id=validation_run_id, replace_run=True)
+    summary["db_persistence"] = {
+        "validation_predictions_rows_written": persisted_count,
+    }
+
+    holdout_metrics = {}
+    if model_entry and isinstance(model_entry.get("metrics_json"), dict):
+        holdout_metrics = model_entry["metrics_json"].get("holdout", {})
+
+    acceptance = evaluate_model_acceptance(
+        metrics_bundle={
+            "holdout": holdout_metrics,
+            "walk_forward": summary,
+            "backtest_oos": {},
+        }
+    )
+    summary["acceptance"] = acceptance
+
     report_path.write_text(json.dumps(summary, ensure_ascii=True, indent=2), encoding="utf-8")
+
+    if get_model_by_id(model_id):
+        registry_status = "accepted" if acceptance["acceptance_status"] == "accepted" else acceptance["acceptance_status"]
+        update_model_evaluation(
+            model_id=model_id,
+            metrics={
+                "walk_forward": summary,
+            },
+            status=registry_status,
+            acceptance_status=acceptance["acceptance_status"],
+            rejection_reasons=acceptance["rejection_reasons"],
+            evaluation_scope=acceptance.get("evaluation_scope", "walk_forward"),
+        )
 
     print(f"Validation summary saved to: {report_path}")
     print(f"Folds metrics saved to: {folds_path}")
     print(f"Predictions saved to: {preds_path}")
     print(f"Equity curve saved to: {curve_path}")
+    print(f"OOS predictions persisted to DB rows={persisted_count} validation_run_id={validation_run_id}")
     print(json.dumps(summary, ensure_ascii=True, indent=2))
 
 

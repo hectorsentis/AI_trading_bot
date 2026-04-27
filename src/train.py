@@ -1,4 +1,5 @@
 import argparse
+import base64
 import json
 import sqlite3
 
@@ -30,6 +31,7 @@ from modeling_utils import (
     compute_economic_metrics,
     probabilities_to_signal,
 )
+from strategy_evaluator import evaluate_model_acceptance
 
 
 def parse_args():
@@ -39,7 +41,36 @@ def parse_args():
     parser.add_argument("--test-size", type=int, default=TEST_SIZE, help="Number of latest datetimes for holdout")
     parser.add_argument("--model-id", type=str, default=None, help="Optional model id override")
     parser.add_argument("--min-train-rows", type=int, default=MIN_TRAIN_ROWS)
+    parser.add_argument("--short-threshold", type=float, default=None, help="Override short probability threshold")
+    parser.add_argument("--long-threshold", type=float, default=None, help="Override long probability threshold")
+    parser.add_argument(
+        "--model-params-json",
+        type=str,
+        default=None,
+        help="JSON object to override LightGBM params, e.g. '{\"n_estimators\":500}'.",
+    )
+    parser.add_argument(
+        "--model-params-b64",
+        type=str,
+        default=None,
+        help="Base64-encoded JSON object for LightGBM params (PowerShell-safe alternative).",
+    )
     return parser.parse_args()
+
+
+def _resolve_model_params(model_params_json: str | None, model_params_b64: str | None) -> dict:
+    params = dict(MODEL_PARAMS)
+    payload = model_params_json
+    if model_params_b64:
+        payload = base64.b64decode(model_params_b64.encode("utf-8")).decode("utf-8")
+
+    if not payload:
+        return params
+    overrides = json.loads(payload)
+    if not isinstance(overrides, dict):
+        raise ValueError("--model-params-json must decode to a JSON object.")
+    params.update(overrides)
+    return params
 
 
 def _load_dataset(symbols: list[str], timeframe: str) -> pd.DataFrame:
@@ -143,15 +174,19 @@ def main():
     X_test = test_df[feature_cols]
     y_test = test_df["label_class"]
 
-    model = LGBMClassifier(**MODEL_PARAMS)
+    model_params = _resolve_model_params(args.model_params_json, args.model_params_b64)
+    short_threshold = float(args.short_threshold) if args.short_threshold is not None else float(SHORT_THRESHOLD)
+    long_threshold = float(args.long_threshold) if args.long_threshold is not None else float(LONG_THRESHOLD)
+
+    model = LGBMClassifier(**model_params)
     model.fit(X_train, y_train)
 
     y_pred = model.predict(X_test)
     probas = model.predict_proba(X_test)
     signal_position = probabilities_to_signal(
         probas=probas,
-        short_threshold=SHORT_THRESHOLD,
-        long_threshold=LONG_THRESHOLD,
+        short_threshold=short_threshold,
+        long_threshold=long_threshold,
     )
 
     accuracy, f1_macro = classification_metrics(y_true=y_test.values, y_pred=y_pred)
@@ -176,11 +211,11 @@ def main():
         "feature_columns": feature_cols,
         "base_feature_columns": FEATURE_COLUMNS,
         "symbol_mapping": symbol_mapping,
-        "long_threshold": LONG_THRESHOLD,
-        "short_threshold": SHORT_THRESHOLD,
+        "long_threshold": long_threshold,
+        "short_threshold": short_threshold,
         "feature_version": FEATURE_VERSION,
         "label_version": LABEL_VERSION,
-        "model_params": MODEL_PARAMS,
+        "model_params": model_params,
         "model": model,
     }
     joblib.dump(artifact, model_path)
@@ -213,15 +248,20 @@ def main():
         },
     }
 
+    acceptance = evaluate_model_acceptance(metrics_bundle={"holdout": metrics})
+    acceptance_status = acceptance["acceptance_status"]
+    registry_status = acceptance_status
+
     report_path = REPORTS_DIR / f"train_{model_id}.json"
     report_payload = {
         "model_id": model_id,
         "model_path": str(model_path),
         "metrics": metrics,
+        "acceptance": acceptance,
         "params": {
-            "model_params": MODEL_PARAMS,
-            "short_threshold": SHORT_THRESHOLD,
-            "long_threshold": LONG_THRESHOLD,
+            "model_params": model_params,
+            "short_threshold": short_threshold,
+            "long_threshold": long_threshold,
             "cost_per_trade": COST_PER_TRADE,
         },
     }
@@ -241,15 +281,18 @@ def main():
         feature_version=FEATURE_VERSION,
         label_version=LABEL_VERSION,
         model_path=str(model_path),
-        metrics=metrics,
+        metrics={"holdout": metrics},
         params={
-            "model_params": MODEL_PARAMS,
-            "short_threshold": SHORT_THRESHOLD,
-            "long_threshold": LONG_THRESHOLD,
+            "model_params": model_params,
+            "short_threshold": short_threshold,
+            "long_threshold": long_threshold,
             "cost_per_trade": COST_PER_TRADE,
             "feature_columns": feature_cols,
         },
-        status="trained",
+        status=registry_status,
+        acceptance_status=acceptance_status,
+        rejection_reasons=acceptance["rejection_reasons"],
+        evaluation_scope=acceptance.get("evaluation_scope", "holdout"),
     )
 
     print(f"Model trained successfully: {model_id}")
@@ -258,6 +301,8 @@ def main():
     print(f"Holdout curve saved to: {curve_path}")
     print("Holdout metrics:")
     print(json.dumps(metrics, ensure_ascii=True, indent=2))
+    print("Acceptance gating:")
+    print(json.dumps(acceptance, ensure_ascii=True, indent=2))
 
 
 if __name__ == "__main__":

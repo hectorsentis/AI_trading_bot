@@ -6,6 +6,10 @@ __pycache__/
 
 # Virtual env
 .venv/
+.py312pkgs/
+wheelhouse/
+.tmp-pip/
+tmp_test/
 
 # Data (NO subir datos)
 data/
@@ -39,4 +43,3 @@ Thumbs.db
 # AI
 
 codex.md
-

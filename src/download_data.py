@@ -20,6 +20,7 @@ from config import (
     OVERLAP_BARS,
     API_SLEEP_SECONDS,
     HTTP_TIMEOUT_SECONDS,
+    FULL_BACKFILL_START_DATE,
     RAW_FILE_TIMESTAMP_FORMAT,
     SAVE_RAW_AS_GZIP,
     DEFAULT_DOWNLOAD_MODE,
@@ -144,7 +145,10 @@ def build_time_window(
     tf_ms = interval_to_ms(timeframe)
 
     if mode == "full":
-        start_ts = now_utc - pd.Timedelta(days=INITIAL_BACKFILL_DAYS)
+        if FULL_BACKFILL_START_DATE:
+            start_ts = pd.Timestamp(FULL_BACKFILL_START_DATE, tz="UTC")
+        else:
+            start_ts = now_utc - pd.Timedelta(days=INITIAL_BACKFILL_DAYS)
         end_ts = now_utc
         return start_ts, end_ts
 

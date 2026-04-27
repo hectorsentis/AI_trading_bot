@@ -118,6 +118,70 @@ def compute_features(prices_df: pd.DataFrame) -> pd.DataFrame:
 
     df["rsi_14"] = _compute_rsi(close, period=14)
 
+    candle_range = (high - low).replace(0, np.nan)
+    body = (close - df["open"]).abs()
+    upper_wick = high - pd.concat([df["open"], close], axis=1).max(axis=1)
+    lower_wick = pd.concat([df["open"], close], axis=1).min(axis=1) - low
+
+    df["body_ratio"] = body / candle_range
+    df["upper_wick_ratio"] = upper_wick / candle_range
+    df["lower_wick_ratio"] = lower_wick / candle_range
+
+    # Candlestick / chart-pattern proxy features. They use only current and past bars.
+    df["is_doji"] = (df["body_ratio"] <= 0.10).astype(float)
+    df["is_hammer"] = (
+        (df["lower_wick_ratio"] >= 0.55)
+        & (df["upper_wick_ratio"] <= 0.20)
+        & (df["body_ratio"] <= 0.35)
+    ).astype(float)
+    df["is_shooting_star"] = (
+        (df["upper_wick_ratio"] >= 0.55)
+        & (df["lower_wick_ratio"] <= 0.20)
+        & (df["body_ratio"] <= 0.35)
+    ).astype(float)
+
+    prev_open = df["open"].shift(1)
+    prev_close = close.shift(1)
+    prev_high = high.shift(1)
+    prev_low = low.shift(1)
+
+    df["bullish_engulfing"] = (
+        (prev_close < prev_open)
+        & (close > df["open"])
+        & (df["open"] <= prev_close)
+        & (close >= prev_open)
+    ).astype(float)
+    df["bearish_engulfing"] = (
+        (prev_close > prev_open)
+        & (close < df["open"])
+        & (df["open"] >= prev_close)
+        & (close <= prev_open)
+    ).astype(float)
+    df["inside_bar"] = ((high < prev_high) & (low > prev_low)).astype(float)
+    df["outside_bar"] = ((high > prev_high) & (low < prev_low)).astype(float)
+
+    prior_high_20 = high.shift(1).rolling(20, min_periods=20).max()
+    prior_low_20 = low.shift(1).rolling(20, min_periods=20).min()
+    df["breakout_20"] = (close > prior_high_20).astype(float)
+    df["breakdown_20"] = (close < prior_low_20).astype(float)
+    df["ma_cross_5_20"] = ((ma_5 > ma_20) & (ma_5.shift(1) <= ma_20.shift(1))).astype(float)
+
+    prior_high_50 = high.shift(1).rolling(50, min_periods=50).max()
+    prior_low_50 = low.shift(1).rolling(50, min_periods=50).min()
+    atr_pct = (df["atr_14"] / close.replace(0, np.nan)).replace(0, np.nan)
+    near_prior_high = ((close / prior_high_50.replace(0, np.nan)) - 1.0).abs()
+    near_prior_low = ((close / prior_low_50.replace(0, np.nan)) - 1.0).abs()
+    df["double_top_proxy"] = (
+        (near_prior_high <= (1.5 * atr_pct))
+        & (df["upper_wick_ratio"] > df["lower_wick_ratio"])
+        & (df["rsi_14"] >= 60)
+    ).astype(float)
+    df["double_bottom_proxy"] = (
+        (near_prior_low <= (1.5 * atr_pct))
+        & (df["lower_wick_ratio"] > df["upper_wick_ratio"])
+        & (df["rsi_14"] <= 40)
+    ).astype(float)
+
     hour = df["datetime_utc"].dt.hour.astype(float)
     df["hour_sin"] = np.sin((2.0 * np.pi * hour) / 24.0)
     df["hour_cos"] = np.cos((2.0 * np.pi * hour) / 24.0)

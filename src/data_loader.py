@@ -1,3 +1,4 @@
+import argparse
 import sqlite3
 from pathlib import Path
 
@@ -440,7 +441,16 @@ def ask_yes_no(prompt: str) -> bool:
         print("Responde con s/n.")
 
 
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Load raw Binance snapshots into SQLite idempotently.")
+    parser.add_argument("--gap-check", action="store_true", help="Run gap checks for newly processed symbol/timeframes.")
+    parser.add_argument("--no-prompt", action="store_true", help="Do not ask interactive questions.")
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
     print("Inicializando base de datos...")
     init_db()
 
@@ -448,13 +458,16 @@ def main():
     processed_symbols = process_all_raw()
 
     if processed_symbols:
-        do_check = ask_yes_no(
-            "\n¿Quieres revisar si hay gaps en los datos que acabas de cargar? [s/n]: "
-        )
+        if args.no_prompt:
+            do_check = bool(args.gap_check)
+        else:
+            do_check = args.gap_check or ask_yes_no(
+                "\nQuieres revisar si hay gaps en los datos que acabas de cargar? [s/n]: "
+            )
         if do_check:
             run_gap_checks_for_symbols(processed_symbols)
     else:
-        print("\nNo se han cargado archivos nuevos, así que no hay símbolos nuevos que revisar.")
+        print("\nNo se han cargado archivos nuevos, asi que no hay simbolos nuevos que revisar.")
 
     print("\nBase de datos actualizada correctamente.")
 
