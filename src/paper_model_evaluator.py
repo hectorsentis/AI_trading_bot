@@ -1,6 +1,8 @@
 ﻿import argparse
 import json
+import os
 import sqlite3
+import time
 
 import pandas as pd
 
@@ -22,8 +24,10 @@ from config import (
     POSITIONS_TABLE,
     SIGNALS_TABLE,
     TIMEFRAME,
+    MODEL_EVALUATION_INTERVAL_SECONDS,
 )
 from db_utils import init_research_tables
+from runtime_status import record_event, update_status
 from model_registry import (
     get_model_by_id,
     list_paper_active_models,
@@ -201,11 +205,35 @@ def parse_args():
     parser.add_argument("--model-id", default=None)
     parser.add_argument("--account-mode", default=None)
     parser.add_argument("--timeframe", default=TIMEFRAME)
+    parser.add_argument("--loop", action="store_true")
+    parser.add_argument("--interval-seconds", type=int, default=MODEL_EVALUATION_INTERVAL_SECONDS)
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    if args.loop:
+        update_status("paper_model_evaluator", "running", pid=os.getpid(), message="loop starting")
+        while True:
+            try:
+                results = evaluate_active_models(account_mode=args.account_mode, timeframe=args.timeframe)
+                update_status(
+                    "paper_model_evaluator",
+                    "running",
+                    pid=os.getpid(),
+                    message=f"evaluated {len(results)} active models",
+                    metadata={"count": len(results)},
+                )
+                print(json.dumps({"component": "paper_model_evaluator", "results": results}, ensure_ascii=True), flush=True)
+            except KeyboardInterrupt:
+                update_status("paper_model_evaluator", "stopped", pid=os.getpid(), message="keyboard interrupt")
+                raise
+            except Exception as exc:
+                update_status("paper_model_evaluator", "error", pid=os.getpid(), message=str(exc))
+                record_event("paper_model_evaluator", "error", str(exc))
+                print(json.dumps({"component": "paper_model_evaluator", "error": str(exc)}, ensure_ascii=True), flush=True)
+            time.sleep(max(10, int(args.interval_seconds)))
+
     if args.evaluate_active:
         print(json.dumps(evaluate_active_models(account_mode=args.account_mode, timeframe=args.timeframe), ensure_ascii=True, indent=2))
         return
@@ -216,3 +244,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

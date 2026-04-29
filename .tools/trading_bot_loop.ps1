@@ -1,6 +1,8 @@
-﻿$ErrorActionPreference = "Stop"
-Set-Location "E:\Trading\v02"
-$env:PYTHONPATH = "E:\Trading\v02\.py312pkgs;E:\Trading\v02\src"
-$env:PYTHONIOENCODING = "utf-8"
-$env:LOKY_MAX_CPU_COUNT = "4"
-& "C:\Program Files\ANSYS Inc\ANSYS Student\v261\CEI\apex261\machines\win64\Python-3.12.11\python.exe" "src\trading_bot.py" --loop --poll-seconds 60 --symbols BTCUSDT,ETHUSDT,SOLUSDT --timeframe 1h --paper-initial-cash 10000 --sync-latest-from-binance --refresh-features --log-level INFO *>> "logs\trading_bot_background.out.log"
+﻿# Legacy entrypoint kept for compatibility. Use .tools\run.ps1 for the full autonomous platform.
+param(
+  [string]$Symbols = "",
+  [string]$Timeframe = "",
+  [switch]$NoDashboard,
+  [switch]$NoMaintenance
+)
+& (Join-Path $PSScriptRoot "run.ps1") -Symbols $Symbols -Timeframe $Timeframe -NoDashboard:$NoDashboard -NoMaintenance:$NoMaintenance

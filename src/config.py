@@ -350,6 +350,7 @@ PAPER_MODEL_METRICS_TABLE = "paper_model_metrics"
 MODEL_LIFECYCLE_EVENTS_TABLE = "model_lifecycle_events"
 BOT_EVENTS_TABLE = "bot_events"
 RISK_EVENTS_TABLE = "risk_events"
+BOT_STATUS_TABLE = "bot_status"
 
 MODEL_LIFECYCLE_STATUSES = [
     "candidate", "validation_rejected", "validation_accepted", "backtest_rejected",

@@ -160,8 +160,15 @@ def _streamlit_main():
     coverage = _query("data_coverage", limit=3000, order_by="updated_at_utc DESC")
     signals = _query("signals", limit=3000, order_by="created_at_utc DESC")
     risk_events = _query("risk_events", limit=3000, order_by="created_at_utc DESC")
+    bot_status = _query("bot_status", limit=100, order_by="component ASC")
+    if not bot_status.empty and "last_heartbeat_utc" in bot_status.columns:
+        now_utc = pd.Timestamp.now(tz="UTC")
+        bot_status["heartbeat_age_seconds"] = (now_utc - pd.to_datetime(bot_status["last_heartbeat_utc"], utc=True, errors="coerce")).dt.total_seconds()
+        bot_status["effective_status"] = bot_status.apply(lambda r: "stale" if str(r.get("status")) == "running" and float(r.get("heartbeat_age_seconds") or 999999) > 180 else r.get("status"), axis=1)
 
     real_enabled = ENABLE_LIVE_TRADING and ENABLE_REAL_ORDER_EXECUTION and ENABLE_REAL_BINANCE_ACCOUNT and not DRY_RUN
+    services_running = (not bot_status.empty and "effective_status" in bot_status and (bot_status["effective_status"].astype(str) == "running").any())
+    runner_running = (not bot_status.empty and "component" in bot_status and "effective_status" in bot_status and ((bot_status["component"].astype(str) == "autonomous_runner") & (bot_status["effective_status"].astype(str) == "running")).any())
     mode_pill = "pill-bad" if real_enabled else "pill-ok"
     st.markdown(
         f"""
@@ -171,6 +178,7 @@ def _streamlit_main():
           <div style="margin-top:12px">
             <span class="pill {mode_pill}">Real execution: {'ENABLED' if real_enabled else 'BLOCKED BY DEFAULT'}</span>
             <span class="pill pill-ok">Environment: {escape(str(BINANCE_ENV))}</span>
+            <span class="pill {'pill-ok' if runner_running else 'pill-bad'}">Bot: {'RUNNING' if runner_running else 'OFF/STALE'}</span>
             <span class="pill {'pill-ok' if ENABLE_TESTNET_PAPER_TRADING else 'pill-warn'}">Spot Demo Paper: {ENABLE_TESTNET_PAPER_TRADING}</span>
             <span class="pill {'pill-ok' if DRY_RUN else 'pill-bad'}">DRY_RUN: {DRY_RUN}</span>
           </div>
@@ -186,13 +194,14 @@ def _streamlit_main():
     filled = int((orders.get("status", pd.Series(dtype=str)).astype(str).str.upper() == "FILLED").sum()) if not orders.empty else 0
     latest_equity = snaps["equity"].iloc[0] if not snaps.empty and "equity" in snaps else 0
 
-    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    k1, k2, k3, k4, k5, k6, k7 = st.columns(7)
     k1.metric("Paper active", active)
     k2.metric("Paper validated", validated)
     k3.metric("Real ready", ready)
     k4.metric("Rejected", rejected)
     k5.metric("Filled orders", filled)
     k6.metric("Latest equity", _fmt_money(latest_equity))
+    k7.metric("Bot", "RUNNING" if runner_running else "OFF")
 
     st.markdown(_status_badges(registry), unsafe_allow_html=True)
 
@@ -200,6 +209,7 @@ def _streamlit_main():
         st.header("⚙️ Runtime")
         st.caption(f"DB: `{DB_FILE}`")
         st.caption(f"Refresh recomendado: {DASHBOARD_REFRESH_SECONDS}s")
+        st.markdown(f"<span class='pill {'pill-ok' if runner_running else 'pill-bad'}'>Bot: {'RUNNING' if runner_running else 'OFF/STALE'}</span>", unsafe_allow_html=True)
         st.divider()
         st.subheader("Conexiones")
         st.markdown(f"<span class='pill {'pill-ok' if BINANCE_TESTNET_API_KEY else 'pill-warn'}'>Demo API key: {'present' if BINANCE_TESTNET_API_KEY else 'missing'}</span>", unsafe_allow_html=True)
@@ -224,6 +234,11 @@ def _streamlit_main():
         with c2:
             st.subheader("Conteo de tablas")
             st.dataframe(_counts(), use_container_width=True, height=260)
+        st.subheader("Estado live de procesos")
+        if bot_status.empty:
+            st.warning("No hay heartbeats. El bot aut?nomo parece apagado. Ejecuta .tools\\run.cmd")
+        else:
+            st.dataframe(bot_status, use_container_width=True, height=220)
         if not orders.empty and "created_at_utc" in orders:
             st.subheader("Actividad reciente")
             st.dataframe(orders.head(20), use_container_width=True, height=300)

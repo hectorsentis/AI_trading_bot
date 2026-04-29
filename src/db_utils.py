@@ -32,6 +32,7 @@ from config import (
     MODEL_LIFECYCLE_EVENTS_TABLE,
     BOT_EVENTS_TABLE,
     RISK_EVENTS_TABLE,
+    BOT_STATUS_TABLE,
 )
 
 
@@ -439,6 +440,20 @@ def init_research_tables() -> None:
 
         conn.execute(
             f"""
+            CREATE TABLE IF NOT EXISTS {BOT_STATUS_TABLE} (
+                component TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                pid INTEGER,
+                started_at_utc TEXT,
+                last_heartbeat_utc TEXT NOT NULL,
+                message TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{{}}'
+            )
+            """
+        )
+
+        conn.execute(
+            f"""
             CREATE TABLE IF NOT EXISTS {RISK_EVENTS_TABLE} (
                 event_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 model_id TEXT,
@@ -636,6 +651,7 @@ def assert_required_schema() -> dict:
         PAPER_MODEL_METRICS_TABLE,
         MODEL_LIFECYCLE_EVENTS_TABLE,
         BOT_EVENTS_TABLE,
+        BOT_STATUS_TABLE,
         RISK_EVENTS_TABLE,
     ]
     model_scoped = {

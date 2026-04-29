@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,8 +17,10 @@ from config import (
     SYMBOLS,
     TARGET_ACCEPTED_MODELS,
     TIMEFRAME,
+    MODEL_MAINTENANCE_INTERVAL_SECONDS,
 )
 from model_registry import count_accepted_models, get_model_by_id, list_accepted_models, set_active_model
+from runtime_status import record_event, update_status
 
 
 @dataclass
@@ -205,19 +208,47 @@ def parse_args():
     parser.add_argument("--target-accepted-models", type=int, default=TARGET_ACCEPTED_MODELS)
     parser.add_argument("--max-attempts", type=int, default=MODEL_POOL_MAX_TRAINING_ATTEMPTS_PER_CYCLE)
     parser.add_argument("--validation-max-folds", type=int, default=MODEL_POOL_VALIDATION_MAX_FOLDS)
+    parser.add_argument("--loop", action="store_true")
+    parser.add_argument("--interval-seconds", type=int, default=MODEL_MAINTENANCE_INTERVAL_SECONDS)
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     symbols = [s.upper().strip() for s in args.symbols] if args.symbols else [s.upper() for s in SYMBOLS]
-    summary = maintain_model_pool(
-        symbols=symbols,
-        timeframe=args.timeframe,
-        target_accepted_models=args.target_accepted_models,
-        max_attempts=args.max_attempts,
-        validation_max_folds=args.validation_max_folds,
-    )
+
+    def _cycle():
+        return maintain_model_pool(
+            symbols=symbols,
+            timeframe=args.timeframe,
+            target_accepted_models=args.target_accepted_models,
+            max_attempts=args.max_attempts,
+            validation_max_folds=args.validation_max_folds,
+        )
+
+    if args.loop:
+        update_status("model_maintenance", "running", pid=os.getpid(), message="loop starting")
+        while True:
+            try:
+                summary = _cycle()
+                update_status(
+                    "model_maintenance",
+                    "running",
+                    pid=os.getpid(),
+                    message="maintenance cycle completed",
+                    metadata={"target_met": summary.get("target_met"), "accepted_count_after": summary.get("accepted_count_after")},
+                )
+                print(json.dumps(summary, ensure_ascii=True), flush=True)
+            except KeyboardInterrupt:
+                update_status("model_maintenance", "stopped", pid=os.getpid(), message="keyboard interrupt")
+                raise
+            except Exception as exc:
+                update_status("model_maintenance", "error", pid=os.getpid(), message=str(exc))
+                record_event("model_maintenance", "error", str(exc))
+                print(json.dumps({"component": "model_maintenance", "error": str(exc)}, ensure_ascii=True), flush=True)
+            time.sleep(max(60, int(args.interval_seconds)))
+
+    summary = _cycle()
     print(json.dumps(summary, ensure_ascii=True, indent=2))
 
 
