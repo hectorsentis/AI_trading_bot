@@ -1,5 +1,6 @@
 ﻿import argparse
 import json
+import math
 import sqlite3
 from typing import Optional
 
@@ -35,9 +36,9 @@ def _json_loads(value, fallback):
 
 def _row_to_model_dict(row: pd.Series) -> dict:
     record = row.to_dict()
-    for key in ["metrics_json", "params_json", "rejection_reasons_json"]:
+    for key in ["metrics_json", "params_json", "rejection_reasons_json", "symbols_json"]:
         if key in record and isinstance(record[key], str):
-            record[key] = _json_loads(record[key], {} if key != "rejection_reasons_json" else [])
+            record[key] = _json_loads(record[key], [] if key in {"rejection_reasons_json", "symbols_json"} else {})
     return record
 
 
@@ -101,6 +102,8 @@ def register_model(
     rejection_reasons: Optional[list[str]] = None,
     evaluation_scope: str = "holdout",
     is_active: bool = False,
+    training_scope: str = "multi_symbol",
+    symbols: Optional[list[str]] = None,
 ) -> None:
     init_research_tables()
     normalized_status = _normalize_status(status, acceptance_status)
@@ -118,8 +121,8 @@ def register_model(
                 model_id, symbol_scope, timeframe, train_start, train_end, test_start, test_end,
                 feature_version, label_version, model_path, training_ts_utc, metrics_json,
                 params_json, status, acceptance_status, rejection_reasons_json,
-                evaluation_scope, is_active, updated_at_utc
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                evaluation_scope, is_active, updated_at_utc, training_scope, symbols_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 model_id,
@@ -141,6 +144,8 @@ def register_model(
                 evaluation_scope,
                 1 if is_active else 0,
                 now,
+                training_scope,
+                _json_dumps(symbols or [s.strip().upper() for s in symbol_scope.split(",") if s.strip()]),
             ),
         )
         conn.commit()
@@ -274,7 +279,94 @@ def update_model_evaluation(
         add_lifecycle_event(model_id, existing.get("status"), final_status, reason="evaluation_update", metadata={"scope": final_scope})
 
 
-def list_models_by_status(statuses: str | list[str], timeframe: Optional[str] = None, limit: Optional[int] = None) -> list[dict]:
+def _record_matches_symbols(record: dict, symbols: Optional[list[str]]) -> bool:
+    if not symbols:
+        return True
+    wanted = {s.upper().strip() for s in symbols if s.strip()}
+    raw_symbols = record.get("symbols_json")
+    if isinstance(raw_symbols, list):
+        available = {str(s).upper().strip() for s in raw_symbols}
+    else:
+        available = {s.strip().upper() for s in str(record.get("symbol_scope", "")).split(",") if s.strip()}
+    return bool(wanted & available)
+
+
+
+
+def _nested_get(payload: dict, keys: list[str]):
+    node = payload
+    for key in keys:
+        if not isinstance(node, dict):
+            return None
+        node = node.get(key)
+    return node
+
+
+def _to_float(value, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        value = float(value)
+        if math.isnan(value):
+            return default
+        if math.isinf(value):
+            return 10.0 if value > 0 else -10.0
+        return value
+    except Exception:
+        return default
+
+
+def model_profitability_score(record: dict) -> float:
+    """Rank by observed validation/backtest economics; not a profit guarantee."""
+    metrics = record.get("metrics_json") if isinstance(record.get("metrics_json"), dict) else {}
+    strategy_return = (
+        _nested_get(metrics, ["paper", "total_return"])
+        or _nested_get(metrics, ["backtest_oos", "economic", "strategy_return"])
+        or _nested_get(metrics, ["walk_forward", "economic", "overall_strategy_return"])
+        or _nested_get(metrics, ["holdout", "economic", "strategy_return"])
+    )
+    sharpe = (
+        _nested_get(metrics, ["backtest_oos", "economic", "sharpe"])
+        or _nested_get(metrics, ["walk_forward", "economic", "overall_sharpe"])
+        or _nested_get(metrics, ["holdout", "economic", "sharpe"])
+    )
+    profit_factor = (
+        _nested_get(metrics, ["backtest_oos", "economic", "profit_factor"])
+        or _nested_get(metrics, ["walk_forward", "economic", "overall_profit_factor"])
+        or _nested_get(metrics, ["holdout", "economic", "profit_factor"])
+    )
+    drawdown = (
+        _nested_get(metrics, ["backtest_oos", "economic", "max_drawdown"])
+        or _nested_get(metrics, ["walk_forward", "economic", "overall_max_drawdown"])
+        or _nested_get(metrics, ["holdout", "economic", "max_drawdown"])
+    )
+    trades = (
+        _nested_get(metrics, ["backtest_oos", "economic", "trade_count"])
+        or _nested_get(metrics, ["walk_forward", "economic", "overall_trade_count"])
+        or _nested_get(metrics, ["holdout", "economic", "trade_count"])
+    )
+    ret = _to_float(strategy_return)
+    sh = _to_float(sharpe)
+    pf = max(0.0, min(_to_float(profit_factor), 10.0))
+    dd = abs(_to_float(drawdown))
+    tr = max(0.0, _to_float(trades))
+    sample_bonus = min(0.05, math.log1p(tr) / 100.0)
+    return float(ret + 0.03 * sh + 0.02 * math.log1p(pf) - dd + sample_bonus)
+
+
+def sort_models_by_profitability(records: list[dict]) -> list[dict]:
+    for record in records:
+        record["selection_score"] = model_profitability_score(record)
+    return sorted(records, key=lambda r: (float(r.get("selection_score", 0.0)), str(r.get("training_ts_utc", ""))), reverse=True)
+
+
+def list_models_by_status(
+    statuses: str | list[str],
+    timeframe: Optional[str] = None,
+    limit: Optional[int] = None,
+    training_scope: Optional[str] = None,
+    symbols: Optional[list[str]] = None,
+) -> list[dict]:
     init_research_tables()
     if isinstance(statuses, str):
         statuses = [statuses]
@@ -284,8 +376,12 @@ def list_models_by_status(statuses: str | list[str], timeframe: Optional[str] = 
     if timeframe:
         where.append("timeframe = ?")
         params.append(timeframe)
-    limit_sql = "LIMIT ?" if limit is not None else ""
-    if limit is not None:
+    if training_scope:
+        where.append("training_scope = ?")
+        params.append(training_scope.replace("-", "_"))
+    sql_limit = limit if symbols is None else None
+    limit_sql = "LIMIT ?" if sql_limit is not None else ""
+    if sql_limit is not None:
         params.append(int(limit))
     conn = sqlite3.connect(DB_FILE)
     try:
@@ -296,15 +392,18 @@ def list_models_by_status(statuses: str | list[str], timeframe: Optional[str] = 
         )
     finally:
         conn.close()
-    return [_row_to_model_dict(row) for _, row in df.iterrows()]
+    records = [_row_to_model_dict(row) for _, row in df.iterrows()]
+    records = [record for record in records if _record_matches_symbols(record, symbols)]
+    records = sort_models_by_profitability(records)
+    return records[:limit] if limit is not None else records
 
 
-def list_paper_active_models(timeframe: Optional[str] = None) -> list[dict]:
-    return list_models_by_status("paper_active", timeframe=timeframe)
+def list_paper_active_models(timeframe: Optional[str] = None, training_scope: Optional[str] = None, symbols: Optional[list[str]] = None) -> list[dict]:
+    return list_models_by_status("paper_active", timeframe=timeframe, training_scope=training_scope, symbols=symbols)
 
 
-def list_backtest_accepted_models(timeframe: Optional[str] = None) -> list[dict]:
-    return list_models_by_status("backtest_accepted", timeframe=timeframe)
+def list_backtest_accepted_models(timeframe: Optional[str] = None, training_scope: Optional[str] = None, symbols: Optional[list[str]] = None) -> list[dict]:
+    return list_models_by_status("backtest_accepted", timeframe=timeframe, training_scope=training_scope, symbols=symbols)
 
 
 def activate_model_for_paper(model_id: str, account_mode: str = ACCOUNT_MODE_TESTNET_PAPER) -> None:
@@ -398,13 +497,18 @@ def select_model_for_inference(timeframe: str, acceptance_order: list[str], pref
     return None
 
 
-def list_accepted_models(timeframe: str, limit: int | None = None) -> list[dict]:
+def list_accepted_models(
+    timeframe: str,
+    limit: int | None = None,
+    training_scope: Optional[str] = None,
+    symbols: Optional[list[str]] = None,
+) -> list[dict]:
     statuses = ["paper_active", "paper_validated", "real_ready", "backtest_accepted", "validation_accepted"]
-    return list_models_by_status(statuses, timeframe=timeframe, limit=limit)
+    return list_models_by_status(statuses, timeframe=timeframe, limit=limit, training_scope=training_scope, symbols=symbols)
 
 
-def count_accepted_models(timeframe: str) -> int:
-    return len(list_accepted_models(timeframe=timeframe))
+def count_accepted_models(timeframe: str, training_scope: Optional[str] = None, symbols: Optional[list[str]] = None) -> int:
+    return len(list_accepted_models(timeframe=timeframe, training_scope=training_scope, symbols=symbols))
 
 
 def count_paper_active_models(timeframe: Optional[str] = None) -> int:
@@ -418,7 +522,9 @@ def list_models(limit: int = 20) -> pd.DataFrame:
         df = pd.read_sql_query(
             f"""
             SELECT model_id, symbol_scope, timeframe, train_start, train_end, test_start, test_end,
-                   training_ts_utc, status, acceptance_status, evaluation_scope, is_active, account_mode
+                   training_ts_utc, status, acceptance_status, evaluation_scope, training_scope, symbols_json,
+                   metrics_json,
+                   is_active, account_mode
             FROM {MODEL_REGISTRY_TABLE}
             ORDER BY training_ts_utc DESC
             LIMIT ?
@@ -428,6 +534,13 @@ def list_models(limit: int = 20) -> pd.DataFrame:
         )
     finally:
         conn.close()
+    if not df.empty and "metrics_json" in df.columns:
+        scores = []
+        for _, row in df.iterrows():
+            record = _row_to_model_dict(row)
+            scores.append(model_profitability_score(record))
+        df["selection_score"] = scores
+        df = df.drop(columns=["metrics_json"])
     return df
 
 

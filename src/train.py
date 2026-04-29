@@ -25,6 +25,7 @@ from config import (
     MIN_TRAIN_ROWS,
     TRAINING_CUTOFF_HOURS_BEFORE_NOW,
     VALIDATION_WINDOW_HOURS,
+    TRAINING_SCOPE,
 )
 from db_utils import init_research_tables, ensure_project_directories
 from model_registry import register_model
@@ -42,6 +43,12 @@ def parse_args():
     parser.add_argument("--timeframe", default=TIMEFRAME, help="Timeframe filter")
     parser.add_argument("--test-size", type=int, default=TEST_SIZE, help="Number of latest datetimes for holdout")
     parser.add_argument("--model-id", type=str, default=None, help="Optional model id override")
+    parser.add_argument(
+        "--training-scope",
+        choices=["multi-symbol", "multi_symbol", "per-symbol", "per_symbol", "both"],
+        default=TRAINING_SCOPE,
+        help="multi-symbol trains one model across all symbols with symbol_code; per-symbol trains one model per crypto; both runs both scopes.",
+    )
     parser.add_argument("--min-train-rows", type=int, default=MIN_TRAIN_ROWS)
     parser.add_argument("--short-threshold", type=float, default=None, help="Override short probability threshold")
     parser.add_argument("--long-threshold", type=float, default=None, help="Override long probability threshold")
@@ -58,6 +65,10 @@ def parse_args():
         help="Base64-encoded JSON object for LightGBM params (PowerShell-safe alternative).",
     )
     return parser.parse_args()
+
+
+def _normalize_training_scope(raw: str) -> str:
+    return (raw or "multi_symbol").replace("-", "_")
 
 
 def _resolve_model_params(model_params_json: str | None, model_params_b64: str | None) -> dict:
@@ -162,27 +173,27 @@ def _apply_symbol_code(df: pd.DataFrame, mapping: dict[str, int]) -> pd.DataFram
     return out
 
 
-def main():
-    args = parse_args()
-    ensure_project_directories()
-    init_research_tables()
 
-    symbols = [s.upper().strip() for s in args.symbols] if args.symbols else [s.upper() for s in SYMBOLS]
+def train_one_scope(args, symbols: list[str], model_id_override: str | None = None) -> dict:
     df = _load_dataset(symbols=symbols, timeframe=args.timeframe)
     if df.empty:
-        print("No rows found in features table with valid labels and complete feature values.")
-        return
+        raise ValueError(f"No rows found in features table for symbols={symbols} timeframe={args.timeframe}.")
 
     train_df, test_df = _split_train_test(df, test_size_dates=args.test_size)
     if len(train_df) < args.min_train_rows:
         raise ValueError(
-            f"Train rows too low ({len(train_df)}). Increase data or reduce filtering; min_train_rows={args.min_train_rows}."
+            f"Train rows too low ({len(train_df)}) for symbols={symbols}. "
+            f"Increase data or reduce filtering; min_train_rows={args.min_train_rows}."
         )
 
+    training_scope = _normalize_training_scope(args.training_scope)
+    included_symbols = sorted(df["symbol"].unique().tolist())
     symbol_mapping = _build_symbol_mapping(df)
     train_df = _apply_symbol_code(train_df, symbol_mapping)
     test_df = _apply_symbol_code(test_df, symbol_mapping)
 
+    # Both scopes keep symbol_code for artifact compatibility. In per_symbol it is a
+    # constant 0, while multi_symbol uses it to let one model learn cross-symbol effects.
     feature_cols = FEATURE_COLUMNS + ["symbol_code"]
     X_train = train_df[feature_cols]
     y_train = train_df["label_class"]
@@ -215,14 +226,22 @@ def main():
     )
 
     training_ts = pd.Timestamp.now(tz="UTC")
-    model_id = args.model_id or f"lgbm_{args.timeframe}_{training_ts.strftime('%Y%m%d_%H%M%S')}"
+    if model_id_override:
+        model_id = model_id_override
+    elif args.model_id:
+        model_id = args.model_id
+    else:
+        scope_tag = "multi" if training_scope == "multi_symbol" else included_symbols[0].lower()
+        model_id = f"lgbm_{scope_tag}_{args.timeframe}_{training_ts.strftime('%Y%m%d_%H%M%S')}"
     model_path = MODELS_DIR / f"{model_id}.joblib"
 
     artifact = {
         "model_id": model_id,
         "trained_at_utc": training_ts.isoformat(),
+        "training_scope": training_scope,
         "timeframe": args.timeframe,
-        "symbols": sorted(df["symbol"].unique().tolist()),
+        "symbols": included_symbols,
+        "symbol_scope": ",".join(included_symbols),
         "feature_columns": feature_cols,
         "base_feature_columns": FEATURE_COLUMNS,
         "symbol_mapping": symbol_mapping,
@@ -261,6 +280,8 @@ def main():
             "test_start": test_df["datetime_utc"].min().isoformat(),
             "test_end": test_df["datetime_utc"].max().isoformat(),
         },
+        "training_scope": training_scope,
+        "symbols": included_symbols,
     }
 
     acceptance = evaluate_model_acceptance(metrics_bundle={"holdout": metrics})
@@ -271,6 +292,9 @@ def main():
     report_payload = {
         "model_id": model_id,
         "model_path": str(model_path),
+        "training_scope": training_scope,
+        "symbol_scope": ",".join(included_symbols),
+        "symbols": included_symbols,
         "metrics": metrics,
         "acceptance": acceptance,
         "params": {
@@ -278,6 +302,7 @@ def main():
             "short_threshold": short_threshold,
             "long_threshold": long_threshold,
             "cost_per_trade": COST_PER_TRADE,
+            "training_scope": training_scope,
         },
     }
     report_path.write_text(json.dumps(report_payload, ensure_ascii=True, indent=2), encoding="utf-8")
@@ -287,7 +312,7 @@ def main():
 
     register_model(
         model_id=model_id,
-        symbol_scope=",".join(sorted(df["symbol"].unique().tolist())),
+        symbol_scope=",".join(included_symbols),
         timeframe=args.timeframe,
         train_start=train_df["datetime_utc"].min().isoformat(),
         train_end=train_df["datetime_utc"].max().isoformat(),
@@ -303,21 +328,78 @@ def main():
             "long_threshold": long_threshold,
             "cost_per_trade": COST_PER_TRADE,
             "feature_columns": feature_cols,
+            "training_scope": training_scope,
+            "symbols": included_symbols,
         },
         status=registry_status,
         acceptance_status=acceptance_status,
         rejection_reasons=[],
         evaluation_scope=acceptance.get("evaluation_scope", "holdout"),
+        training_scope=training_scope,
+        symbols=included_symbols,
     )
 
-    print(f"Model trained successfully: {model_id}")
-    print(f"Model saved to: {model_path}")
-    print(f"Report saved to: {report_path}")
-    print(f"Holdout curve saved to: {curve_path}")
+    return {
+        "model_id": model_id,
+        "model_path": str(model_path),
+        "report_path": str(report_path),
+        "curve_path": str(curve_path),
+        "training_scope": training_scope,
+        "symbol_scope": ",".join(included_symbols),
+        "symbols": included_symbols,
+        "metrics": metrics,
+        "acceptance": acceptance,
+    }
+
+
+def main():
+    args = parse_args()
+    ensure_project_directories()
+    init_research_tables()
+
+    symbols = [s.upper().strip() for s in args.symbols] if args.symbols else [s.upper() for s in SYMBOLS]
+    training_scope = _normalize_training_scope(args.training_scope)
+
+    if training_scope == "both":
+        results = []
+        multi_args = argparse.Namespace(**vars(args))
+        multi_args.training_scope = "multi_symbol"
+        results.append(train_one_scope(args=multi_args, symbols=symbols))
+        per_args = argparse.Namespace(**vars(args))
+        per_args.training_scope = "per_symbol"
+        for symbol in symbols:
+            model_id = None
+            if args.model_id:
+                model_id = f"{args.model_id}_{symbol.lower()}"
+            result = train_one_scope(args=per_args, symbols=[symbol], model_id_override=model_id)
+            results.append(result)
+        print(json.dumps({"training_scope": "both", "models": results}, ensure_ascii=True, indent=2))
+        return
+
+    if training_scope == "per_symbol":
+        results = []
+        if args.model_id and len(symbols) > 1:
+            print("--model-id with --training-scope per-symbol and multiple symbols will be suffixed per symbol.")
+        for symbol in symbols:
+            model_id = None
+            if args.model_id:
+                model_id = args.model_id if len(symbols) == 1 else f"{args.model_id}_{symbol.lower()}"
+            result = train_one_scope(args=args, symbols=[symbol], model_id_override=model_id)
+            results.append(result)
+            print(f"Model trained successfully: {result['model_id']} scope=per_symbol symbol={symbol}")
+            print(f"Model saved to: {result['model_path']}")
+        print(json.dumps({"training_scope": training_scope, "models": results}, ensure_ascii=True, indent=2))
+        return
+
+    result = train_one_scope(args=args, symbols=symbols)
+    print(f"Model trained successfully: {result['model_id']} scope=multi_symbol")
+    print(f"Model saved to: {result['model_path']}")
+    print(f"Report saved to: {result['report_path']}")
+    print(f"Holdout curve saved to: {result['curve_path']}")
     print("Holdout metrics:")
-    print(json.dumps(metrics, ensure_ascii=True, indent=2))
+    print(json.dumps(result["metrics"], ensure_ascii=True, indent=2))
     print("Acceptance gating:")
-    print(json.dumps(acceptance, ensure_ascii=True, indent=2))
+    print(json.dumps(result["acceptance"], ensure_ascii=True, indent=2))
 
 
 if __name__ == "__main__":

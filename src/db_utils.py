@@ -207,6 +207,17 @@ def init_research_tables() -> None:
         _ensure_column(conn, MODEL_REGISTRY_TABLE, "real_ready_at_utc", "TEXT")
         _ensure_column(conn, MODEL_REGISTRY_TABLE, "real_active_at_utc", "TEXT")
         _ensure_column(conn, MODEL_REGISTRY_TABLE, "account_mode", "TEXT")
+        _ensure_column(conn, MODEL_REGISTRY_TABLE, "training_scope", "TEXT NOT NULL DEFAULT 'multi_symbol'")
+        _ensure_column(conn, MODEL_REGISTRY_TABLE, "symbols_json", "TEXT NOT NULL DEFAULT '[]'")
+        conn.execute(
+            f"""
+            UPDATE {MODEL_REGISTRY_TABLE}
+            SET symbols_json = '[' || '"' || REPLACE(symbol_scope, ',', '","') || '"' || ']'
+            WHERE (symbols_json IS NULL OR symbols_json = '[]' OR symbols_json = '')
+              AND symbol_scope IS NOT NULL
+              AND symbol_scope != ''
+            """
+        )
 
         conn.execute(
             f"""

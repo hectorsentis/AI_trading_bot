@@ -40,6 +40,7 @@ from config import (
     TARGET_ACCEPTED_MODELS,
     TIMEFRAME,
     TP_MULTIPLIER,
+    TRAINING_SCOPE,
 )
 from data_loader import (
     compute_gaps_for_symbol,
@@ -78,6 +79,12 @@ def parse_args():
     mode.add_argument("--loop", action="store_true", help="Run continuously until Ctrl+C.")
     parser.add_argument("--mode", choices=["paper", "shadow-real", "live"], default="paper")
     parser.add_argument("--paper-mode", choices=["per-model", "ensemble"], default="per-model")
+    parser.add_argument(
+        "--training-scope",
+        choices=["auto", "multi-symbol", "multi_symbol", "per-symbol", "per_symbol", "both"],
+        default="auto",
+        help="Filter models by training scope. both compares/runs eligible multi and per-symbol models. auto keeps backward compatibility.",
+    )
     parser.add_argument("--poll-seconds", type=int, default=BOT_POLL_SECONDS)
     parser.add_argument("--symbols", nargs="*", default=None, help="Comma or space separated symbols.")
     parser.add_argument("--timeframe", default=TIMEFRAME)
@@ -149,19 +156,82 @@ def _resolve_model(model_id_arg: str | None, timeframe: str) -> tuple[str, Path]
     raise FileNotFoundError("No valid model found for trading_bot.")
 
 
-def _resolve_model_pool(args) -> list[tuple[str, Path]]:
+def _normalize_training_scope_arg(raw: str | None) -> str | None:
+    if not raw or raw == "auto":
+        return None
+    return raw.replace("-", "_")
+
+
+def _resolve_model_pool(args, symbols: list[str]) -> list[tuple[str, Path]]:
     if args.model_id:
         model_id, model_path = _resolve_model(args.model_id, args.timeframe)
         return [(model_id, model_path)]
 
+    training_scope = _normalize_training_scope_arg(args.training_scope)
     pool: list[tuple[str, Path]] = []
-    for record in list_accepted_models(timeframe=args.timeframe, limit=max(1, int(args.target_accepted_models))):
+
+    if training_scope == "both":
+        seen: set[str] = set()
+        for scope in ["multi_symbol", "per_symbol"]:
+            records = list_accepted_models(
+                timeframe=args.timeframe,
+                training_scope=scope,
+                symbols=symbols,
+                limit=None,
+            )
+            for record in records:
+                model_id = str(record["model_id"])
+                if model_id in seen:
+                    continue
+                path = Path(str(record["model_path"]))
+                if path.exists():
+                    pool.append((model_id, path))
+                    seen.add(model_id)
+        if pool:
+            return pool[: max(1, int(args.target_accepted_models))]
+        raise FileNotFoundError(
+            f"No valid multi_symbol or per_symbol model found for symbols={symbols} timeframe={args.timeframe}."
+        )
+
+    if training_scope == "per_symbol":
+        seen: set[str] = set()
+        for symbol in symbols:
+            records = list_accepted_models(
+                timeframe=args.timeframe,
+                training_scope="per_symbol",
+                symbols=[symbol],
+                limit=None,
+            )
+            for record in records[: max(1, int(args.target_accepted_models))]:
+                model_id = str(record["model_id"])
+                if model_id in seen:
+                    continue
+                path = Path(str(record["model_path"]))
+                if path.exists():
+                    pool.append((model_id, path))
+                    seen.add(model_id)
+        if pool:
+            return pool
+
+    for record in list_accepted_models(
+        timeframe=args.timeframe,
+        limit=None,
+        training_scope=training_scope,
+        symbols=symbols if training_scope else None,
+    ):
         path = Path(str(record["model_path"]))
         if path.exists():
             pool.append((str(record["model_id"]), path))
+        if len(pool) >= max(1, int(args.target_accepted_models)):
+            break
 
     if pool:
         return pool
+
+    if training_scope is not None:
+        raise FileNotFoundError(
+            f"No valid {training_scope} model found for symbols={symbols} timeframe={args.timeframe}."
+        )
 
     model_id, model_path = _resolve_model(args.model_id, args.timeframe)
     return [(model_id, model_path)]
@@ -352,10 +422,11 @@ def run_once(args) -> dict:
             timeframe=args.timeframe,
             target_accepted_models=args.target_accepted_models,
             max_attempts=args.model_maintenance_max_attempts,
+            training_scope=TRAINING_SCOPE,
         )
         LOGGER.info("Model maintenance summary: %s", maintenance_summary)
 
-    model_pool = _resolve_model_pool(args)
+    model_pool = _resolve_model_pool(args, symbols=symbols)
     artifacts = []
     for model_id, model_path in model_pool:
         artifact = joblib.load(model_path)

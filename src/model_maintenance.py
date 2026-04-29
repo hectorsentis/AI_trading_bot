@@ -18,6 +18,7 @@ from config import (
     TARGET_ACCEPTED_MODELS,
     TIMEFRAME,
     MODEL_MAINTENANCE_INTERVAL_SECONDS,
+    TRAINING_SCOPE,
 )
 from model_registry import count_accepted_models, get_model_by_id, list_accepted_models, set_active_model
 from runtime_status import record_event, update_status
@@ -77,9 +78,14 @@ def build_trial_plan(max_attempts: int) -> list[TrainingTrial]:
     return trials[: max(0, int(max_attempts))]
 
 
-def _eligible_existing_accepted(timeframe: str) -> list[dict]:
+def _normalize_training_scope(raw: str) -> str:
+    scope = (raw or "both").replace("-", "_")
+    return scope if scope in {"multi_symbol", "per_symbol", "both"} else "both"
+
+
+def _eligible_existing_accepted(timeframe: str, training_scope: str | None = None, symbols: list[str] | None = None) -> list[dict]:
     models = []
-    for model in list_accepted_models(timeframe=timeframe):
+    for model in list_accepted_models(timeframe=timeframe, training_scope=training_scope, symbols=symbols):
         path = Path(str(model.get("model_path", "")))
         if path.exists():
             models.append(model)
@@ -92,8 +98,49 @@ def maintain_model_pool(
     target_accepted_models: int = TARGET_ACCEPTED_MODELS,
     max_attempts: int = MODEL_POOL_MAX_TRAINING_ATTEMPTS_PER_CYCLE,
     validation_max_folds: int = MODEL_POOL_VALIDATION_MAX_FOLDS,
+    training_scope: str = TRAINING_SCOPE,
 ) -> dict:
-    accepted_before = _eligible_existing_accepted(timeframe)
+    training_scope = _normalize_training_scope(training_scope)
+    if training_scope == "both":
+        multi = maintain_model_pool(
+            symbols=symbols,
+            timeframe=timeframe,
+            target_accepted_models=target_accepted_models,
+            max_attempts=max_attempts,
+            validation_max_folds=validation_max_folds,
+            training_scope="multi_symbol",
+        )
+        per = maintain_model_pool(
+            symbols=symbols,
+            timeframe=timeframe,
+            target_accepted_models=target_accepted_models,
+            max_attempts=max_attempts,
+            validation_max_folds=validation_max_folds,
+            training_scope="per_symbol",
+        )
+        return {
+            "training_scope": "both",
+            "multi_symbol": multi,
+            "per_symbol": per,
+            "target_met": bool(multi.get("target_met")) and bool(per.get("target_met")),
+        }
+    if training_scope == "per_symbol" and len(symbols) > 1:
+        per_symbol = {}
+        for symbol in symbols:
+            per_symbol[symbol] = maintain_model_pool(
+                symbols=[symbol],
+                timeframe=timeframe,
+                target_accepted_models=target_accepted_models,
+                max_attempts=max_attempts,
+                validation_max_folds=validation_max_folds,
+                training_scope=training_scope,
+            )
+        return {
+            "training_scope": training_scope,
+            "per_symbol": per_symbol,
+            "target_met": all(item.get("target_met") for item in per_symbol.values()),
+        }
+    accepted_before = _eligible_existing_accepted(timeframe, training_scope=training_scope, symbols=symbols)
     needed = max(0, int(target_accepted_models) - len(accepted_before))
     summary = {
         "target_accepted_models": int(target_accepted_models),
@@ -101,17 +148,20 @@ def maintain_model_pool(
         "attempts": [],
         "accepted_after": [],
         "needed_before_attempts": needed,
+        "training_scope": training_scope,
+        "symbols": symbols,
     }
     if needed <= 0:
         summary["accepted_after"] = summary["accepted_before"]
         return summary
 
     for idx, trial in enumerate(build_trial_plan(max_attempts), start=1):
-        if count_accepted_models(timeframe) >= int(target_accepted_models):
+        if count_accepted_models(timeframe, training_scope=training_scope, symbols=symbols) >= int(target_accepted_models):
             break
 
         stamp = pd.Timestamp.now(tz="UTC").strftime("%Y%m%d_%H%M%S")
-        model_id = f"auto_lgbm_{timeframe}_{stamp}_{idx:02d}"
+        scope_tag = "multi" if training_scope == "multi_symbol" else symbols[0].lower()
+        model_id = f"auto_lgbm_{scope_tag}_{timeframe}_{stamp}_{idx:02d}"
         params_b64 = _b64_json(trial.params)
         symbols_args = [s.upper().strip() for s in symbols]
 
@@ -133,6 +183,8 @@ def maintain_model_pool(
             timeframe,
             "--model-id",
             model_id,
+            "--training-scope",
+            training_scope,
             "--short-threshold",
             str(trial.short_threshold),
             "--long-threshold",
@@ -188,13 +240,13 @@ def maintain_model_pool(
         attempt["final_status"] = record.get("status") if record else None
         attempt["rejection_reasons"] = record.get("rejection_reasons_json") if record else None
 
-        if record and record.get("acceptance_status") == "accepted" and not _eligible_existing_accepted(timeframe):
+        if record and record.get("acceptance_status") == "accepted" and not _eligible_existing_accepted(timeframe, training_scope=training_scope, symbols=symbols):
             set_active_model(model_id, timeframe=timeframe)
             attempt["set_active"] = True
 
         summary["attempts"].append(attempt)
 
-    accepted_after = _eligible_existing_accepted(timeframe)
+    accepted_after = _eligible_existing_accepted(timeframe, training_scope=training_scope, symbols=symbols)
     summary["accepted_after"] = [m["model_id"] for m in accepted_after]
     summary["accepted_count_after"] = len(accepted_after)
     summary["target_met"] = len(accepted_after) >= int(target_accepted_models)
@@ -208,6 +260,7 @@ def parse_args():
     parser.add_argument("--target-accepted-models", type=int, default=TARGET_ACCEPTED_MODELS)
     parser.add_argument("--max-attempts", type=int, default=MODEL_POOL_MAX_TRAINING_ATTEMPTS_PER_CYCLE)
     parser.add_argument("--validation-max-folds", type=int, default=MODEL_POOL_VALIDATION_MAX_FOLDS)
+    parser.add_argument("--training-scope", choices=["multi-symbol", "multi_symbol", "per-symbol", "per_symbol", "both"], default=TRAINING_SCOPE)
     parser.add_argument("--loop", action="store_true")
     parser.add_argument("--interval-seconds", type=int, default=MODEL_MAINTENANCE_INTERVAL_SECONDS)
     return parser.parse_args()
@@ -217,13 +270,32 @@ def main():
     args = parse_args()
     symbols = [s.upper().strip() for s in args.symbols] if args.symbols else [s.upper() for s in SYMBOLS]
 
+    training_scope = _normalize_training_scope(args.training_scope)
+
     def _cycle():
+        if training_scope == "per_symbol" and len(symbols) > 1:
+            per_symbol = {}
+            for symbol in symbols:
+                per_symbol[symbol] = maintain_model_pool(
+                    symbols=[symbol],
+                    timeframe=args.timeframe,
+                    target_accepted_models=args.target_accepted_models,
+                    max_attempts=args.max_attempts,
+                    validation_max_folds=args.validation_max_folds,
+                    training_scope=training_scope,
+                )
+            return {
+                "training_scope": training_scope,
+                "per_symbol": per_symbol,
+                "target_met": all(item.get("target_met") for item in per_symbol.values()),
+            }
         return maintain_model_pool(
             symbols=symbols,
             timeframe=args.timeframe,
             target_accepted_models=args.target_accepted_models,
             max_attempts=args.max_attempts,
             validation_max_folds=args.validation_max_folds,
+            training_scope=training_scope,
         )
 
     if args.loop:

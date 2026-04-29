@@ -140,7 +140,37 @@ No activa real salvo flags explícitos y `ALLOW_AUTO_PROMOTE_TO_REAL=true`.
 streamlit run src/dashboard.py
 ```
 
-Muestra overview, registry, paper portfolios, órdenes, fills, performance, data quality y risk events desde SQLite.
+Dashboard operativo profesional en Streamlit + Plotly. Es de solo lectura: abre SQLite en modo `mode=ro` y no ejecuta órdenes ni cambia el estado del bot.
+
+Datos usados:
+
+- SQLite configurado por `SQLITE_DB_PATH` / `config.DB_FILE`.
+- Tablas: `prices`, `data_coverage`, `data_gaps`, `model_registry`, `signals`, `orders`, `fills`, `positions`, `portfolio_snapshots`, `paper_model_metrics`, `bot_events`, `risk_events`, `bot_status`.
+- Fallbacks de `reports/`: `backtest_oos_equity*.csv`, `backtest_oos_signals*.csv`, `backtest_oos_summary*.json`, `validation_equity*.csv`, `validation_summary*.json`.
+- Logs filtrados en `logs/*.log` solo para líneas útiles: `ERROR`, `WARNING`, rejected, risk, gap, failed, blocked.
+
+Secciones:
+
+1. **Overview**: header operativo, modo actual, estado del bot, KPIs, equity curve, benchmark buy & hold si existe, precio + señales.
+2. **Portfolio**: equity/drawdown, PnL por operación/backtest, posiciones actuales y exposición.
+3. **Signals**: últimas señales con modelo, símbolo, timeframe y confianza.
+4. **Orders**: órdenes recientes y fills.
+5. **Models**: registry, métricas OOS/backtest, accepted/rejected y resumen de reportes.
+6. **Data Quality**: cobertura, gaps abiertos y row counts.
+7. **Logs / Ops**: límites de riesgo, risk events y logs críticos.
+
+Si falta una tabla o la DB no existe, el dashboard no debe crashear; muestra el path esperado y comandos sugeridos para generar datos.
+
+Comandos recomendados antes de abrirlo:
+
+```bash
+python src/db_utils.py --init --check-schema
+python src/realtime_ingestor.py --symbols BTCUSDT ETHUSDT SOLUSDT --timeframe 1h
+python src/model_maintenance.py --target-accepted-models 5 --max-attempts 50
+python src/trading_bot.py --mode paper --paper-mode per-model --run-once
+python src/paper_model_evaluator.py --evaluate-active
+streamlit run src/dashboard.py
+```
 
 ## Verificación local mínima
 
@@ -214,3 +244,78 @@ Ver estado desde terminal:
 ```
 
 El dashboard muestra `Bot: RUNNING` si el `autonomous_runner` mantiene heartbeats recientes. Si no hay heartbeat o está stale, muestra `OFF/STALE`.
+
+## Entrenamiento multi-cripto vs individual por cripto
+
+El entrenamiento soporta dos scopes explícitos:
+
+- `multi_symbol`: un único modelo se entrena con todos los símbolos configurados. Usa `symbol_code` como feature para distinguir cripto dentro del mismo modelo.
+- `per_symbol`: entrena un modelo separado por cada cripto. Cada artifact mantiene `symbol_code` por compatibilidad, pero en la práctica el modelo solo ve un símbolo.
+
+Config por defecto en `.env`:
+
+```env
+TRAINING_SCOPE=both
+```
+
+### Entrenar ambos modos autom?ticamente
+
+```powershell
+python src/train.py --training-scope both --symbols BTCUSDT ETHUSDT SOLUSDT --timeframe 1h
+python src/model_maintenance.py --training-scope both --symbols BTCUSDT ETHUSDT SOLUSDT --timeframe 1h --target-accepted-models 5 --max-attempts 50
+```
+
+### Entrenar un modelo multi-symbol
+
+```powershell
+python src/train.py --training-scope multi-symbol --symbols BTCUSDT ETHUSDT SOLUSDT --timeframe 1h
+python src/validate_model.py --symbols BTCUSDT ETHUSDT SOLUSDT --timeframe 1h --model-id MODEL_ID
+python src/backtest.py --mode oos --timeframe 1h --model-id MODEL_ID
+```
+
+Mantenimiento automático del pool multi-symbol:
+
+```powershell
+python src/model_maintenance.py --training-scope multi-symbol --symbols BTCUSDT ETHUSDT SOLUSDT --timeframe 1h --target-accepted-models 5 --max-attempts 50
+```
+
+### Entrenar modelos individuales por cripto
+
+```powershell
+python src/train.py --training-scope per-symbol --symbols BTCUSDT ETHUSDT SOLUSDT --timeframe 1h
+```
+
+Esto genera un modelo por símbolo. Para validar/backtest individualmente:
+
+```powershell
+python src/validate_model.py --symbols BTCUSDT --timeframe 1h --model-id MODEL_ID_BTC
+python src/backtest.py --mode oos --timeframe 1h --model-id MODEL_ID_BTC
+```
+
+Mantenimiento automático del pool per-symbol:
+
+```powershell
+python src/model_maintenance.py --training-scope per-symbol --symbols BTCUSDT ETHUSDT SOLUSDT --timeframe 1h --target-accepted-models 2 --max-attempts 20
+```
+
+### Comparar ambos modos en paper trading
+
+Paper con modelos multi-symbol:
+
+```powershell
+python src/trading_bot.py --mode paper --paper-mode per-model --training-scope multi-symbol --symbols BTCUSDT ETHUSDT SOLUSDT --timeframe 1h --run-once
+```
+
+Paper con modelos per-symbol:
+
+```powershell
+python src/trading_bot.py --mode paper --paper-mode per-model --training-scope per-symbol --symbols BTCUSDT ETHUSDT SOLUSDT --timeframe 1h --run-once
+```
+
+Paper comparando/ejecutando ambos scopes elegibles:
+
+```powershell
+python src/trading_bot.py --mode paper --paper-mode per-model --training-scope both --symbols BTCUSDT ETHUSDT SOLUSDT --timeframe 1h --run-once
+```
+
+El `model_registry` guarda `symbol_scope`, `training_scope`, `symbols_json`, `timeframe` y `selection_score`. La selecci?n usa m?tricas observadas de validaci?n/backtest/paper para ordenar candidatos; esto busca el mejor edge observado, no garantiza rentabilidad futura.

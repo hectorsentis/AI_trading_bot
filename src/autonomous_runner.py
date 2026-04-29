@@ -18,6 +18,7 @@ from config import (
     SYMBOLS,
     TARGET_ACCEPTED_MODELS,
     TIMEFRAME,
+    TRAINING_SCOPE,
 )
 from db_utils import init_research_tables
 from runtime_status import load_status, record_event, update_status
@@ -79,6 +80,8 @@ class AutonomousRunner:
                     "--skip-model-maintenance",
                     "--target-accepted-models",
                     str(TARGET_ACCEPTED_MODELS),
+                    "--training-scope",
+                    TRAINING_SCOPE,
                     "--log-level",
                     "INFO",
                 ],
