@@ -15,6 +15,13 @@ from config import (
     DB_FILE,
     DRY_RUN,
     ENABLE_TRADING,
+    ENABLE_TESTNET_PAPER_TRADING,
+    ENABLE_LOCAL_SIMULATED_PAPER,
+    BINANCE_TESTNET_API_KEY,
+    BINANCE_TESTNET_API_SECRET,
+    ACCOUNT_MODE_LOCAL_PAPER,
+    ACCOUNT_MODE_TESTNET_PAPER,
+    BOT_POLL_SECONDS,
     FEATURES_TABLE,
     LOGS_DIR,
     LOOKAHEAD_BARS,
@@ -45,7 +52,7 @@ from download_data import normalize_klines, save_raw_snapshot
 from download_data import get_latest_datetime_from_db
 from execution_engine import ExecutionEngine
 from feature_store import run_feature_store
-from model_maintenance import maintain_model_pool
+from model_pool_manager import maintain_paper_model_pool
 from model_registry import get_latest_model, get_model_by_id, list_accepted_models, select_model_for_inference
 from portfolio_manager import PortfolioManager
 from risk_manager import RiskManager
@@ -69,7 +76,9 @@ def parse_args():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--run-once", action="store_true", help="Run one full paper-trading cycle.")
     mode.add_argument("--loop", action="store_true", help="Run continuously until Ctrl+C.")
-    parser.add_argument("--poll-seconds", type=int, default=60)
+    parser.add_argument("--mode", choices=["paper", "shadow-real", "live"], default="paper")
+    parser.add_argument("--paper-mode", choices=["per-model", "ensemble"], default="per-model")
+    parser.add_argument("--poll-seconds", type=int, default=BOT_POLL_SECONDS)
     parser.add_argument("--symbols", nargs="*", default=None, help="Comma or space separated symbols.")
     parser.add_argument("--timeframe", default=TIMEFRAME)
     parser.add_argument("--model-id", type=str, default=None)
@@ -85,7 +94,7 @@ def parse_args():
     parser.add_argument("--model-maintenance-max-attempts", type=int, default=MODEL_POOL_MAX_TRAINING_ATTEMPTS_PER_CYCLE)
     parser.add_argument("--model-maintenance-validation-folds", type=int, default=MODEL_POOL_VALIDATION_MAX_FOLDS)
     parser.add_argument("--model-maintenance-interval-seconds", type=int, default=MODEL_POOL_MAINTENANCE_INTERVAL_SECONDS)
-    parser.add_argument("--disable-ensemble", action="store_true", help="Use one selected model instead of accepted-model ensemble.")
+    parser.add_argument("--disable-ensemble", action="store_true", help="Legacy alias: use per-model/single model instead of ensemble.")
     return parser.parse_args()
 
 
@@ -102,7 +111,9 @@ def configure_logging(level: str) -> None:
     )
 
 
-def _assert_safety() -> None:
+def _assert_safety(mode: str = "paper") -> None:
+    if mode == "live":
+        raise RuntimeError("Live trading is implemented behind src/live_trading_engine.py safety gates, not trading_bot paper mode.")
     if ENABLE_TRADING:
         raise RuntimeError("ENABLE_TRADING is True. This bot refuses to run live in this step.")
     if not DRY_RUN:
@@ -139,7 +150,7 @@ def _resolve_model(model_id_arg: str | None, timeframe: str) -> tuple[str, Path]
 
 
 def _resolve_model_pool(args) -> list[tuple[str, Path]]:
-    if args.model_id or args.disable_ensemble:
+    if args.model_id:
         model_id, model_path = _resolve_model(args.model_id, args.timeframe)
         return [(model_id, model_path)]
 
@@ -192,21 +203,23 @@ def _save_signal(
     prob_short: float,
     prob_flat: float,
     prob_long: float,
+    account_mode: str = ACCOUNT_MODE_LOCAL_PAPER,
 ) -> None:
     conn = sqlite3.connect(DB_FILE)
     try:
         conn.execute(
             f"""
             INSERT OR REPLACE INTO {SIGNALS_TABLE} (
-                model_id, symbol, timeframe, datetime_utc, signal_position, signal_label,
+                model_id, symbol, timeframe, account_mode, datetime_utc, signal_position, signal_label,
                 prob_short, prob_flat, prob_long, created_at_utc
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 model_id,
                 symbol,
                 timeframe,
+                account_mode,
                 datetime_utc.isoformat(),
                 int(signal_position),
                 {1: "LONG", 0: "FLAT", -1: "SHORT"}[int(signal_position)],
@@ -291,8 +304,16 @@ def refresh_recent_features(symbols: list[str], timeframe: str) -> None:
     run_feature_store(symbols=symbols, timeframe=timeframe, args=args)
 
 
+def _default_paper_account_mode() -> str:
+    if ENABLE_TESTNET_PAPER_TRADING and BINANCE_TESTNET_API_KEY and BINANCE_TESTNET_API_SECRET:
+        return ACCOUNT_MODE_TESTNET_PAPER
+    if ENABLE_LOCAL_SIMULATED_PAPER:
+        return ACCOUNT_MODE_LOCAL_PAPER
+    raise RuntimeError("No paper trading mode available. Enable testnet credentials or ENABLE_LOCAL_SIMULATED_PAPER=true.")
+
+
 def run_once(args) -> dict:
-    _assert_safety()
+    _assert_safety(args.mode)
     ensure_project_directories()
     init_research_tables()
 
@@ -326,12 +347,11 @@ def run_once(args) -> dict:
             args.target_accepted_models,
             args.model_maintenance_max_attempts,
         )
-        maintenance_summary = maintain_model_pool(
+        maintenance_summary = maintain_paper_model_pool(
             symbols=symbols,
             timeframe=args.timeframe,
             target_accepted_models=args.target_accepted_models,
             max_attempts=args.model_maintenance_max_attempts,
-            validation_max_folds=args.model_maintenance_validation_folds,
         )
         LOGGER.info("Model maintenance summary: %s", maintenance_summary)
 
@@ -340,15 +360,132 @@ def run_once(args) -> dict:
     for model_id, model_path in model_pool:
         artifact = joblib.load(model_path)
         artifacts.append((model_id, model_path, artifact))
+
+    if args.paper_mode == "per-model" or args.disable_ensemble:
+        account_mode = _default_paper_account_mode()
+        broker = BinanceSpotClient.testnet_execution_client() if account_mode == ACCOUNT_MODE_TESTNET_PAPER else None
+        model_reports: list[dict] = []
+        total_price_map: dict[str, float] = {}
+
+        for model_id, model_path, artifact in artifacts:
+            portfolio_manager = PortfolioManager(
+                timeframe=args.timeframe,
+                dry_run=True,
+                initial_cash=float(args.paper_initial_cash),
+                model_id=model_id,
+                account_mode=account_mode,
+            )
+            risk_manager = RiskManager(model_id=model_id, account_mode=account_mode)
+            execution_engine = ExecutionEngine(
+                portfolio_manager=portfolio_manager,
+                risk_manager=risk_manager,
+                account_mode=account_mode,
+                broker_client=broker,
+            )
+            symbol_reports: list[dict] = []
+            price_map: dict[str, float] = {}
+            model = artifact["model"]
+            feature_columns = artifact["feature_columns"]
+            base_feature_columns = artifact["base_feature_columns"]
+            symbol_mapping = artifact["symbol_mapping"]
+
+            for symbol in symbols:
+                if symbol not in symbol_mapping:
+                    symbol_reports.append({"symbol": symbol, "status": "SKIPPED", "reason": "symbol_not_in_model_mapping"})
+                    continue
+                latest = _load_latest_features(symbol=symbol, timeframe=args.timeframe, base_feature_columns=base_feature_columns)
+                if latest.empty:
+                    symbol_reports.append({"symbol": symbol, "status": "SKIPPED", "reason": "no_latest_features"})
+                    continue
+                latest = latest.copy()
+                latest["symbol_code"] = int(symbol_mapping[symbol])
+                probas = model.predict_proba(latest[feature_columns])
+                dt = latest.iloc[0]["datetime_utc"]
+                close_price = float(latest.iloc[0]["close"])
+                price_map[symbol] = close_price
+                total_price_map[symbol] = close_price
+                prob_short, prob_flat, prob_long = [float(x) for x in probas[0]]
+                signal = generate_signal_from_probabilities(prob_short=prob_short, prob_flat=prob_flat, prob_long=prob_long)
+                signal["datetime_utc"] = dt.isoformat()
+                _save_signal(
+                    model_id=model_id,
+                    symbol=symbol,
+                    timeframe=args.timeframe,
+                    datetime_utc=dt,
+                    signal_position=signal["final_signal_position"],
+                    prob_short=prob_short,
+                    prob_flat=prob_flat,
+                    prob_long=prob_long,
+                    account_mode=account_mode,
+                )
+                execution = execution_engine.execute_signal(
+                    model_id=model_id,
+                    symbol=symbol,
+                    timeframe=args.timeframe,
+                    signal_payload=signal,
+                    market_price=close_price,
+                )
+                symbol_reports.append(
+                    {
+                        "symbol": symbol,
+                        "status": "OK",
+                        "datetime_utc": dt.isoformat(),
+                        "close_price": close_price,
+                        "signal": signal,
+                        "execution": execution,
+                    }
+                )
+            state = portfolio_manager.snapshot(price_by_symbol=price_map)
+            model_reports.append(
+                {
+                    "model_id": model_id,
+                    "model_path": str(model_path),
+                    "account_mode": account_mode,
+                    "symbol_reports": symbol_reports,
+                    "portfolio_state": {
+                        "cash": state.cash,
+                        "equity": state.equity,
+                        "realized_pnl": state.realized_pnl,
+                        "unrealized_pnl": state.unrealized_pnl,
+                        "daily_realized_pnl": state.daily_realized_pnl,
+                        "exposure_by_symbol": state.exposure_by_symbol,
+                        "positions": state.positions,
+                    },
+                }
+            )
+
+        run_report = {
+            "mode": "paper",
+            "paper_mode": "per-model",
+            "account_mode": account_mode,
+            "dry_run": DRY_RUN,
+            "enable_trading": ENABLE_TRADING,
+            "symbols": symbols,
+            "timeframe": args.timeframe,
+            "sync_summary": sync_summary,
+            "maintenance_summary": maintenance_summary,
+            "models": model_reports,
+            "created_at_utc": pd.Timestamp.now(tz="UTC").isoformat(),
+        }
+        stamp = pd.Timestamp.now(tz="UTC").strftime("%Y%m%d_%H%M%S")
+        report_path = Path(args.report_path) if args.report_path else REPORTS_DIR / f"trading_bot_per_model_{stamp}.json"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(run_report, ensure_ascii=True, indent=2), encoding="utf-8")
+        run_report["report_path"] = str(report_path)
+        LOGGER.info("per-model trading_bot run completed: %s", report_path)
+        return run_report
+
     execution_model_id = "ensemble:" + ",".join(model_id for model_id, _, _ in artifacts)
 
     portfolio_manager = PortfolioManager(
         timeframe=args.timeframe,
         dry_run=True,
         initial_cash=float(args.paper_initial_cash),
+        model_id=execution_model_id,
+        account_mode=ACCOUNT_MODE_LOCAL_PAPER,
     )
-    risk_manager = RiskManager()
-    execution_engine = ExecutionEngine(portfolio_manager=portfolio_manager, risk_manager=risk_manager)
+    risk_manager = RiskManager(model_id=execution_model_id, account_mode=ACCOUNT_MODE_LOCAL_PAPER)
+    execution_engine = ExecutionEngine(portfolio_manager=portfolio_manager, risk_manager=risk_manager, account_mode=ACCOUNT_MODE_LOCAL_PAPER)
 
     price_map: dict[str, float] = {}
     symbol_reports: list[dict] = []
@@ -405,6 +542,7 @@ def run_once(args) -> dict:
             prob_short=prob_short,
             prob_flat=prob_flat,
             prob_long=prob_long,
+            account_mode=ACCOUNT_MODE_LOCAL_PAPER,
         )
         signal["datetime_utc"] = dt.isoformat()
 
@@ -442,7 +580,9 @@ def run_once(args) -> dict:
     portfolio_state = portfolio_manager.snapshot(price_by_symbol=price_map)
 
     run_report = {
-        "mode": "paper_dry_run",
+        "mode": "paper",
+        "paper_mode": "ensemble",
+        "account_mode": ACCOUNT_MODE_LOCAL_PAPER,
         "model_id": execution_model_id,
         "model_pool": [{"model_id": model_id, "model_path": str(model_path)} for model_id, model_path, _ in artifacts],
         "timeframe": args.timeframe,

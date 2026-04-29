@@ -307,3 +307,131 @@ PAPER_MAX_EXPOSURE_PER_ASSET = 0.35
 PAPER_MAX_POSITION_NOTIONAL_USDT = 3_000.0
 PAPER_MAX_NEW_TRADES_PER_DAY = 20
 PAPER_MAX_DAILY_LOSS_USDT = 500.0
+
+# =========================================================
+# AUTONOMOUS PLATFORM CONFIG (safe-by-default)
+# =========================================================
+
+def _env_str(name: str, default: str | None = None) -> str | None:
+    raw = os.getenv(name)
+    return default if raw is None or raw == "" else raw.strip()
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    try:
+        return int(raw) if raw not in (None, "") else int(default)
+    except ValueError:
+        return int(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    try:
+        return float(raw) if raw not in (None, "") else float(default)
+    except ValueError:
+        return float(default)
+
+
+def _env_list(name: str, default: list[str]) -> list[str]:
+    raw = os.getenv(name)
+    if not raw:
+        return list(default)
+    return [part.strip().upper() for part in raw.split(",") if part.strip()]
+
+
+DB_FILE = Path(_env_str("SQLITE_DB_PATH", str(DB_FILE))).expanduser()
+if not DB_FILE.is_absolute():
+    DB_FILE = (BASE_DIR / DB_FILE).resolve()
+DB_DIR = DB_FILE.parent
+
+FILLS_TABLE = "fills"
+PAPER_MODEL_METRICS_TABLE = "paper_model_metrics"
+MODEL_LIFECYCLE_EVENTS_TABLE = "model_lifecycle_events"
+BOT_EVENTS_TABLE = "bot_events"
+RISK_EVENTS_TABLE = "risk_events"
+
+MODEL_LIFECYCLE_STATUSES = [
+    "candidate", "validation_rejected", "validation_accepted", "backtest_rejected",
+    "backtest_accepted", "paper_active", "paper_rejected", "paper_validated",
+    "real_ready", "real_active", "real_paused", "real_rejected", "archived",
+]
+
+ACCOUNT_MODE_LOCAL_PAPER = "local_paper"
+ACCOUNT_MODE_TESTNET_PAPER = "testnet_paper"
+ACCOUNT_MODE_SHADOW_REAL = "shadow_real"
+ACCOUNT_MODE_REAL = "real"
+ACCOUNT_MODES = [ACCOUNT_MODE_LOCAL_PAPER, ACCOUNT_MODE_TESTNET_PAPER, ACCOUNT_MODE_SHADOW_REAL, ACCOUNT_MODE_REAL]
+
+DRY_RUN = _env_bool("DRY_RUN", True)
+ENABLE_TESTNET_PAPER_TRADING = _env_bool("ENABLE_TESTNET_PAPER_TRADING", True)
+ENABLE_LOCAL_SIMULATED_PAPER = _env_bool("ENABLE_LOCAL_SIMULATED_PAPER", True)
+ENABLE_LIVE_TRADING = _env_bool("ENABLE_LIVE_TRADING", False)
+ENABLE_REAL_ORDER_EXECUTION = _env_bool("ENABLE_REAL_ORDER_EXECUTION", False)
+ENABLE_REAL_BINANCE_ACCOUNT = _env_bool("ENABLE_REAL_BINANCE_ACCOUNT", False)
+ALLOW_AUTO_PROMOTE_TO_REAL = _env_bool("ALLOW_AUTO_PROMOTE_TO_REAL", False)
+ENABLE_TRADING = ENABLE_LIVE_TRADING and ENABLE_REAL_ORDER_EXECUTION and ENABLE_REAL_BINANCE_ACCOUNT and not DRY_RUN
+
+BINANCE_ENV = (_env_str("BINANCE_ENV", "prod") or "prod").lower()
+BINANCE_PUBLIC_BASE_URL = _env_str("BINANCE_PUBLIC_BASE_URL", "https://api.binance.com")
+BINANCE_REST_BASE_URL = _env_str("BINANCE_REST_BASE_URL", BINANCE_PUBLIC_BASE_URL)
+BINANCE_WS_API_URL = _env_str("BINANCE_WS_API_URL", "")
+BINANCE_WS_STREAM_URL = _env_str("BINANCE_WS_STREAM_URL", "")
+BINANCE_WS_COMBINED_STREAM_URL = _env_str("BINANCE_WS_COMBINED_STREAM_URL", "")
+
+# Binance Spot Demo Mode aliases are accepted because Binance labels this
+# environment differently from the older "testnet" wording.
+BINANCE_DEMO_API_KEY = _env_str("BINANCE_DEMO_API_KEY", "") or None
+BINANCE_DEMO_API_SECRET = _env_str("BINANCE_DEMO_API_SECRET", "") or None
+BINANCE_TESTNET_API_KEY = _env_str("BINANCE_TESTNET_API_KEY", BINANCE_DEMO_API_KEY or _env_str("BINANCE_API_KEY", "")) or None
+BINANCE_TESTNET_API_SECRET = _env_str("BINANCE_TESTNET_API_SECRET", BINANCE_DEMO_API_SECRET or _env_str("BINANCE_API_SECRET", "")) or None
+BINANCE_TESTNET_BASE_URL = _env_str(
+    "BINANCE_TESTNET_BASE_URL",
+    _env_str("BINANCE_REST_BASE_URL", "https://testnet.binance.vision"),
+)
+if BINANCE_ENV in {"demo", "demo_mode", "spot_demo", "spot_demo_mode"}:
+    BINANCE_TESTNET_BASE_URL = BINANCE_REST_BASE_URL
+BINANCE_REAL_API_KEY = _env_str("BINANCE_REAL_API_KEY", "") or None
+BINANCE_REAL_API_SECRET = _env_str("BINANCE_REAL_API_SECRET", "") or None
+BINANCE_REAL_BASE_URL = _env_str("BINANCE_REAL_BASE_URL", "https://api.binance.com")
+BINANCE_ACCOUNT_REST_BASE_URL = BINANCE_TESTNET_BASE_URL if BINANCE_USE_TESTNET else BINANCE_REAL_BASE_URL
+BINANCE_EXECUTION_REST_BASE_URL = BINANCE_ACCOUNT_REST_BASE_URL
+
+SYMBOLS = _env_list("SYMBOLS", SYMBOLS)
+TIMEFRAME = _env_str("TIMEFRAME", TIMEFRAME) or TIMEFRAME
+TARGET_ACCEPTED_MODELS = _env_int("TARGET_ACCEPTED_MODELS", 5)
+MAX_TRAINING_ATTEMPTS_PER_CYCLE = _env_int("MAX_TRAINING_ATTEMPTS_PER_CYCLE", _env_int("MODEL_POOL_MAX_TRAINING_ATTEMPTS_PER_CYCLE", 50))
+MODEL_POOL_MAX_TRAINING_ATTEMPTS_PER_CYCLE = MAX_TRAINING_ATTEMPTS_PER_CYCLE
+AUTO_REPLACE_REJECTED_MODELS = _env_bool("AUTO_REPLACE_REJECTED_MODELS", True)
+TRAINING_CUTOFF_HOURS_BEFORE_NOW = _env_int("TRAINING_CUTOFF_HOURS_BEFORE_NOW", 168)
+VALIDATION_WINDOW_HOURS = _env_int("VALIDATION_WINDOW_HOURS", 168)
+WALK_FORWARD_ENABLED = _env_bool("WALK_FORWARD_ENABLED", True)
+
+MIN_PAPER_VALIDATION_DAYS = _env_int("MIN_PAPER_VALIDATION_DAYS", 7)
+MIN_PAPER_VALIDATION_TRADES = _env_int("MIN_PAPER_VALIDATION_TRADES", 20)
+PAPER_MIN_PROFIT_FACTOR = _env_float("PAPER_MIN_PROFIT_FACTOR", 1.05)
+PAPER_MAX_DRAWDOWN = _env_float("PAPER_MAX_DRAWDOWN", 0.08)
+PAPER_MIN_TOTAL_RETURN = _env_float("PAPER_MIN_TOTAL_RETURN", 0.0)
+PAPER_MIN_WIN_RATE = _env_float("PAPER_MIN_WIN_RATE", 0.45)
+
+MAX_EXPOSURE_PER_MODEL_USDT = _env_float("MAX_EXPOSURE_PER_MODEL_USDT", 100.0)
+MAX_EXPOSURE_TOTAL_USDT = _env_float("MAX_EXPOSURE_TOTAL_USDT", 500.0)
+MAX_POSITION_PCT_PER_SYMBOL = _env_float("MAX_POSITION_PCT_PER_SYMBOL", 0.20)
+MAX_DAILY_LOSS_USDT = _env_float("MAX_DAILY_LOSS_USDT", 50.0)
+MAX_TRADES_PER_DAY_PER_MODEL = _env_int("MAX_TRADES_PER_DAY_PER_MODEL", 10)
+MAX_ORDER_NOTIONAL_USDT = _env_float("MAX_ORDER_NOTIONAL_USDT", 50.0)
+MIN_ORDER_NOTIONAL_USDT = _env_float("MIN_ORDER_NOTIONAL_USDT", 10.0)
+KILL_SWITCH_ENABLED = _env_bool("KILL_SWITCH_ENABLED", True)
+
+DEFAULT_QUOTE_SIZE_USDT = min(_env_float("DEFAULT_QUOTE_SIZE_USDT", DEFAULT_QUOTE_SIZE_USDT), MAX_ORDER_NOTIONAL_USDT)
+PAPER_MIN_NOTIONAL_USDT = MIN_ORDER_NOTIONAL_USDT
+PAPER_MAX_POSITION_NOTIONAL_USDT = MAX_EXPOSURE_PER_MODEL_USDT
+PAPER_MAX_NEW_TRADES_PER_DAY = MAX_TRADES_PER_DAY_PER_MODEL
+PAPER_MAX_DAILY_LOSS_USDT = MAX_DAILY_LOSS_USDT
+PAPER_MAX_EXPOSURE_PER_ASSET = MAX_POSITION_PCT_PER_SYMBOL
+
+BOT_POLL_SECONDS = _env_int("BOT_POLL_SECONDS", 60)
+MODEL_EVALUATION_INTERVAL_SECONDS = _env_int("MODEL_EVALUATION_INTERVAL_SECONDS", 3600)
+MODEL_MAINTENANCE_INTERVAL_SECONDS = _env_int("MODEL_MAINTENANCE_INTERVAL_SECONDS", 3600)
+MODEL_POOL_MAINTENANCE_INTERVAL_SECONDS = MODEL_MAINTENANCE_INTERVAL_SECONDS
+DASHBOARD_REFRESH_SECONDS = _env_int("DASHBOARD_REFRESH_SECONDS", 30)

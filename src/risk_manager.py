@@ -1,12 +1,16 @@
 import sqlite3
+import math
 
 import pandas as pd
 
 from config import (
     DB_FILE,
     ORDERS_TABLE,
+    RISK_EVENTS_TABLE,
     DRY_RUN,
-    ENABLE_TRADING,
+    ENABLE_LIVE_TRADING,
+    ENABLE_REAL_ORDER_EXECUTION,
+    ENABLE_REAL_BINANCE_ACCOUNT,
     DEFAULT_QUOTE_SIZE_USDT,
     PAPER_POSITION_STEP_SIZE,
     PAPER_MIN_NOTIONAL_USDT,
@@ -14,13 +18,19 @@ from config import (
     PAPER_MAX_POSITION_NOTIONAL_USDT,
     PAPER_MAX_NEW_TRADES_PER_DAY,
     PAPER_MAX_DAILY_LOSS_USDT,
+    MAX_ORDER_NOTIONAL_USDT,
+    ACCOUNT_MODE_REAL,
 )
 
 
 class RiskManager:
-    def __init__(self):
+    def __init__(self, model_id: str | None = None, account_mode: str = "local_paper"):
         self.dry_run = DRY_RUN
-        self.enable_trading = ENABLE_TRADING
+        self.enable_live_trading = ENABLE_LIVE_TRADING
+        self.enable_real_order_execution = ENABLE_REAL_ORDER_EXECUTION
+        self.enable_real_binance_account = ENABLE_REAL_BINANCE_ACCOUNT
+        self.model_id = model_id
+        self.account_mode = account_mode
         self.default_quote_size_usdt = float(DEFAULT_QUOTE_SIZE_USDT)
         self.position_step_size = float(PAPER_POSITION_STEP_SIZE)
         self.min_notional_usdt = float(PAPER_MIN_NOTIONAL_USDT)
@@ -28,13 +38,16 @@ class RiskManager:
         self.max_position_notional_usdt = float(PAPER_MAX_POSITION_NOTIONAL_USDT)
         self.max_new_trades_per_day = int(PAPER_MAX_NEW_TRADES_PER_DAY)
         self.max_daily_loss_usdt = float(PAPER_MAX_DAILY_LOSS_USDT)
+        self.max_order_notional_usdt = float(MAX_ORDER_NOTIONAL_USDT)
 
     def round_quantity(self, quantity: float) -> float:
         quantity = abs(float(quantity))
         step = self.position_step_size
         if step <= 0:
             return quantity
-        rounded = round(quantity / step) * step
+        # Floor instead of nearest rounding so risk sizing never increases the
+        # requested notional above MAX_ORDER_NOTIONAL_USDT.
+        rounded = math.floor(quantity / step) * step
         return float(max(0.0, rounded))
 
     def build_target_quantity(self, signal_position: int, price: float, quote_size_usdt: float | None = None) -> float:
@@ -50,15 +63,21 @@ class RiskManager:
         unsigned_qty = quote_size / float(price)
         return self.round_quantity(unsigned_qty)
 
-    def _trades_today(self, symbol: str | None = None) -> int:
+    def _trades_today(self, symbol: str | None = None, model_id: str | None = None, account_mode: str | None = None) -> int:
         today_start = pd.Timestamp.now(tz="UTC").floor("D").isoformat()
         conn = sqlite3.connect(DB_FILE)
         try:
-            where = ["dry_run = 1", "created_at_utc >= ?", "status = 'FILLED'"]
+            where = ["created_at_utc >= ?", "status = 'FILLED'"]
             params: list[object] = [today_start]
             if symbol:
                 where.append("symbol = ?")
                 params.append(symbol)
+            if model_id:
+                where.append("model_id = ?")
+                params.append(model_id)
+            if account_mode:
+                where.append("account_mode = ?")
+                params.append(account_mode)
 
             row = pd.read_sql_query(
                 f"""
@@ -73,6 +92,37 @@ class RiskManager:
             conn.close()
         return int(row.loc[0, "n"]) if not row.empty else 0
 
+    def real_trading_flags_ok(self) -> bool:
+        return (
+            self.enable_live_trading
+            and self.enable_real_order_execution
+            and self.enable_real_binance_account
+            and not self.dry_run
+        )
+
+    def _log_risk_event(self, symbol: str, approved: bool, reasons: list[str], details: dict) -> None:
+        conn = sqlite3.connect(DB_FILE)
+        try:
+            conn.execute(
+                f"""
+                INSERT INTO {RISK_EVENTS_TABLE} (
+                    model_id, symbol, account_mode, approved, reason, details_json, created_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    self.model_id,
+                    symbol,
+                    self.account_mode,
+                    1 if approved else 0,
+                    ";".join(reasons),
+                    __import__("json").dumps(details, ensure_ascii=True, sort_keys=True),
+                    pd.Timestamp.now(tz="UTC").isoformat(),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
     def validate_order(
         self,
         symbol: str,
@@ -86,10 +136,8 @@ class RiskManager:
         delta_quantity = float(delta_quantity)
         projected_qty = float(projected_position_quantity)
 
-        if not self.dry_run:
-            reasons.append("dry_run_must_be_enabled")
-        if self.enable_trading and not self.dry_run:
-            reasons.append("live_trading_not_allowed_in_this_step")
+        if self.account_mode == ACCOUNT_MODE_REAL and not self.real_trading_flags_ok():
+            reasons.append("real_trading_flags_not_all_enabled")
 
         if projected_qty < -1e-12:
             reasons.append("spot_short_position_not_allowed")
@@ -107,6 +155,8 @@ class RiskManager:
 
         if delta_notional > 0 and delta_notional < self.min_notional_usdt:
             reasons.append("notional_below_minimum")
+        if delta_notional > self.max_order_notional_usdt:
+            reasons.append("order_notional_above_limit")
 
         if projected_notional > self.max_position_notional_usdt:
             reasons.append("projected_position_notional_above_limit")
@@ -120,12 +170,12 @@ class RiskManager:
         if daily_realized <= -self.max_daily_loss_usdt:
             reasons.append("daily_loss_limit_reached")
 
-        trades_today = self._trades_today(symbol=symbol)
+        trades_today = self._trades_today(symbol=symbol, model_id=self.model_id, account_mode=self.account_mode)
         if trades_today >= self.max_new_trades_per_day:
             reasons.append("max_new_trades_per_day_reached")
 
         approved = len(reasons) == 0
-        return {
+        result = {
             "approved": approved,
             "reasons": reasons,
             "rounded_quantity": qty_abs,
@@ -133,3 +183,5 @@ class RiskManager:
             "projected_notional": projected_notional,
             "projected_exposure": projected_exposure,
         }
+        self._log_risk_event(symbol=symbol, approved=approved, reasons=reasons, details=result)
+        return result

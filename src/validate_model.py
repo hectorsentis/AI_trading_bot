@@ -418,7 +418,7 @@ def main():
     report_path.write_text(json.dumps(summary, ensure_ascii=True, indent=2), encoding="utf-8")
 
     if get_model_by_id(model_id):
-        registry_status = "accepted" if acceptance["acceptance_status"] == "accepted" else acceptance["acceptance_status"]
+        registry_status = "validation_accepted" if acceptance["acceptance_status"] == "accepted" else "validation_rejected"
         update_model_evaluation(
             model_id=model_id,
             metrics={

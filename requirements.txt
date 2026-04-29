@@ -1,6 +1,7 @@
-pandas
+﻿pandas
 numpy
 scikit-learn
 lightgbm
 joblib
 requests
+streamlit

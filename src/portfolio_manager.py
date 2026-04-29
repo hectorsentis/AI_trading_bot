@@ -9,6 +9,7 @@ from config import (
     PORTFOLIO_SNAPSHOTS_TABLE,
     TIMEFRAME,
     PAPER_INITIAL_CASH_USDT,
+    ACCOUNT_MODE_LOCAL_PAPER,
 )
 from db_utils import init_research_tables, save_portfolio_snapshot
 
@@ -25,11 +26,20 @@ class PortfolioState:
 
 
 class PortfolioManager:
-    def __init__(self, timeframe: str = TIMEFRAME, dry_run: bool = True, initial_cash: float = PAPER_INITIAL_CASH_USDT):
+    def __init__(
+        self,
+        timeframe: str = TIMEFRAME,
+        dry_run: bool = True,
+        initial_cash: float = PAPER_INITIAL_CASH_USDT,
+        model_id: str = "legacy",
+        account_mode: str = ACCOUNT_MODE_LOCAL_PAPER,
+    ):
         init_research_tables()
         self.timeframe = timeframe
         self.dry_run = dry_run
         self.initial_cash = float(initial_cash)
+        self.model_id = model_id
+        self.account_mode = account_mode
 
         latest = self._load_latest_snapshot()
         if latest is None:
@@ -56,12 +66,12 @@ class PortfolioManager:
                 f"""
                 SELECT datetime_utc, cash, equity, realized_pnl, unrealized_pnl
                 FROM {PORTFOLIO_SNAPSHOTS_TABLE}
-                WHERE dry_run = ?
+                WHERE dry_run = ? AND model_id = ? AND account_mode = ?
                 ORDER BY snapshot_id DESC
                 LIMIT 1
                 """,
                 conn,
-                params=(self._dry_run_int(),),
+                params=(self._dry_run_int(), self.model_id, self.account_mode),
             )
         finally:
             conn.close()
@@ -74,13 +84,13 @@ class PortfolioManager:
         try:
             df = pd.read_sql_query(
                 f"""
-                SELECT symbol, timeframe, quantity, avg_price, realized_pnl, unrealized_pnl, updated_at_utc, dry_run
+                SELECT model_id, symbol, timeframe, account_mode, quantity, avg_price, realized_pnl, unrealized_pnl, updated_at_utc, dry_run
                 FROM {POSITIONS_TABLE}
-                WHERE timeframe = ? AND dry_run = ?
+                WHERE model_id = ? AND timeframe = ? AND account_mode = ?
                 ORDER BY symbol
                 """,
                 conn,
-                params=(self.timeframe, self._dry_run_int()),
+                params=(self.model_id, self.timeframe, self.account_mode),
             )
         finally:
             conn.close()
@@ -96,13 +106,15 @@ class PortfolioManager:
             conn.execute(
                 f"""
                 INSERT OR REPLACE INTO {POSITIONS_TABLE} (
-                    symbol, timeframe, quantity, avg_price, realized_pnl, unrealized_pnl, updated_at_utc, dry_run
+                    model_id, symbol, timeframe, account_mode, quantity, avg_price, realized_pnl, unrealized_pnl, updated_at_utc, dry_run
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    self.model_id,
                     symbol,
                     self.timeframe,
+                    self.account_mode,
                     float(quantity),
                     float(avg_price),
                     float(realized_pnl),
@@ -123,12 +135,12 @@ class PortfolioManager:
                 f"""
                 SELECT realized_pnl
                 FROM {PORTFOLIO_SNAPSHOTS_TABLE}
-                WHERE dry_run = ? AND datetime_utc >= ?
+                WHERE dry_run = ? AND model_id = ? AND account_mode = ? AND datetime_utc >= ?
                 ORDER BY snapshot_id ASC
                 LIMIT 1
                 """,
                 conn,
-                params=(self._dry_run_int(), today_start.isoformat()),
+                params=(self._dry_run_int(), self.model_id, self.account_mode, today_start.isoformat()),
             )
         finally:
             conn.close()
@@ -256,5 +268,7 @@ class PortfolioManager:
             unrealized_pnl=state.unrealized_pnl,
             exposure_by_symbol=state.exposure_by_symbol,
             dry_run=self.dry_run,
+            model_id=self.model_id,
+            account_mode=self.account_mode,
         )
         return state

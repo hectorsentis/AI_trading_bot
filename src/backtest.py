@@ -448,7 +448,7 @@ def _run_oos(args) -> dict:
         update_model_evaluation(
             model_id=model_id,
             metrics={"backtest_oos": summary},
-            status=acceptance["acceptance_status"],
+            status="backtest_accepted" if acceptance["acceptance_status"] == "accepted" else "backtest_rejected",
             acceptance_status=acceptance["acceptance_status"],
             rejection_reasons=acceptance["rejection_reasons"],
             evaluation_scope=acceptance.get("evaluation_scope", "backtest_oos"),

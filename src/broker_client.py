@@ -10,15 +10,22 @@ from urllib.parse import urlencode
 import requests
 
 from config import (
-    BINANCE_API_KEY,
-    BINANCE_API_SECRET,
+    BINANCE_REAL_API_KEY,
+    BINANCE_REAL_API_SECRET,
+    BINANCE_TESTNET_API_KEY,
+    BINANCE_TESTNET_API_SECRET,
     BINANCE_ACCOUNT_REST_BASE_URL,
     BINANCE_EXECUTION_REST_BASE_URL,
+    BINANCE_REAL_BASE_URL,
     BINANCE_RECV_WINDOW_MS,
     BINANCE_REST_BASE_URL,
+    BINANCE_TESTNET_BASE_URL,
     BINANCE_USE_TESTNET,
     DRY_RUN,
-    ENABLE_TRADING,
+    ENABLE_TESTNET_PAPER_TRADING,
+    ENABLE_LIVE_TRADING,
+    ENABLE_REAL_ORDER_EXECUTION,
+    ENABLE_REAL_BINANCE_ACCOUNT,
     HTTP_TIMEOUT_SECONDS,
 )
 
@@ -35,12 +42,13 @@ class LiveTradingBlockedError(RuntimeError):
 class BinanceClientConfig:
     client_role: str = "market_data"
     base_url: str = BINANCE_ACCOUNT_REST_BASE_URL
-    api_key: str | None = BINANCE_API_KEY
-    api_secret: str | None = BINANCE_API_SECRET
+    api_key: str | None = None
+    api_secret: str | None = None
     timeout_seconds: int = HTTP_TIMEOUT_SECONDS
     recv_window_ms: int = BINANCE_RECV_WINDOW_MS
     dry_run: bool = DRY_RUN
-    enable_trading: bool = ENABLE_TRADING
+    account_mode: str = "public"
+    enable_trading: bool = False
 
 
 class BinanceSpotClient:
@@ -57,8 +65,69 @@ class BinanceSpotClient:
         return cls(BinanceClientConfig(client_role="market_data", base_url=BINANCE_REST_BASE_URL, api_key=None, api_secret=None))
 
     @classmethod
+    def public_market_data_client(cls) -> "BinanceSpotClient":
+        return cls.market_data_client()
+
+    @classmethod
     def account_read_client(cls) -> "BinanceSpotClient":
-        return cls(BinanceClientConfig(client_role="account_read", base_url=BINANCE_ACCOUNT_REST_BASE_URL))
+        return cls.testnet_account_client() if BINANCE_USE_TESTNET else cls.real_account_client()
+
+    @classmethod
+    def testnet_account_client(cls) -> "BinanceSpotClient":
+        return cls(
+            BinanceClientConfig(
+                client_role="testnet_account",
+                base_url=BINANCE_TESTNET_BASE_URL,
+                api_key=BINANCE_TESTNET_API_KEY,
+                api_secret=BINANCE_TESTNET_API_SECRET,
+                dry_run=False,
+                account_mode="testnet_paper",
+                enable_trading=False,
+            )
+        )
+
+    @classmethod
+    def testnet_execution_client(cls) -> "BinanceSpotClient":
+        return cls(
+            BinanceClientConfig(
+                client_role="testnet_execution",
+                base_url=BINANCE_TESTNET_BASE_URL,
+                api_key=BINANCE_TESTNET_API_KEY,
+                api_secret=BINANCE_TESTNET_API_SECRET,
+                dry_run=False,
+                account_mode="testnet_paper",
+                enable_trading=ENABLE_TESTNET_PAPER_TRADING,
+            )
+        )
+
+    @classmethod
+    def real_account_client(cls) -> "BinanceSpotClient":
+        return cls(
+            BinanceClientConfig(
+                client_role="real_account",
+                base_url=BINANCE_REAL_BASE_URL,
+                api_key=BINANCE_REAL_API_KEY,
+                api_secret=BINANCE_REAL_API_SECRET,
+                dry_run=True,
+                account_mode="shadow_real",
+                enable_trading=False,
+            )
+        )
+
+    @classmethod
+    def real_execution_client(cls) -> "BinanceSpotClient":
+        live_ok = ENABLE_LIVE_TRADING and ENABLE_REAL_ORDER_EXECUTION and ENABLE_REAL_BINANCE_ACCOUNT and not DRY_RUN
+        return cls(
+            BinanceClientConfig(
+                client_role="real_execution",
+                base_url=BINANCE_REAL_BASE_URL,
+                api_key=BINANCE_REAL_API_KEY,
+                api_secret=BINANCE_REAL_API_SECRET,
+                dry_run=not live_ok,
+                account_mode="real",
+                enable_trading=live_ok,
+            )
+        )
 
     @classmethod
     def simulated_execution_client(cls) -> "BinanceSpotClient":
@@ -67,12 +136,19 @@ class BinanceSpotClient:
                 client_role="simulated_execution",
                 base_url=BINANCE_EXECUTION_REST_BASE_URL,
                 dry_run=True,
+                account_mode="local_paper",
                 enable_trading=False,
             )
         )
 
     def _url(self, endpoint: str) -> str:
-        return f"{self.config.base_url.rstrip('/')}{endpoint}"
+        base = self.config.base_url.rstrip("/")
+        # Binance Spot Demo Mode is often documented/configured as
+        # https://demo-api.binance.com/api while normal Spot/Testnet bases are
+        # host-only and expect /api/v3 appended. Avoid producing /api/api/v3.
+        if base.endswith("/api") and endpoint.startswith("/api/"):
+            return f"{base}{endpoint[len('/api'):]}"
+        return f"{base}{endpoint}"
 
     def _request(self, method: str, endpoint: str, params: dict[str, Any] | None = None) -> Any:
         response = self.session.request(
@@ -90,7 +166,8 @@ class BinanceSpotClient:
     def _require_credentials(self) -> None:
         if not self.config.api_key or not self.config.api_secret:
             raise BinanceCredentialsError(
-                "Binance credentials are missing. Set BINANCE_API_KEY and BINANCE_API_SECRET in environment or .env."
+                f"Binance credentials are missing for {self.config.client_role}. "
+                "Set BINANCE_TESTNET_API_KEY/SECRET for testnet paper or BINANCE_REAL_API_KEY/SECRET for real."
             )
 
     def _signed_params(self, params: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -122,10 +199,11 @@ class BinanceSpotClient:
             "server_time": time_payload.get("serverTime"),
             "base_url": self.config.base_url,
             "client_role": self.config.client_role,
-            "use_testnet": BINANCE_USE_TESTNET,
-            "dry_run": self.config.dry_run,
-            "enable_trading": self.config.enable_trading,
-            "has_credentials": bool(self.config.api_key and self.config.api_secret),
+                "use_testnet": BINANCE_USE_TESTNET,
+                "account_mode": self.config.account_mode,
+                "dry_run": self.config.dry_run,
+                "enable_trading": self.config.enable_trading,
+                "has_credentials": bool(self.config.api_key and self.config.api_secret),
         }
 
     def exchange_info(self, symbol: str | None = None, symbols: list[str] | None = None) -> dict:
@@ -205,15 +283,40 @@ class BinanceSpotClient:
         }
 
     def place_order(self, symbol: str, side: str, order_type: str, quantity: float, **kwargs) -> dict:
-        if self.config.client_role not in {"simulated_execution", "execution"}:
+        if self.config.client_role not in {"simulated_execution", "testnet_execution", "real_execution", "execution"}:
             raise LiveTradingBlockedError(
                 f"Client role {self.config.client_role!r} is not an execution client."
             )
         if self.config.dry_run:
             return self.simulate_order(symbol, side, order_type, quantity, kwargs.get("price"))
+        if self.config.client_role == "real_execution":
+            if not (ENABLE_LIVE_TRADING and ENABLE_REAL_ORDER_EXECUTION and ENABLE_REAL_BINANCE_ACCOUNT and not DRY_RUN):
+                raise LiveTradingBlockedError(
+                    "Real order blocked. Required: ENABLE_LIVE_TRADING=true, "
+                    "ENABLE_REAL_ORDER_EXECUTION=true, ENABLE_REAL_BINANCE_ACCOUNT=true, DRY_RUN=false."
+                )
+        elif self.config.client_role == "testnet_execution":
+            if not ENABLE_TESTNET_PAPER_TRADING:
+                raise LiveTradingBlockedError("ENABLE_TESTNET_PAPER_TRADING is false; testnet paper orders are blocked.")
         if not self.config.enable_trading:
-            raise LiveTradingBlockedError("ENABLE_TRADING is False; live Binance orders are blocked.")
-        raise LiveTradingBlockedError("Live order placement is intentionally disabled in this project step.")
+            raise LiveTradingBlockedError("Execution client is not enabled.")
+
+        def _fmt_decimal(value: float | str) -> str:
+            return f"{float(value):.8f}".rstrip("0").rstrip(".")
+
+        params: dict[str, Any] = {
+            "symbol": symbol.upper(),
+            "side": side.upper(),
+            "type": order_type.upper(),
+            "quantity": _fmt_decimal(quantity),
+        }
+        if kwargs.get("price") is not None:
+            params["price"] = _fmt_decimal(kwargs["price"])
+        if "timeInForce" in kwargs:
+            params["timeInForce"] = kwargs["timeInForce"]
+        if "newClientOrderId" in kwargs:
+            params["newClientOrderId"] = kwargs["newClientOrderId"]
+        return self._request("POST", "/api/v3/order", params=self._signed_params(params))
 
 
 def parse_args():
