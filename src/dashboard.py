@@ -1048,7 +1048,7 @@ def main() -> None:
     if filtered_equity.empty and not (selected_models or selected_accounts):
         filtered_equity = data.load_equity_curve()
 
-    tabs = st.tabs(["Control", "Portfolio", "Models", "Data / Logs"])
+    tabs = st.tabs(["Control", "Portfolio", "Models", "Proposals / Trades", "Safety / Sync", "Data / Logs"])
 
     with tabs[0]:
         render_compact_kpis(st, summary, status, registry_f, positions_f, gaps)
@@ -1080,6 +1080,78 @@ def main() -> None:
         render_models_tab(st, registry_f, model_control, requested_by, selected_models)
 
     with tabs[3]:
+        st.subheader("Independent model trade proposals")
+        proposals = data.read_table("trade_proposals", 500, "created_at_utc")
+        prop_cols = [c for c in [
+            "created_at_utc", "proposal_id", "prediction_id", "model_id", "symbol", "side",
+            "confidence", "expected_return_pct", "expected_adverse_move_pct",
+            "requested_notional_usdt", "proposal_score", "status", "rejection_reason",
+        ] if c in proposals.columns]
+        show_df(st, proposals[prop_cols] if prop_cols and not proposals.empty else proposals, height=330, empty="No trade proposals persisted yet.")
+
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            st.subheader("Allocator decisions")
+            allocations = data.read_table("allocations", 500, "created_at_utc")
+            alloc_cols = [c for c in [
+                "created_at_utc", "allocation_id", "proposal_id", "model_id", "symbol",
+                "decision", "requested_notional_usdt", "approved_notional_usdt",
+                "allocator_score", "rejection_reason", "shadow_trade_id",
+            ] if c in allocations.columns]
+            show_df(st, allocations[alloc_cols] if alloc_cols and not allocations.empty else allocations, height=320, empty="No allocator decisions.")
+        with c2:
+            st.subheader("Open trades and exits")
+            trades = data.read_table("trades", 500, "created_at_utc")
+            trade_cols = [c for c in [
+                "status", "trade_id", "model_id", "symbol", "side", "approved_notional_usdt",
+                "qty", "avg_entry_price", "tp_price", "sl_price", "emergency_sl_price",
+                "unrealized_pnl_usdt", "realized_pnl_usdt", "exit_reason", "account_mode",
+                "opened_at_utc", "updated_at_utc",
+            ] if c in trades.columns]
+            show_df(st, trades[trade_cols] if trade_cols and not trades.empty else trades, height=320, empty="No trades.")
+
+        c3, c4 = st.columns([1, 1])
+        with c3:
+            st.subheader("Orders with model/trade attribution")
+            order_cols = [c for c in [
+                "created_at_utc", "order_id", "trade_id", "model_id", "symbol", "side",
+                "type", "quantity", "price_filled", "status", "account_mode",
+                "fees_usdt", "slippage_usdt", "reason",
+            ] if c in orders_f.columns]
+            show_df(st, orders_f[order_cols].head(200) if order_cols and not orders_f.empty else orders_f.head(200), height=300, empty="No orders.")
+        with c4:
+            st.subheader("Fills with full attribution")
+            fill_cols = [c for c in [
+                "timestamp_utc", "fill_id", "order_id", "trade_id", "model_id", "symbol",
+                "quantity", "price", "fee_usdt", "slippage_usdt", "account_mode",
+            ] if c in fills_f.columns]
+            show_df(st, fills_f[fill_cols].head(200) if fill_cols and not fills_f.empty else fills_f.head(200), height=300, empty="No fills.")
+
+        st.subheader("Shadow trade analytics")
+        shadows = data.read_table("shadow_trades", 500, "created_at_utc")
+        shadow_cols = [c for c in [
+            "created_at_utc", "shadow_trade_id", "proposal_id", "model_id", "symbol",
+            "status", "requested_notional_usdt", "entry_reference_price", "tp_price",
+            "sl_price", "reason", "outcome_pnl_usdt",
+        ] if c in shadows.columns]
+        show_df(st, shadows[shadow_cols] if shadow_cols and not shadows.empty else shadows, height=260, empty="No shadow trades.")
+
+    with tabs[4]:
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            st.subheader("Binance/account synchronization")
+            show_df(st, data.read_table("account_snapshots", 100, "created_at_utc"), height=280, empty="No account snapshots.")
+            st.subheader("Balance snapshots")
+            show_df(st, data.read_table("balance_snapshots", 200, "timestamp_utc"), height=280, empty="No balance snapshots.")
+        with c2:
+            st.subheader("Reconciliation events")
+            show_df(st, data.read_table("reconciliation_events", 200, "created_at_utc"), height=280, empty="No reconciliation events.")
+            st.subheader("System status")
+            show_df(st, data.read_table("system_status", 100, "updated_at_utc"), height=280, empty="No system status rows.")
+        st.subheader("Safety and risk events")
+        show_df(st, data.read_table("risk_events", 300, "created_at_utc"), height=300, empty="No risk events.")
+
+    with tabs[5]:
         c1, c2 = st.columns([1, 1])
         with c1:
             st.subheader("Data quality")

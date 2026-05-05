@@ -22,6 +22,8 @@ from config import (
 from broker_client import BinanceCredentialsError, BinanceSpotClient, LiveTradingBlockedError
 from db_utils import init_research_tables
 from trade_protection import build_long_protection, validate_long_protection
+from trade_builder import BuiltTrade
+from ledger import create_trade_record, mark_trade_failed, mark_trade_open
 
 
 class ExecutionEngine:
@@ -587,3 +589,186 @@ class ExecutionEngine:
             "fill": fill,
         }
 
+
+    def execute_built_trade(self, built_trade: BuiltTrade, latest_market_timestamp_utc: str | None = None) -> dict:
+        """Central execution path for model-owned proposals.
+
+        The caller must have already persisted prediction, proposal and allocation.
+        This method reruns risk gates, logs order/fill rows with full attribution,
+        and updates the trade ledger. Models never call broker endpoints directly.
+        """
+        create_trade_record(built_trade, account_mode=self.account_mode, status="APPROVED")
+        state = self.portfolio_manager.get_state(price_by_symbol={built_trade.symbol: built_trade.entry_reference_price})
+        risk = self.risk_manager.validate_trade_plan(
+            built_trade,
+            portfolio_state=state,
+            latest_market_timestamp_utc=latest_market_timestamp_utc,
+        )
+        if not risk["approved"]:
+            reason = ";".join(risk["reasons"])
+            mark_trade_failed(built_trade.trade_id, reason, raw={"risk": risk})
+            self._insert_trade_order(
+                built_trade=built_trade,
+                side="BUY",
+                status="REJECTED",
+                reason=reason,
+                fill_price=None,
+                raw_exchange_response={"risk": risk},
+            )
+            return {"trade_id": built_trade.trade_id, "status": "REJECTED", "reason": reason, "risk": risk}
+
+        fill_price = self._simulated_fill_price(side="BUY", market_price=built_trade.entry_reference_price)
+        raw_exchange_response = {}
+        exchange_order_id = None
+        reason = "dry_run_trade_plan_fill"
+        if self.account_mode == ACCOUNT_MODE_TESTNET_PAPER and self.broker_client is not None:
+            try:
+                raw_exchange_response = self.broker_client.place_order(
+                    symbol=built_trade.symbol,
+                    side="BUY",
+                    order_type=DEFAULT_ORDER_TYPE,
+                    quantity=built_trade.quantity,
+                    newClientOrderId=built_trade.trade_id[:30],
+                )
+                exchange_order_id = str(raw_exchange_response.get("orderId")) if raw_exchange_response.get("orderId") is not None else None
+                fills = raw_exchange_response.get("fills") or []
+                if fills:
+                    fill_price = float(fills[0].get("price", fill_price))
+                reason = "binance_testnet_trade_plan_order"
+            except Exception as exc:
+                raw_exchange_response = {"error": str(exc)}
+                mark_trade_failed(built_trade.trade_id, f"testnet_order_failed:{exc}", raw=raw_exchange_response)
+                self._insert_trade_order(
+                    built_trade=built_trade,
+                    side="BUY",
+                    status="REJECTED",
+                    reason=f"testnet_order_failed:{exc}",
+                    fill_price=None,
+                    raw_exchange_response=raw_exchange_response,
+                )
+                return {"trade_id": built_trade.trade_id, "status": "REJECTED", "reason": f"testnet_order_failed:{exc}"}
+
+        fill = self.portfolio_manager.apply_fill(
+            symbol=built_trade.symbol,
+            side="BUY",
+            quantity=built_trade.quantity,
+            fill_price=fill_price,
+            fee_rate=PAPER_FEE_RATE,
+        )
+        order_id = self._insert_trade_order(
+            built_trade=built_trade,
+            side="BUY",
+            status="FILLED",
+            reason=reason,
+            fill_price=fill_price,
+            exchange_order_id=exchange_order_id,
+            raw_exchange_response=raw_exchange_response,
+        )
+        fill_id = self._insert_trade_fill(
+            built_trade=built_trade,
+            order_id=order_id,
+            price=fill_price,
+            commission=float(fill.get("fee", 0.0)),
+            raw=raw_exchange_response,
+        )
+        slippage_usdt = abs(fill_price - built_trade.entry_reference_price) * built_trade.quantity
+        mark_trade_open(
+            trade_id=built_trade.trade_id,
+            avg_entry_price=fill_price,
+            qty=built_trade.quantity,
+            fees_usdt=float(fill.get("fee", 0.0)),
+            slippage_usdt=slippage_usdt,
+            raw_update={"order_id": order_id, "fill_id": fill_id, "reason": reason},
+        )
+        return {
+            "trade_id": built_trade.trade_id,
+            "order_id": order_id,
+            "fill_id": fill_id,
+            "status": "FILLED",
+            "reason": reason,
+            "fill_price": fill_price,
+            "tp_price": built_trade.tp_price,
+            "sl_price": built_trade.sl_price,
+            "emergency_sl_price": built_trade.emergency_sl_price,
+        }
+
+    def _insert_trade_order(
+        self,
+        *,
+        built_trade: BuiltTrade,
+        side: str,
+        status: str,
+        reason: str,
+        fill_price: float | None,
+        exchange_order_id: str | None = None,
+        raw_exchange_response: dict | None = None,
+    ) -> str:
+        order_id = self._order_id()
+        requested_price = float(built_trade.entry_reference_price)
+        notional = float(built_trade.quantity) * float(fill_price if fill_price is not None else requested_price)
+        now = pd.Timestamp.now(tz="UTC").isoformat()
+        conn = self._connect()
+        try:
+            conn.execute(
+                f"""
+                INSERT OR REPLACE INTO {ORDERS_TABLE} (
+                    order_id, client_order_id, exchange_order_id, model_id, prediction_id, proposal_id,
+                    allocation_id, trade_id, symbol, timeframe, timestamp_utc, signal_datetime_utc,
+                    account_mode, side, executable_action, order_type, type, quantity, requested_price,
+                    price_requested, fill_price, price_filled, notional, status, reason,
+                    take_profit_price, stop_loss_price, protection_required, protection_status,
+                    decision_json, dry_run, created_at_utc, updated_at_utc, filled_at_utc,
+                    raw_exchange_response_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    order_id, built_trade.trade_id, exchange_order_id, built_trade.model_id, built_trade.prediction_id,
+                    built_trade.proposal_id, built_trade.allocation_id, built_trade.trade_id, built_trade.symbol, built_trade.timeframe,
+                    now, built_trade.timestamp_utc if hasattr(built_trade, "timestamp_utc") else built_trade.valid_until_utc,
+                    self.account_mode, side, side, DEFAULT_ORDER_TYPE, DEFAULT_ORDER_TYPE, float(built_trade.quantity),
+                    requested_price, requested_price, float(fill_price) if fill_price is not None else None,
+                    float(fill_price) if fill_price is not None else None, float(notional), status, reason,
+                    float(built_trade.tp_price), float(built_trade.sl_price), 1, "VIRTUAL_TP_SL_RECORDED",
+                    json.dumps(built_trade.raw_json, ensure_ascii=True, sort_keys=True), 1 if self.dry_run else 0,
+                    now, now, now if fill_price is not None and status == "FILLED" else None,
+                    json.dumps(raw_exchange_response or {}, ensure_ascii=True, sort_keys=True),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return order_id
+
+    def _insert_trade_fill(
+        self,
+        *,
+        built_trade: BuiltTrade,
+        order_id: str,
+        price: float,
+        commission: float = 0.0,
+        raw: dict | None = None,
+    ) -> str:
+        fill_id = f"fill_{uuid.uuid4().hex}"
+        now = pd.Timestamp.now(tz="UTC").isoformat()
+        slippage_usdt = abs(float(price) - float(built_trade.entry_reference_price)) * float(built_trade.quantity)
+        conn = self._connect()
+        try:
+            conn.execute(
+                f"""
+                INSERT OR REPLACE INTO {FILLS_TABLE} (
+                    fill_id, order_id, model_id, prediction_id, proposal_id, allocation_id, trade_id,
+                    symbol, timeframe, account_mode, quantity, price, commission, fee_usdt,
+                    commission_asset, slippage_usdt, timestamp_utc, raw_exchange_response_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    fill_id, order_id, built_trade.model_id, built_trade.prediction_id, built_trade.proposal_id,
+                    built_trade.allocation_id, built_trade.trade_id, built_trade.symbol, built_trade.timeframe, self.account_mode,
+                    float(built_trade.quantity), float(price), float(commission), float(commission), "USDT",
+                    float(slippage_usdt), now, json.dumps(raw or {}, ensure_ascii=True, sort_keys=True),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return fill_id

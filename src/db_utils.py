@@ -28,6 +28,18 @@ from config import (
     DATA_GAPS_TABLE,
     INGESTION_LOG_TABLE,
     FILLS_TABLE,
+    LABELS_TABLE,
+    MODEL_PREDICTIONS_TABLE,
+    MODEL_PERFORMANCE_TABLE,
+    TRADE_PROPOSALS_TABLE,
+    ALLOCATIONS_TABLE,
+    TRADES_TABLE,
+    ACCOUNT_SNAPSHOTS_TABLE,
+    BALANCE_SNAPSHOTS_TABLE,
+    SHADOW_TRADES_TABLE,
+    SHADOW_TRADE_EVENTS_TABLE,
+    RECONCILIATION_EVENTS_TABLE,
+    SYSTEM_STATUS_TABLE,
     PAPER_MODEL_METRICS_TABLE,
     MODEL_LIFECYCLE_EVENTS_TABLE,
     BOT_EVENTS_TABLE,
@@ -511,6 +523,329 @@ def init_research_tables() -> None:
             )
             """
         )
+        _ensure_column(conn, RISK_EVENTS_TABLE, "prediction_id", "TEXT")
+        _ensure_column(conn, RISK_EVENTS_TABLE, "proposal_id", "TEXT")
+        _ensure_column(conn, RISK_EVENTS_TABLE, "allocation_id", "TEXT")
+        _ensure_column(conn, RISK_EVENTS_TABLE, "trade_id", "TEXT")
+        _ensure_column(conn, RISK_EVENTS_TABLE, "order_id", "TEXT")
+        _ensure_column(conn, RISK_EVENTS_TABLE, "timestamp_utc", "TEXT")
+
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {LABELS_TABLE} (
+                label_id TEXT PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                timestamp_utc TEXT NOT NULL,
+                future_return_1h REAL,
+                future_return_4h REAL,
+                future_return_8h REAL,
+                future_return_12h REAL,
+                future_return_24h REAL,
+                max_favorable_excursion_4h REAL,
+                max_favorable_excursion_8h REAL,
+                max_favorable_excursion_12h REAL,
+                max_favorable_excursion_24h REAL,
+                max_adverse_excursion_4h REAL,
+                max_adverse_excursion_8h REAL,
+                max_adverse_excursion_12h REAL,
+                max_adverse_excursion_24h REAL,
+                time_to_max_favorable_excursion INTEGER,
+                time_to_max_adverse_excursion INTEGER,
+                hit_model_tp_before_sl INTEGER,
+                realized_return_after_costs REAL,
+                raw_json TEXT NOT NULL DEFAULT '{{}}',
+                created_at_utc TEXT NOT NULL,
+                UNIQUE(symbol, timeframe, timestamp_utc)
+            )
+            """
+        )
+
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {MODEL_PREDICTIONS_TABLE} (
+                prediction_id TEXT PRIMARY KEY,
+                model_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                timestamp_utc TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                prob_up REAL,
+                prob_down REAL,
+                prob_flat REAL,
+                expected_return_pct REAL,
+                expected_move_pct REAL,
+                expected_adverse_move_pct REAL,
+                q05_return_pct REAL,
+                q25_return_pct REAL,
+                q50_return_pct REAL,
+                q75_return_pct REAL,
+                q95_return_pct REAL,
+                expected_max_favorable_excursion_pct REAL,
+                expected_max_adverse_excursion_pct REAL,
+                horizon_bars INTEGER,
+                signal_valid_until_utc TEXT,
+                raw_prediction_json TEXT NOT NULL DEFAULT '{{}}',
+                created_at_utc TEXT NOT NULL,
+                UNIQUE(model_id, symbol, timeframe, timestamp_utc)
+            )
+            """
+        )
+
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {TRADE_PROPOSALS_TABLE} (
+                proposal_id TEXT PRIMARY KEY,
+                prediction_id TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                timeframe TEXT,
+                timestamp_utc TEXT NOT NULL,
+                side TEXT NOT NULL,
+                entry_reference_price REAL NOT NULL,
+                confidence REAL,
+                expected_return_pct REAL,
+                expected_move_pct REAL,
+                expected_adverse_move_pct REAL,
+                expected_value_usdt REAL,
+                q05_return_pct REAL,
+                q50_return_pct REAL,
+                q95_return_pct REAL,
+                expected_max_favorable_excursion_pct REAL,
+                expected_max_adverse_excursion_pct REAL,
+                horizon_bars INTEGER,
+                valid_until_utc TEXT,
+                requested_notional_usdt REAL,
+                proposal_score REAL,
+                status TEXT NOT NULL DEFAULT 'PROPOSED',
+                rejection_reason TEXT,
+                raw_json TEXT NOT NULL DEFAULT '{{}}',
+                created_at_utc TEXT NOT NULL,
+                updated_at_utc TEXT
+            )
+            """
+        )
+
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {ALLOCATIONS_TABLE} (
+                allocation_id TEXT PRIMARY KEY,
+                proposal_id TEXT NOT NULL,
+                prediction_id TEXT,
+                model_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                timestamp_utc TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                requested_notional_usdt REAL,
+                approved_notional_usdt REAL,
+                rejection_reason TEXT,
+                allocator_score REAL,
+                expected_value_usdt REAL,
+                shadow_trade_id TEXT,
+                risk_json TEXT NOT NULL DEFAULT '{{}}',
+                decision_json TEXT NOT NULL DEFAULT '{{}}',
+                created_at_utc TEXT NOT NULL
+            )
+            """
+        )
+
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {TRADES_TABLE} (
+                trade_id TEXT PRIMARY KEY,
+                proposal_id TEXT,
+                allocation_id TEXT,
+                prediction_id TEXT,
+                model_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                timeframe TEXT,
+                side TEXT NOT NULL,
+                status TEXT NOT NULL,
+                account_mode TEXT NOT NULL,
+                requested_notional_usdt REAL,
+                approved_notional_usdt REAL,
+                qty REAL,
+                entry_price REAL,
+                avg_entry_price REAL,
+                exit_price REAL,
+                avg_exit_price REAL,
+                tp_price REAL,
+                sl_price REAL,
+                emergency_sl_price REAL,
+                horizon_bars INTEGER,
+                valid_until_utc TEXT,
+                opened_at_utc TEXT,
+                closed_at_utc TEXT,
+                exit_reason TEXT,
+                realized_pnl_usdt REAL NOT NULL DEFAULT 0,
+                unrealized_pnl_usdt REAL NOT NULL DEFAULT 0,
+                fees_usdt REAL NOT NULL DEFAULT 0,
+                slippage_usdt REAL NOT NULL DEFAULT 0,
+                raw_json TEXT NOT NULL DEFAULT '{{}}',
+                created_at_utc TEXT NOT NULL,
+                updated_at_utc TEXT
+            )
+            """
+        )
+
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {SHADOW_TRADES_TABLE} (
+                shadow_trade_id TEXT PRIMARY KEY,
+                proposal_id TEXT NOT NULL,
+                allocation_id TEXT,
+                prediction_id TEXT,
+                model_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                timeframe TEXT,
+                side TEXT NOT NULL,
+                status TEXT NOT NULL,
+                entry_reference_price REAL,
+                tp_price REAL,
+                sl_price REAL,
+                emergency_sl_price REAL,
+                horizon_bars INTEGER,
+                valid_until_utc TEXT,
+                requested_notional_usdt REAL,
+                reason TEXT,
+                outcome_pnl_usdt REAL,
+                raw_json TEXT NOT NULL DEFAULT '{{}}',
+                opened_at_utc TEXT,
+                closed_at_utc TEXT,
+                created_at_utc TEXT NOT NULL,
+                updated_at_utc TEXT
+            )
+            """
+        )
+
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {SHADOW_TRADE_EVENTS_TABLE} (
+                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                shadow_trade_id TEXT NOT NULL,
+                proposal_id TEXT,
+                model_id TEXT,
+                symbol TEXT,
+                event_type TEXT NOT NULL,
+                message TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{{}}',
+                timestamp_utc TEXT NOT NULL
+            )
+            """
+        )
+
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {ACCOUNT_SNAPSHOTS_TABLE} (
+                snapshot_id TEXT PRIMARY KEY,
+                account_mode TEXT NOT NULL,
+                source TEXT NOT NULL,
+                total_equity_usdt REAL,
+                free_usdt REAL,
+                locked_usdt REAL,
+                raw_json TEXT NOT NULL DEFAULT '{{}}',
+                timestamp_utc TEXT NOT NULL,
+                created_at_utc TEXT NOT NULL
+            )
+            """
+        )
+
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {BALANCE_SNAPSHOTS_TABLE} (
+                balance_snapshot_id TEXT PRIMARY KEY,
+                account_snapshot_id TEXT,
+                account_mode TEXT NOT NULL,
+                asset TEXT NOT NULL,
+                free REAL NOT NULL DEFAULT 0,
+                locked REAL NOT NULL DEFAULT 0,
+                total REAL NOT NULL DEFAULT 0,
+                usdt_value REAL,
+                timestamp_utc TEXT NOT NULL,
+                raw_json TEXT NOT NULL DEFAULT '{{}}'
+            )
+            """
+        )
+
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {MODEL_PERFORMANCE_TABLE} (
+                performance_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                model_id TEXT NOT NULL,
+                symbol TEXT,
+                timeframe TEXT,
+                account_mode TEXT,
+                timestamp_utc TEXT NOT NULL,
+                predictions INTEGER NOT NULL DEFAULT 0,
+                proposals INTEGER NOT NULL DEFAULT 0,
+                accepted_proposals INTEGER NOT NULL DEFAULT 0,
+                rejected_proposals INTEGER NOT NULL DEFAULT 0,
+                shadow_trades INTEGER NOT NULL DEFAULT 0,
+                open_trades INTEGER NOT NULL DEFAULT 0,
+                closed_trades INTEGER NOT NULL DEFAULT 0,
+                realized_pnl_usdt REAL NOT NULL DEFAULT 0,
+                unrealized_pnl_usdt REAL NOT NULL DEFAULT 0,
+                total_return_pct REAL,
+                max_drawdown_pct REAL,
+                win_rate REAL,
+                profit_factor REAL,
+                calibration_quality REAL,
+                degradation_status TEXT,
+                metrics_json TEXT NOT NULL DEFAULT '{{}}'
+            )
+            """
+        )
+
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {RECONCILIATION_EVENTS_TABLE} (
+                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_mode TEXT NOT NULL,
+                status TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                message TEXT,
+                db_state_json TEXT NOT NULL DEFAULT '{{}}',
+                exchange_state_json TEXT NOT NULL DEFAULT '{{}}',
+                differences_json TEXT NOT NULL DEFAULT '{{}}',
+                created_at_utc TEXT NOT NULL
+            )
+            """
+        )
+
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {SYSTEM_STATUS_TABLE} (
+                component TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                mode TEXT,
+                kill_switch_enabled INTEGER NOT NULL DEFAULT 1,
+                reconciliation_status TEXT,
+                last_market_data_utc TEXT,
+                last_account_sync_utc TEXT,
+                message TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{{}}',
+                updated_at_utc TEXT NOT NULL
+            )
+            """
+        )
+
+        for table in [ORDERS_TABLE, FILLS_TABLE, POSITIONS_TABLE]:
+            for col, sql in [
+                ("prediction_id", "TEXT"),
+                ("proposal_id", "TEXT"),
+                ("allocation_id", "TEXT"),
+                ("trade_id", "TEXT"),
+                ("timestamp_utc", "TEXT"),
+            ]:
+                _ensure_column(conn, table, col, sql)
+        _ensure_column(conn, ORDERS_TABLE, "client_order_id", "TEXT")
+        _ensure_column(conn, ORDERS_TABLE, "fill_quantity", "REAL")
+        _ensure_column(conn, ORDERS_TABLE, "fees_usdt", "REAL")
+        _ensure_column(conn, ORDERS_TABLE, "slippage_usdt", "REAL")
+        _ensure_column(conn, FILLS_TABLE, "fee_usdt", "REAL")
+        _ensure_column(conn, FILLS_TABLE, "slippage_usdt", "REAL")
+        _ensure_column(conn, POSITIONS_TABLE, "notional_usdt", "REAL")
 
         conn.commit()
     finally:
@@ -698,6 +1033,18 @@ def assert_required_schema() -> dict:
         BOT_EVENTS_TABLE,
         BOT_STATUS_TABLE,
         RISK_EVENTS_TABLE,
+        LABELS_TABLE,
+        MODEL_PREDICTIONS_TABLE,
+        MODEL_PERFORMANCE_TABLE,
+        TRADE_PROPOSALS_TABLE,
+        ALLOCATIONS_TABLE,
+        TRADES_TABLE,
+        ACCOUNT_SNAPSHOTS_TABLE,
+        BALANCE_SNAPSHOTS_TABLE,
+        SHADOW_TRADES_TABLE,
+        SHADOW_TRADE_EVENTS_TABLE,
+        RECONCILIATION_EVENTS_TABLE,
+        SYSTEM_STATUS_TABLE,
     ]
     model_scoped = {
         SIGNALS_TABLE: "model_id",
@@ -705,6 +1052,18 @@ def assert_required_schema() -> dict:
         FILLS_TABLE: "model_id",
         POSITIONS_TABLE: "model_id",
         PORTFOLIO_SNAPSHOTS_TABLE: "model_id",
+        MODEL_PREDICTIONS_TABLE: "model_id",
+        TRADE_PROPOSALS_TABLE: "model_id",
+        ALLOCATIONS_TABLE: "model_id",
+        TRADES_TABLE: "model_id",
+        SHADOW_TRADES_TABLE: "model_id",
+    }
+    attribution_columns = {
+        ORDERS_TABLE: ["model_id", "prediction_id", "proposal_id", "allocation_id", "trade_id"],
+        FILLS_TABLE: ["model_id", "prediction_id", "proposal_id", "allocation_id", "trade_id", "order_id"],
+        TRADES_TABLE: ["model_id", "prediction_id", "proposal_id", "allocation_id", "trade_id"],
+        TRADE_PROPOSALS_TABLE: ["model_id", "prediction_id", "proposal_id"],
+        ALLOCATIONS_TABLE: ["model_id", "prediction_id", "proposal_id", "allocation_id"],
     }
     conn = get_connection()
     try:
@@ -718,13 +1077,22 @@ def assert_required_schema() -> dict:
             for table, col in model_scoped.items()
             if table in tables and col not in _table_columns(conn, table)
         }
+        missing_attribution_columns = {}
+        for table, cols in attribution_columns.items():
+            if table not in tables:
+                continue
+            present = _table_columns(conn, table)
+            missing = [col for col in cols if col not in present]
+            if missing:
+                missing_attribution_columns[table] = missing
     finally:
         conn.close()
     return {
-        "ok": not missing_tables and not missing_columns,
+        "ok": not missing_tables and not missing_columns and not missing_attribution_columns,
         "db_file": str(DB_FILE),
         "missing_tables": missing_tables,
         "missing_model_id_columns": missing_columns,
+        "missing_attribution_columns": missing_attribution_columns,
     }
 
 

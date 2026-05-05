@@ -411,3 +411,134 @@ python src/trading_bot.py --mode paper --paper-mode per-model --training-scope b
 El `model_registry` guarda `symbol_scope`, `training_scope`, `symbols_json`, `timeframe` y `selection_score`. La selecci?n usa m?tricas observadas de validaci?n/backtest/paper para ordenar candidatos; esto busca el mejor edge observado, no garantiza rentabilidad futura.
 
 
+
+---
+
+## Proposal/allocation architecture (current target)
+
+The runtime now follows the required model-owned proposal path instead of a global LONG/SHORT order rule:
+
+```text
+model prediction -> trade_proposal -> capital allocation -> risk-checked trade build -> central execution -> ledger/PnL attribution
+```
+
+Important properties:
+
+- Models emit structured rows in `model_predictions` with direction, confidence, expected return, expected adverse move, quantiles, MFE/MAE estimates, horizon, and validity.
+- `trade_proposals` are persisted before any allocator decision. Rejections are retained.
+- `capital_allocator.py` evaluates each proposal independently against the shared capital pool. It does not average model signals and does not give fixed per-model budgets.
+- `trade_builder.py` derives TP/SL/emergency SL from predicted distribution fields, fees/slippage, confidence and `MAX_TRADE_LOSS_USDT`; it resizes or rejects when model-derived risk is too large.
+- `risk_manager.py` performs hard gates before execution, including live flags, cash reserve, exposure limits, model/symbol limits, stale live data, reconciliation state, and TP/SL dimensional checks.
+- `execution_engine.py` is the only order path. It records `prediction_id`, `proposal_id`, `allocation_id`, `trade_id`, `order_id`, and `fill_id` for auditability.
+- `ledger.py`, `reconciliation_engine.py`, `exit_manager.py`, and `stop_manager.py` provide restart-safe accounting/synchronization hooks and virtual stop monitoring.
+
+New/audited SQLite tables include:
+
+```text
+labels, model_predictions, model_performance, trade_proposals, allocations,
+trades, account_snapshots, balance_snapshots, shadow_trades,
+shadow_trade_events, reconciliation_events, system_status
+```
+
+Legacy tables (`signals`, `orders`, `fills`, `positions`, `portfolio_snapshots`) are preserved and extended for compatibility.
+
+## Required operational commands
+
+```bash
+# Install/check dependencies
+python src/install_setup.py
+python -m pip install -r requirements.txt
+
+# Initialize/migrate database
+python src/db_utils.py --init
+python src/db_utils.py --check-schema
+
+# Historical data and feature workflow
+python src/download_data.py --symbols BTCUSDT ETHUSDT SOLUSDT --timeframe 1h --mode full
+python src/data_loader.py --gap-check --no-prompt
+python src/feature_store.py --symbols BTCUSDT ETHUSDT SOLUSDT --timeframe 1h
+
+# Training/validation/model pool
+python src/train.py --symbols BTCUSDT ETHUSDT SOLUSDT --timeframe 1h
+python src/validate_model.py
+python src/backtest.py
+python src/model_maintenance.py --target-active-paper-models 5 --max-attempts 50
+
+# Proposal/allocation paper loop (shared capital pool)
+python src/trading_bot.py --mode paper --paper-mode per-model --run-once
+python src/trading_bot.py --mode paper --paper-mode per-model --loop
+
+# Reconciliation and paper evaluation
+python src/reconciliation_engine.py --check --mode local_paper
+python src/paper_model_evaluator.py --evaluate-active
+
+# Dashboard/control panel
+streamlit run src/dashboard.py
+```
+
+## Server deployment processes
+
+Run these as separate supervised processes (systemd, tmux, Docker, or another supervisor):
+
+```text
+market-data-ingestor: python src/realtime_ingestor.py --symbols BTCUSDT ETHUSDT SOLUSDT --timeframe 1h
+model-maintenance:     python src/model_maintenance.py --target-active-paper-models 5 --max-attempts 50
+trading-bot:           python src/trading_bot.py --mode paper --paper-mode per-model --loop
+dashboard:             streamlit run src/dashboard.py --server.address 0.0.0.0
+```
+
+## Verify model/trade-level PnL attribution
+
+```bash
+python - <<'PY'
+import sqlite3
+from src.config import DB_FILE
+with sqlite3.connect(DB_FILE) as c:
+    for table in ['model_predictions','trade_proposals','allocations','trades','orders','fills','model_performance']:
+        print('\n', table)
+        for row in c.execute(f"SELECT * FROM {table} LIMIT 3"):
+            print(row)
+PY
+```
+
+Every executed trade/order/fill should carry the attribution chain:
+`model_id`, `prediction_id`, `proposal_id`, `allocation_id`, `trade_id`, `order_id`, `fill_id`.
+
+## Verify no real order can be sent by default
+
+1. Keep the default `.env.example` flags:
+
+```env
+DRY_RUN=true
+ENABLE_LIVE_TRADING=false
+ENABLE_REAL_ORDER_EXECUTION=false
+ENABLE_REAL_BINANCE_ACCOUNT=false
+ENABLE_BINANCE_TESTNET_PAPER_TRADING=true
+KILL_SWITCH_ENABLED=true
+```
+
+2. Run:
+
+```bash
+python src/broker_client.py --healthcheck
+python src/trading_bot.py --mode paper --paper-mode per-model --run-once
+```
+
+3. Confirm in SQLite that orders are `dry_run=1` or `account_mode IN ('local_paper','testnet_paper')`, never `real`.
+
+Live real execution requires all of these simultaneously and still goes through risk/reconciliation/kill-switch gates:
+
+```env
+ENABLE_LIVE_TRADING=true
+ENABLE_REAL_ORDER_EXECUTION=true
+ENABLE_REAL_BINANCE_ACCOUNT=true
+DRY_RUN=false
+```
+
+## Current limitations / hardening needed
+
+- Existing trained artifacts are direction classifiers. `prediction_engine.py` conservatively derives return distribution/MFE/MAE fields from probabilities and current volatility until native regression/quantile models are added.
+- Local `positions` remain compatible with the legacy aggregate portfolio manager; authoritative trade-level attribution is in `trades`, `orders`, and `fills`.
+- Emergency stops are recorded and exposed; exchange-side stop placement for every venue mode should be hardened with Binance filter rounding and reconciliation of stop order IDs before live use.
+- Reconciliation currently snapshots local/testnet state and pauses on connectivity/credential failure; deeper Binance fill-history replay should be expanded before real trading.
+- No profitability is implied. Models must pass temporal validation, OOS testing, and paper validation with sufficient samples before any real readiness decision.

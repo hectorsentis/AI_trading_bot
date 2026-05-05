@@ -13,6 +13,7 @@ import pandas as pd
 from broker_client import BinanceCredentialsError, BinanceSpotClient
 from config import (
     DB_FILE,
+    DEFAULT_QUOTE_SIZE_USDT,
     DRY_RUN,
     ENABLE_TRADING,
     ENABLE_TESTNET_PAPER_TRADING,
@@ -60,6 +61,12 @@ from portfolio_manager import PortfolioManager
 from risk_manager import RiskManager
 from signal_engine import generate_signal_from_probabilities
 from trade_protection import build_long_protection
+from prediction_engine import build_prediction_from_probabilities, persist_prediction
+from trade_proposal_engine import build_trade_proposal, persist_trade_proposal
+from capital_allocator import CapitalAllocator
+from trade_builder import build_trade_from_allocation
+from ledger import refresh_model_performance
+from reconciliation_engine import run_reconciliation
 
 
 LOGGER = logging.getLogger("trading_bot")
@@ -539,20 +546,22 @@ def run_once(args) -> dict:
     if args.paper_mode == "per-model" or args.disable_ensemble:
         account_mode = _default_paper_account_mode()
         broker = BinanceSpotClient.testnet_execution_client() if account_mode == ACCOUNT_MODE_TESTNET_PAPER else None
+        reconciliation_summary = run_reconciliation(mode=account_mode)
+        shared_portfolio_manager = PortfolioManager(
+            timeframe=args.timeframe,
+            dry_run=True,
+            initial_cash=float(args.paper_initial_cash),
+            model_id="shared_capital_pool",
+            account_mode=account_mode,
+        )
+        allocator = CapitalAllocator(account_mode=account_mode)
         model_reports: list[dict] = []
         total_price_map: dict[str, float] = {}
 
         for model_id, model_path, artifact in artifacts:
-            portfolio_manager = PortfolioManager(
-                timeframe=args.timeframe,
-                dry_run=True,
-                initial_cash=float(args.paper_initial_cash),
-                model_id=model_id,
-                account_mode=account_mode,
-            )
             risk_manager = RiskManager(model_id=model_id, account_mode=account_mode)
             execution_engine = ExecutionEngine(
-                portfolio_manager=portfolio_manager,
+                portfolio_manager=shared_portfolio_manager,
                 risk_manager=risk_manager,
                 account_mode=account_mode,
                 broker_client=broker,
@@ -600,13 +609,45 @@ def run_once(args) -> dict:
                     risk_reward=signal.get("risk_reward"),
                     protection_required=bool(signal.get("protection_required")),
                 )
-                execution = execution_engine.execute_signal(
+                prediction = build_prediction_from_probabilities(
                     model_id=model_id,
                     symbol=symbol,
                     timeframe=args.timeframe,
-                    signal_payload=signal,
-                    market_price=close_price,
+                    timestamp_utc=dt,
+                    close_price=close_price,
+                    prob_short=prob_short,
+                    prob_flat=prob_flat,
+                    prob_long=prob_long,
+                    latest_features=latest.iloc[0].to_dict(),
+                    raw={"model_path": str(model_path), "legacy_signal_id": signal.get("datetime_utc")},
                 )
+                persist_prediction(prediction)
+                proposal = build_trade_proposal(
+                    prediction=prediction,
+                    entry_reference_price=close_price,
+                    requested_notional_usdt=DEFAULT_QUOTE_SIZE_USDT,
+                )
+                persist_trade_proposal(proposal)
+                allocation = allocator.allocate(proposal)
+                built_trade, build_reasons = (None, [])
+                execution = {
+                    "status": "NOT_EXECUTED",
+                    "reason": allocation.get("rejection_reason") or allocation.get("decision"),
+                    "allocation": allocation,
+                }
+                if allocation.get("decision") in {"ACCEPT", "RESIZE"}:
+                    built_trade, build_reasons = build_trade_from_allocation(
+                        proposal,
+                        allocation,
+                        step_size=risk_manager.position_step_size,
+                    )
+                    if built_trade is None:
+                        execution = {"status": "REJECTED", "reason": ";".join(build_reasons), "allocation": allocation}
+                    else:
+                        execution = execution_engine.execute_built_trade(
+                            built_trade,
+                            latest_market_timestamp_utc=dt.isoformat(),
+                        )
                 symbol_reports.append(
                     {
                         "symbol": symbol,
@@ -614,10 +655,15 @@ def run_once(args) -> dict:
                         "datetime_utc": dt.isoformat(),
                         "close_price": close_price,
                         "signal": signal,
+                        "prediction": prediction.to_dict(),
+                        "proposal": proposal.to_dict(),
+                        "allocation": allocation,
+                        "built_trade": built_trade.to_dict() if built_trade is not None else None,
+                        "trade_build_reasons": build_reasons,
                         "execution": execution,
                     }
                 )
-            state = portfolio_manager.snapshot(price_by_symbol=price_map)
+            state = shared_portfolio_manager.snapshot(price_by_symbol=price_map)
             model_reports.append(
                 {
                     "model_id": model_id,
@@ -645,10 +691,12 @@ def run_once(args) -> dict:
             "symbols": symbols,
             "timeframe": args.timeframe,
             "sync_summary": sync_summary,
+            "reconciliation_summary": reconciliation_summary,
             "maintenance_summary": maintenance_summary,
             "models": model_reports,
             "created_at_utc": pd.Timestamp.now(tz="UTC").isoformat(),
         }
+        refresh_model_performance(account_mode=account_mode)
         stamp = pd.Timestamp.now(tz="UTC").strftime("%Y%m%d_%H%M%S")
         report_path = Path(args.report_path) if args.report_path else REPORTS_DIR / f"trading_bot_per_model_{stamp}.json"
         report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -656,6 +704,11 @@ def run_once(args) -> dict:
         run_report["report_path"] = str(report_path)
         LOGGER.info("per-model trading_bot run completed: %s", report_path)
         return run_report
+
+    raise RuntimeError(
+        "Legacy ensemble execution is disabled in the proposal/allocation architecture. "
+        "Use --paper-mode per-model so each model emits independent proposals that compete for shared capital."
+    )
 
     execution_model_id = "ensemble:" + ",".join(model_id for model_id, _, _ in artifacts)
 

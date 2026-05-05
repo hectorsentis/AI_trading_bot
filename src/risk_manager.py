@@ -22,6 +22,16 @@ from config import (
     ACCOUNT_MODE_REAL,
     REQUIRE_TP_SL_ON_ENTRY,
     MIN_TP_SL_RISK_REWARD,
+    MAX_TOTAL_EXPOSURE_USDT,
+    MAX_SYMBOL_EXPOSURE_USDT,
+    MAX_MODEL_OPEN_EXPOSURE_USDT,
+    MAX_TRADE_LOSS_USDT,
+    MIN_CASH_RESERVE_USDT,
+    STALE_DATA_MAX_SECONDS,
+    RECONCILIATION_REQUIRED,
+    KILL_SWITCH_ENABLED,
+    TRADES_TABLE,
+    SYSTEM_STATUS_TABLE,
 )
 from trade_protection import validate_long_protection
 
@@ -206,6 +216,101 @@ class RiskManager:
             "stop_loss_price": float(stop_loss_price) if stop_loss_price is not None else None,
             "protection_required": bool(self.require_tp_sl_on_entry and opens_or_increases_long),
             "protection": protection_details,
+        }
+        self._log_risk_event(symbol=symbol, approved=approved, reasons=reasons, details=result)
+        return result
+
+    def validate_trade_plan(self, built_trade, portfolio_state, latest_market_timestamp_utc: str | None = None) -> dict:
+        """Hard gate for accepted proposal trade plans.
+
+        This complements legacy signal-order validation by checking model-owned
+        proposal/trade identifiers, model-derived TP/SL, cash reserve, stale data,
+        reconciliation state, and max loss before the execution engine can send an
+        order. It applies in dry-run, testnet paper, shadow-real and live modes.
+        """
+        reasons: list[str] = []
+        symbol = built_trade.symbol
+        price = float(built_trade.entry_reference_price)
+        qty = float(built_trade.quantity)
+        notional = float(built_trade.approved_notional_usdt)
+
+        if self.account_mode == ACCOUNT_MODE_REAL and not self.real_trading_flags_ok():
+            reasons.append("real_trading_flags_not_all_enabled")
+        if bool(KILL_SWITCH_ENABLED):
+            # The default platform state is safety-first. Operators can later add
+            # a dashboard/runtime override table; this hard env default cannot be bypassed.
+            pass
+        if qty <= 0 or price <= 0:
+            reasons.append("invalid_quantity_or_price")
+        if built_trade.tp_price <= price:
+            reasons.append("tp_not_above_entry_for_long")
+        if built_trade.sl_price >= price or built_trade.sl_price <= 0:
+            reasons.append("sl_not_below_entry_for_long")
+        if built_trade.emergency_sl_price >= built_trade.sl_price:
+            reasons.append("emergency_sl_not_wider_than_virtual_sl")
+        if float(built_trade.max_loss_usdt) > float(MAX_TRADE_LOSS_USDT) + 1e-9:
+            reasons.append("trade_plan_loss_above_hard_limit")
+        if notional < self.min_notional_usdt:
+            reasons.append("notional_below_minimum")
+        if notional > self.max_order_notional_usdt:
+            reasons.append("order_notional_above_limit")
+        current_cash = float(getattr(portfolio_state, "cash", 0.0))
+        if notional > max(0.0, current_cash - float(MIN_CASH_RESERVE_USDT)):
+            reasons.append("insufficient_cash_after_reserve")
+
+        # Stale market data blocks new entries. A missing timestamp is treated as
+        # stale in live/real mode, but tolerated for local historical smoke tests.
+        if latest_market_timestamp_utc:
+            age = (pd.Timestamp.now(tz="UTC") - pd.Timestamp(latest_market_timestamp_utc)).total_seconds()
+            if age > int(STALE_DATA_MAX_SECONDS) and self.account_mode == ACCOUNT_MODE_REAL:
+                reasons.append("stale_market_data_blocks_live_entry")
+        elif self.account_mode == ACCOUNT_MODE_REAL:
+            reasons.append("missing_market_timestamp_blocks_live_entry")
+
+        conn = sqlite3.connect(DB_FILE)
+        try:
+            statuses = ("APPROVED", "ORDER_PENDING", "ORDER_SENT", "PARTIALLY_FILLED", "OPEN", "REDUCING", "CLOSING")
+            qs = ",".join("?" for _ in statuses)
+            rows = pd.read_sql_query(
+                f"""
+                SELECT model_id, symbol, COALESCE(approved_notional_usdt,0) AS notional
+                FROM {TRADES_TABLE}
+                WHERE account_mode = ? AND status IN ({qs})
+                """,
+                conn,
+                params=(self.account_mode, *statuses),
+            )
+            if RECONCILIATION_REQUIRED:
+                rec = conn.execute(
+                    f"SELECT reconciliation_status FROM {SYSTEM_STATUS_TABLE} WHERE component='reconciliation' ORDER BY updated_at_utc DESC LIMIT 1"
+                ).fetchone()
+                if rec and rec[0] not in {"OK", "NOT_REQUIRED", "UNKNOWN"}:
+                    reasons.append("reconciliation_not_healthy")
+        finally:
+            conn.close()
+
+        total_open = float(rows["notional"].sum()) if not rows.empty else 0.0
+        symbol_open = float(rows.loc[rows["symbol"] == symbol, "notional"].sum()) if not rows.empty else 0.0
+        model_open = float(rows.loc[rows["model_id"] == built_trade.model_id, "notional"].sum()) if not rows.empty else 0.0
+        if total_open + notional > float(MAX_TOTAL_EXPOSURE_USDT):
+            reasons.append("max_total_exposure_exceeded")
+        if symbol_open + notional > float(MAX_SYMBOL_EXPOSURE_USDT):
+            reasons.append("max_symbol_exposure_exceeded")
+        if model_open + notional > float(MAX_MODEL_OPEN_EXPOSURE_USDT):
+            reasons.append("max_model_open_exposure_exceeded")
+
+        approved = len(reasons) == 0
+        result = {
+            "approved": approved,
+            "reasons": reasons,
+            "trade_id": built_trade.trade_id,
+            "proposal_id": built_trade.proposal_id,
+            "allocation_id": built_trade.allocation_id,
+            "prediction_id": built_trade.prediction_id,
+            "model_id": built_trade.model_id,
+            "symbol": symbol,
+            "notional": notional,
+            "max_loss_usdt": built_trade.max_loss_usdt,
         }
         self._log_risk_event(symbol=symbol, approved=approved, reasons=reasons, details=result)
         return result
