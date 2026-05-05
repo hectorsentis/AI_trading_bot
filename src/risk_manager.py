@@ -20,7 +20,10 @@ from config import (
     PAPER_MAX_DAILY_LOSS_USDT,
     MAX_ORDER_NOTIONAL_USDT,
     ACCOUNT_MODE_REAL,
+    REQUIRE_TP_SL_ON_ENTRY,
+    MIN_TP_SL_RISK_REWARD,
 )
+from trade_protection import validate_long_protection
 
 
 class RiskManager:
@@ -39,6 +42,8 @@ class RiskManager:
         self.max_new_trades_per_day = int(PAPER_MAX_NEW_TRADES_PER_DAY)
         self.max_daily_loss_usdt = float(PAPER_MAX_DAILY_LOSS_USDT)
         self.max_order_notional_usdt = float(MAX_ORDER_NOTIONAL_USDT)
+        self.require_tp_sl_on_entry = bool(REQUIRE_TP_SL_ON_ENTRY)
+        self.min_tp_sl_risk_reward = float(MIN_TP_SL_RISK_REWARD)
 
     def round_quantity(self, quantity: float) -> float:
         quantity = abs(float(quantity))
@@ -130,6 +135,9 @@ class RiskManager:
         delta_quantity: float,
         projected_position_quantity: float,
         portfolio_state,
+        side: str | None = None,
+        take_profit_price: float | None = None,
+        stop_loss_price: float | None = None,
     ) -> dict:
         reasons: list[str] = []
         price = float(price)
@@ -141,6 +149,18 @@ class RiskManager:
 
         if projected_qty < -1e-12:
             reasons.append("spot_short_position_not_allowed")
+
+        opens_or_increases_long = delta_quantity > 0
+        protection_details: dict = {}
+        if self.require_tp_sl_on_entry and opens_or_increases_long:
+            ok, protection_reasons, protection_details = validate_long_protection(
+                entry_price=price,
+                take_profit_price=take_profit_price,
+                stop_loss_price=stop_loss_price,
+                min_risk_reward=self.min_tp_sl_risk_reward,
+            )
+            if not ok:
+                reasons.extend(protection_reasons)
 
         qty_abs = self.round_quantity(abs(delta_quantity))
         if qty_abs <= 0:
@@ -182,6 +202,10 @@ class RiskManager:
             "delta_notional": delta_notional,
             "projected_notional": projected_notional,
             "projected_exposure": projected_exposure,
+            "take_profit_price": float(take_profit_price) if take_profit_price is not None else None,
+            "stop_loss_price": float(stop_loss_price) if stop_loss_price is not None else None,
+            "protection_required": bool(self.require_tp_sl_on_entry and opens_or_increases_long),
+            "protection": protection_details,
         }
         self._log_risk_event(symbol=symbol, approved=approved, reasons=reasons, details=result)
         return result

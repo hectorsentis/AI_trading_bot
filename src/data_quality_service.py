@@ -4,7 +4,7 @@ import sqlite3
 
 import pandas as pd
 
-from config import DATA_COVERAGE_TABLE, DATA_GAPS_TABLE, DB_FILE, PRICES_TABLE, SYMBOLS, TIMEFRAME
+from config import DATA_COVERAGE_TABLE, DATA_GAPS_TABLE, DB_FILE, PRICES_TABLE, SYMBOLS, TIMEFRAME, TIMEFRAMES
 from data_loader import compute_gaps_for_symbol, replace_gaps_for_symbol, update_price_coverage
 from db_utils import init_research_tables
 
@@ -51,12 +51,21 @@ def run_quality_checks(symbols: list[str] | None = None, timeframe: str = TIMEFR
     return [check_symbol_quality(symbol, timeframe) for symbol in symbols]
 
 
+def run_quality_checks_many(symbols: list[str] | None = None, timeframes: list[str] | None = None) -> dict[str, list[dict]]:
+    selected = [tf.strip() for tf in (timeframes or TIMEFRAMES) if str(tf).strip()]
+    return {timeframe: run_quality_checks(symbols=symbols, timeframe=timeframe) for timeframe in selected}
+
+
 def main():
     parser = argparse.ArgumentParser(description="Data quality service: gaps, duplicates, UTC timestamps, coverage.")
     parser.add_argument("--symbols", nargs="*", default=None)
     parser.add_argument("--timeframe", default=TIMEFRAME)
+    parser.add_argument("--timeframes", nargs="*", default=None)
     args = parser.parse_args()
-    print(json.dumps(run_quality_checks(args.symbols, args.timeframe), ensure_ascii=True, indent=2))
+    if args.timeframes:
+        print(json.dumps(run_quality_checks_many(args.symbols, args.timeframes), ensure_ascii=True, indent=2))
+    else:
+        print(json.dumps(run_quality_checks(args.symbols, args.timeframe), ensure_ascii=True, indent=2))
 
 
 if __name__ == "__main__":

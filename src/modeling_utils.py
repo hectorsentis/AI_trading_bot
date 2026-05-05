@@ -96,6 +96,7 @@ def compute_economic_metrics(
     frame: pd.DataFrame,
     timeframe: str,
     cost_per_trade: float,
+    allow_short: bool = False,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, SplitMetrics]:
     required = {"symbol", "datetime_utc", "signal_position", "fwd_return_1"}
     missing = required - set(frame.columns)
@@ -108,6 +109,12 @@ def compute_economic_metrics(
 
     df["fwd_return_1"] = pd.to_numeric(df["fwd_return_1"], errors="coerce").fillna(0.0)
     df["signal_position"] = pd.to_numeric(df["signal_position"], errors="coerce").fillna(0).astype(int)
+    df["research_signal_position"] = df["signal_position"]
+    if not allow_short:
+        # Binance Spot cannot open true short exposure. SHORT model outputs are
+        # bearish/risk-off decisions and are evaluated as flat/exit, matching
+        # the execution engine's spot policy.
+        df["signal_position"] = df["signal_position"].clip(lower=0)
 
     df["prev_signal"] = df.groupby("symbol")["signal_position"].shift(1).fillna(0).astype(int)
     df["turnover"] = (df["signal_position"] - df["prev_signal"]).abs()

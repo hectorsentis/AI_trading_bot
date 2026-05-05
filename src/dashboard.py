@@ -6,6 +6,7 @@ Run:
 from __future__ import annotations
 
 import itertools
+import json
 from html import escape
 from typing import Any
 
@@ -14,6 +15,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+import dashboard_auth as auth
+import dashboard_controls as controls
 import dashboard_data as data
 
 
@@ -137,7 +140,69 @@ def show_df(st, df: pd.DataFrame, *, height: int = 320, empty: str = "No data av
         msg = df.attrs.get("message") or empty
         st.info(msg)
         return
-    st.dataframe(df, use_container_width=True, height=height)
+    display = df.copy()
+    for col in display.columns:
+        if str(col).endswith("_json"):
+            display[col] = display[col].apply(parse_jsonish_for_display)
+        if display[col].map(lambda v: isinstance(v, (dict, list))).any():
+            display[col] = display[col].apply(humanize_nested_value)
+    st.dataframe(display, use_container_width=True, height=height)
+
+
+def parse_jsonish_for_display(value: Any) -> Any:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    if isinstance(value, (dict, list)):
+        return value
+    text = str(value).strip()
+    if not text:
+        return ""
+    try:
+        return json.loads(text)
+    except Exception:
+        return text
+
+
+def humanize_nested_value(value: Any) -> str:
+    """Display nested dict/list payloads without raw JSON widgets."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    if isinstance(value, dict):
+        parts = []
+        for k, v in value.items():
+            if isinstance(v, dict):
+                inner = ", ".join(f"{ik}={iv}" for ik, iv in list(v.items())[:5])
+                parts.append(f"{k}: {inner}")
+            elif isinstance(v, list):
+                parts.append(f"{k}: {', '.join(map(str, v[:5]))}")
+            else:
+                parts.append(f"{k}: {v}")
+        return "; ".join(parts[:8])
+    if isinstance(value, list):
+        return ", ".join(map(str, value[:8]))
+    return str(value)
+
+
+def flatten_nested_metrics(payload: Any) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+
+    def walk(prefix: str, value: Any) -> None:
+        if isinstance(value, dict):
+            for k, v in value.items():
+                walk(f"{prefix}.{k}" if prefix else str(k), v)
+        elif isinstance(value, list):
+            rows.append({"metric": prefix, "value": ", ".join(map(str, value[:10]))})
+        else:
+            rows.append({"metric": prefix, "value": value})
+
+    walk("", payload if isinstance(payload, dict) else {})
+    return pd.DataFrame(rows)
+
+
+def render_key_value_table(st, title: str, payload: dict[str, Any], *, height: int = 260) -> None:
+    st.markdown(f"#### {title}")
+    rows = [{"field": str(k), "value": humanize_nested_value(v)} for k, v in payload.items()]
+    show_df(st, pd.DataFrame(rows), height=height, empty="No data available.")
 
 
 def filter_df(st, df: pd.DataFrame, key: str, columns: list[str] | None = None) -> pd.DataFrame:
@@ -230,6 +295,28 @@ def render_kpis(st, summary: dict[str, Any], status: dict[str, Any], model_row: 
     k[1].metric("Coverage min", min_cov)
     k[2].metric("Coverage max", max_cov)
     k[3].metric("Open gaps", open_gaps)
+
+
+def render_compact_kpis(st, summary: dict[str, Any], status: dict[str, Any], registry: pd.DataFrame, positions: pd.DataFrame, gaps: pd.DataFrame) -> None:
+    """Small operator-first KPI strip for the simplified control panel."""
+    active_models = 0
+    if not registry.empty:
+        if "is_active" in registry.columns:
+            active_models = int(pd.to_numeric(registry["is_active"], errors="coerce").fillna(0).sum())
+        elif "status" in registry.columns:
+            active_models = int(registry["status"].astype(str).str.contains("active|ready|validated|accepted", case=False, regex=True).sum())
+    open_positions = 0
+    if not positions.empty and "quantity" in positions.columns:
+        open_positions = int((pd.to_numeric(positions["quantity"], errors="coerce").fillna(0).abs() > 1e-12).sum())
+    cards = st.columns(6)
+    cards[0].metric("Portfolio", fmt_money(summary.get("total_equity")))
+    cards[1].metric("Total PnL", fmt_money((summary.get("realized_pnl") or 0) + (summary.get("unrealized_pnl") or 0)))
+    cards[2].metric("Daily PnL", fmt_money(summary.get("daily_pnl")))
+    cards[3].metric("Bot", str(status.get("state") or "Unknown"))
+    cards[4].metric("Models", active_models)
+    cards[5].metric("Positions", open_positions)
+    if not gaps.empty:
+        st.warning(f"DATA WARNING: {len(gaps)} open data gaps.")
 
 
 def fig_template(fig: go.Figure) -> go.Figure:
@@ -343,7 +430,7 @@ def render_trade_pnl(st, trades: pd.DataFrame, *, key_prefix: str = "trade_pnl")
 
 
 def render_price_signals(st, symbol: str, timeframe: str, price: pd.DataFrame, signals: pd.DataFrame, orders: pd.DataFrame, *, key_prefix: str = "price") -> None:
-    st.subheader(f"Price + signals · {symbol} · {timeframe}")
+    st.subheader(f"Market chart - {symbol} - {timeframe}")
     if price.empty:
         st.info(price.attrs.get("message", "No price data available for this symbol/timeframe."))
         return
@@ -355,11 +442,36 @@ def render_price_signals(st, symbol: str, timeframe: str, price: pd.DataFrame, s
     if price.empty:
         st.warning("Price data has no plottable rows.")
         return
-    fig = go.Figure()
+
+    has_volume = "volume" in price.columns and pd.to_numeric(price["volume"], errors="coerce").notna().any()
+    fig = make_subplots(
+        rows=2 if has_volume else 1,
+        cols=1,
+        shared_xaxes=True,
+        row_heights=[0.76, 0.24] if has_volume else [1.0],
+        vertical_spacing=0.03,
+    )
     if {"open", "high", "low", "close"}.issubset(price.columns) and price[["open", "high", "low", "close"]].notna().all(axis=1).any():
-        fig.add_trace(go.Candlestick(x=price["datetime_utc"], open=price["open"], high=price["high"], low=price["low"], close=price["close"], name="OHLC"))
+        fig.add_trace(
+            go.Candlestick(
+                x=price["datetime_utc"],
+                open=price["open"],
+                high=price["high"],
+                low=price["low"],
+                close=price["close"],
+                name="Candles",
+                increasing_line_color="#22c55e",
+                decreasing_line_color="#ef4444",
+            ),
+            row=1,
+            col=1,
+        )
     else:
-        fig.add_trace(go.Scatter(x=price["datetime_utc"], y=price["close"], mode="lines", name="Close", line=dict(color="#38bdf8", width=2)))
+        fig.add_trace(go.Scatter(x=price["datetime_utc"], y=price["close"], mode="lines", name="Close", line=dict(color="#38bdf8", width=2)), row=1, col=1)
+
+    if has_volume:
+        fig.add_trace(go.Bar(x=price["datetime_utc"], y=pd.to_numeric(price["volume"], errors="coerce"), name="Volume", marker_color="rgba(148,163,184,.45)"), row=2, col=1)
+
     if not signals.empty and {"symbol", "datetime_utc"}.issubset(signals.columns):
         tf_series = signals["timeframe"].astype(str) if "timeframe" in signals.columns else pd.Series([timeframe] * len(signals), index=signals.index)
         sig = signals[(signals["symbol"].astype(str) == symbol) & (tf_series == timeframe)].copy()
@@ -370,7 +482,7 @@ def render_price_signals(st, symbol: str, timeframe: str, price: pd.DataFrame, s
             for label, color, marker in [("LONG", "#22c55e", "triangle-up"), ("SHORT", "#ef4444", "triangle-down"), ("FLAT", "#94a3b8", "circle")]:
                 part = sig[label_series.str.upper() == label]
                 if not part.empty:
-                    fig.add_trace(go.Scatter(x=part["datetime_utc"], y=part["close"], mode="markers", name=f"Signal {label}", marker=dict(color=color, size=10, symbol=marker)))
+                    fig.add_trace(go.Scatter(x=part["datetime_utc"], y=part["close"], mode="markers", name=f"Signal {label}", marker=dict(color=color, size=11, symbol=marker, line=dict(color="#020617", width=1))), row=1, col=1)
     if not orders.empty and {"symbol", "created_at_utc"}.issubset(orders.columns):
         od = orders[orders["symbol"].astype(str) == symbol].copy()
         if not od.empty:
@@ -378,9 +490,12 @@ def render_price_signals(st, symbol: str, timeframe: str, price: pd.DataFrame, s
             od["plot_price"] = pd.to_numeric(od.get("fill_price", od.get("requested_price")), errors="coerce")
             od = od.dropna(subset=["created_at_utc", "plot_price"])
             if not od.empty:
-                fig.add_trace(go.Scatter(x=od["created_at_utc"], y=od["plot_price"], mode="markers", name="Orders", marker=dict(color="#facc15", size=10, symbol="x")))
+                fig.add_trace(go.Scatter(x=od["created_at_utc"], y=od["plot_price"], mode="markers", name="Orders", marker=dict(color="#facc15", size=11, symbol="x")), row=1, col=1)
     fig.update_xaxes(rangeslider_visible=False)
-    safe_plotly_chart(st, fig, height=520, key=f"{key_prefix}_price_signals_{symbol}_{timeframe}_{len(price)}")
+    fig.update_yaxes(title_text="Price", row=1, col=1)
+    if has_volume:
+        fig.update_yaxes(title_text="Volume", row=2, col=1)
+    safe_plotly_chart(st, fig, height=560, key=f"{key_prefix}_price_signals_{symbol}_{timeframe}_{len(price)}")
 
 
 def render_exposure(st, exposure: pd.DataFrame, *, key_prefix: str = "exposure") -> None:
@@ -465,6 +580,348 @@ def render_model_equity_matrix(st, snapshots: pd.DataFrame, *, key_prefix: str) 
     safe_plotly_chart(st, fig, height=420, key=f"{key_prefix}_model_equity_{len(df)}")
 
 
+def render_symbol_bot_matrix(st, registry: pd.DataFrame, positions: pd.DataFrame, orders: pd.DataFrame) -> None:
+    st.subheader("Symbol-separated bot allocation")
+    if registry.empty or "model_id" not in registry.columns:
+        st.info("No registered models available to map by symbol.")
+        return
+    rows: list[dict[str, Any]] = []
+    for _, row in registry.iterrows():
+        symbols_raw = str(row.get("symbol_scope", "") or "")
+        symbols = [s.strip().upper() for s in symbols_raw.split(",") if s.strip()]
+        for symbol in symbols:
+            model_id = str(row.get("model_id", ""))
+            pos_qty = None
+            if not positions.empty and {"model_id", "symbol", "quantity"}.issubset(positions.columns):
+                match = positions[(positions["model_id"].astype(str) == model_id) & (positions["symbol"].astype(str) == symbol)]
+                if not match.empty:
+                    pos_qty = pd.to_numeric(match["quantity"], errors="coerce").sum()
+            last_order = None
+            if not orders.empty and {"model_id", "symbol", "created_at_utc"}.issubset(orders.columns):
+                match = orders[(orders["model_id"].astype(str) == model_id) & (orders["symbol"].astype(str) == symbol)].copy()
+                if not match.empty:
+                    match["created_at_utc"] = pd.to_datetime(match["created_at_utc"], utc=True, errors="coerce")
+                    last_order = match.sort_values("created_at_utc").tail(1).iloc[0].get("status")
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "model_id": model_id,
+                    "status": row.get("status"),
+                    "training_scope": row.get("training_scope"),
+                    "signal_enabled": row.get("dashboard_signal_enabled"),
+                    "paper_enabled": row.get("dashboard_paper_enabled"),
+                    "return": row.get("strategy_return"),
+                    "excess_return": row.get("excess_return"),
+                    "sharpe": row.get("sharpe"),
+                    "drawdown": row.get("max_drawdown"),
+                    "profit_factor": row.get("profit_factor"),
+                    "risk_adjusted_score": row.get("risk_adjusted_score"),
+                    "position_qty": pos_qty,
+                    "last_order_status": last_order,
+                }
+            )
+    matrix = pd.DataFrame(rows)
+    if matrix.empty:
+        st.info("No symbol scope data found in model registry.")
+        return
+    sort_cols = ["symbol", "risk_adjusted_score"] if "risk_adjusted_score" in matrix.columns else ["symbol"]
+    show_df(st, matrix.sort_values(sort_cols, ascending=[True, False] if len(sort_cols) == 2 else True), height=280)
+
+
+def merge_model_controls(registry: pd.DataFrame, model_control: pd.DataFrame) -> pd.DataFrame:
+    if registry.empty:
+        return registry
+    out = registry.copy()
+    if not model_control.empty and "model_id" in model_control.columns:
+        cols = [c for c in ["model_id", "signal_enabled", "paper_enabled", "live_enabled", "updated_by", "updated_at_utc"] if c in model_control.columns]
+        out = out.merge(model_control[cols].drop_duplicates("model_id"), on="model_id", how="left", suffixes=("", "_control"))
+    for col in ["signal_enabled", "paper_enabled", "live_enabled"]:
+        if col not in out.columns:
+            out[col] = pd.NA
+    if "is_active" in out.columns:
+        out["dashboard_signal_enabled"] = out["signal_enabled"].fillna(out["is_active"]).fillna(0).astype(int)
+    else:
+        out["dashboard_signal_enabled"] = out["signal_enabled"].fillna(0).astype(int)
+    out["dashboard_paper_enabled"] = out["paper_enabled"].fillna(0).astype(int)
+    out["dashboard_live_enabled"] = out["live_enabled"].fillna(0).astype(int)
+    return out
+
+
+def render_action_result(st, fn, *args, **kwargs) -> None:
+    try:
+        action_id = fn(*args, **kwargs)
+        st.success(f"Audited action recorded. action_id={action_id}")
+    except Exception as exc:
+        st.error(f"Action rejected: {exc}")
+
+
+def json_safe_value(value: Any) -> Any:
+    if isinstance(value, (dict, list, int, float, bool)) or value is None:
+        return value
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    return str(value)
+
+
+def render_models_tab(st, registry: pd.DataFrame, model_control: pd.DataFrame, requested_by: str, selected_models: list[str]) -> None:
+    st.subheader("Model registry, metrics and safe controls")
+    merged = merge_model_controls(registry, model_control)
+    if not merged.empty:
+        merged = apply_selection_filters(merged, model_ids=selected_models)
+    comparison = data.load_model_comparison()
+    comparison = apply_selection_filters(comparison, model_ids=selected_models)
+    if not comparison.empty and {"model_id", "strategy_return"}.issubset(comparison.columns):
+        plot_df = comparison.dropna(subset=["strategy_return"]).head(30)
+        if not plot_df.empty:
+            fig = px.bar(plot_df, x="model_id", y="strategy_return", color="status", hover_data=[c for c in ["sharpe", "max_drawdown", "profit_factor", "trade_count"] if c in plot_df.columns])
+            fig.update_yaxes(tickformat=".1%")
+            safe_plotly_chart(st, fig, height=390, key=f"models_comparison_{len(plot_df)}_{','.join(selected_models) if selected_models else 'all'}")
+
+    preferred = [
+        "model_id", "symbol_scope", "timeframe", "status", "acceptance_status", "is_active",
+        "dashboard_signal_enabled", "dashboard_paper_enabled", "dashboard_live_enabled",
+        "training_ts_utc", "train_start", "train_end", "test_start", "test_end",
+        "feature_version", "label_version", "model_path", "risk_adjusted_score",
+        "strategy_return", "buy_hold_return", "excess_return", "sharpe",
+        "max_drawdown", "profit_factor", "trade_count",
+        "f1_macro", "accuracy", "precision_macro", "recall_macro",
+        "rejection_reasons_json_parsed",
+    ]
+    show_df(st, merged[[c for c in preferred if c in merged.columns]] if not merged.empty else merged, height=430, empty="No models registered. Run model maintenance/training first.")
+
+    if merged.empty or "model_id" not in merged.columns:
+        st.info("Model controls are pending until model_registry has rows.")
+        return
+
+    model_ids = merged["model_id"].dropna().astype(str).tolist()
+    selected_model = st.selectbox("Inspect/control model", model_ids, key="model_detail_select")
+    row = merged[merged["model_id"].astype(str) == selected_model].iloc[0]
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        st.markdown("#### Model details")
+        detail = {k: row.get(k) for k in preferred if k in row.index}
+        render_key_value_table(st, "Selected model", {k: json_safe_value(v) for k, v in detail.items()}, height=300)
+        metrics_raw = row.get("metrics_json_parsed", {})
+        if isinstance(metrics_raw, dict) and metrics_raw:
+            st.markdown("#### Metrics")
+            metrics_df = flatten_nested_metrics(metrics_raw)
+            show_df(st, metrics_df, height=260, empty="No metrics available for this model.")
+        else:
+            st.info("No metrics available for this model.")
+    with c2:
+        st.markdown("#### Safe model controls")
+        st.caption("These controls update model_control/model_registry and queue pending actions. They do not send orders.")
+        a, b = st.columns(2)
+        if a.button("Activate signal generation", key=f"activate_{selected_model}", use_container_width=True):
+            render_action_result(st, controls.activate_model, selected_model, requested_by)
+        if b.button("Deactivate signal generation", key=f"deactivate_{selected_model}", use_container_width=True):
+            render_action_result(st, controls.deactivate_model, selected_model, requested_by)
+        a, b = st.columns(2)
+        if a.button("Enable paper trading", key=f"paper_on_{selected_model}", use_container_width=True):
+            render_action_result(st, controls.set_model_paper, selected_model, True, requested_by)
+        if b.button("Disable paper trading", key=f"paper_off_{selected_model}", use_container_width=True):
+            render_action_result(st, controls.set_model_paper, selected_model, False, requested_by)
+        st.warning("Live runtime is controlled from the Control tab and requires password plus external environment gates.")
+        st.caption(controls.live_trading_locked_reason())
+
+    reports = data.load_latest_report_summary()
+    report_rows = []
+    for name, payload in reports.items():
+        if isinstance(payload, dict) and payload:
+            economic = payload.get("economic", {}) if isinstance(payload.get("economic"), dict) else {}
+            classification = payload.get("classification", {}) if isinstance(payload.get("classification"), dict) else {}
+            report_rows.append(
+                {
+                    "report": name,
+                    "model_id": payload.get("model_id"),
+                    "status": payload.get("status") or payload.get("acceptance_status"),
+                    "return": economic.get("strategy_return"),
+                    "sharpe": economic.get("sharpe"),
+                    "drawdown": economic.get("max_drawdown"),
+                    "trades": economic.get("trade_count"),
+                    "accuracy": classification.get("accuracy"),
+                    "f1_macro": classification.get("f1_macro"),
+                    "source": payload.get("_source_file"),
+                }
+            )
+    st.markdown("#### Latest report summaries")
+    show_df(st, pd.DataFrame(report_rows), height=220, empty="No report summaries available.")
+
+
+def render_bot_control_tab(st, status: dict[str, Any], requested_by: str) -> None:
+    st.subheader("Bot Control - audited operator intents")
+    st.caption("Authenticated buttons execute safe server-side operations on the VPS and audit every action in SQLite. They do not place exchange orders or enable live trading.")
+    if controls.server_actions_enabled():
+        st.success("Server actions enabled: dashboard can start/stop paper bot services and launch maintenance jobs.")
+    else:
+        st.warning("Server actions disabled: actions will be queued but not executed. Set DASHBOARD_ALLOW_SERVER_ACTIONS=true on the VPS.")
+    c = st.columns(4)
+    action_buttons = [
+        ("Request bot start", "START_BOT"),
+        ("Request bot stop", "STOP_BOT"),
+        ("Pause signal generation", "PAUSE_SIGNALS"),
+        ("Resume signal generation", "RESUME_SIGNALS"),
+        ("Enable paper trading", "ENABLE_PAPER"),
+        ("Disable paper trading", "DISABLE_PAPER"),
+        ("Refresh data", "REFRESH_DATA"),
+        ("Run data quality check", "RUN_DATA_CHECK"),
+    ]
+    for idx, (label, action) in enumerate(action_buttons):
+        if c[idx % 4].button(label, key=f"bot_action_{action}", use_container_width=True):
+            params = {"source": "dashboard", "mode": status.get("mode"), "dry_run": status.get("safety_flags", {}).get("DRY_RUN")}
+            params.update({"symbols": ",".join(status.get("symbols") or []), "timeframe": status.get("timeframe")})
+            render_action_result(st, controls.execute_bot_action, action, params, requested_by)
+
+    st.markdown("#### Request new model training")
+    with st.form("request_training"):
+        symbols = st.text_input("Symbols", value=",".join(status.get("symbols") or []))
+        timeframe = st.text_input("Timeframe", value=str(status.get("timeframe") or "1h"))
+        training_scope = st.selectbox("Training scope", ["both", "multi_symbol", "per_symbol"], index=0)
+        max_attempts = st.number_input("Max attempts", min_value=1, max_value=500, value=50, step=1)
+        submitted = st.form_submit_button("Queue training request")
+    if submitted:
+        render_action_result(
+            st,
+            controls.execute_bot_action,
+            "REQUEST_RETRAIN",
+            {"symbols": symbols, "timeframe": timeframe, "training_scope": training_scope, "max_attempts": int(max_attempts)},
+            requested_by,
+        )
+
+    st.markdown("#### Runtime/safety state")
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        render_key_value_table(st, "Runtime/safety state", status, height=520)
+    with c2:
+        st.markdown("#### Pending/recent actions")
+        show_df(st, controls.load_control_actions(300), height=520, empty="No dashboard actions recorded yet.")
+
+
+def render_simple_control_panel(st, status: dict[str, Any], requested_by: str) -> None:
+    st.subheader("Panel de control")
+    st.caption("Panel simplificado para VPS. El login permite gestionar el sistema; live trading conserva los guardarraíles obligatorios de entorno.")
+
+    st.markdown("### Kill switch")
+    st.error("Detiene procesos del bot y desactiva signals, paper y live en runtime_config. No borra datos ni modelos.")
+    kill_cols = st.columns([1, 2])
+    if kill_cols[0].button("KILL SWITCH", type="primary", use_container_width=True):
+        render_action_result(st, controls.execute_bot_action, "KILL_SWITCH", {"source": "dashboard"}, requested_by)
+    kill_cols[1].caption("Usar ante comportamiento inesperado, pérdidas, conectividad mala o cualquier duda operativa.")
+
+    st.markdown("### Bot")
+    c = st.columns(4)
+    action_specs = [
+        ("Start", "START_BOT"),
+        ("Stop", "STOP_BOT"),
+        ("Pause signals", "PAUSE_SIGNALS"),
+        ("Resume signals", "RESUME_SIGNALS"),
+        ("Enable paper", "ENABLE_PAPER"),
+        ("Disable paper", "DISABLE_PAPER"),
+        ("Refresh data", "REFRESH_DATA"),
+        ("Data check", "RUN_DATA_CHECK"),
+    ]
+    for idx, (label, action) in enumerate(action_specs):
+        if c[idx % 4].button(label, key=f"simple_{action}", use_container_width=True):
+            params = {"symbols": ",".join(status.get("symbols") or []), "timeframe": status.get("timeframe"), "source": "dashboard"}
+            render_action_result(st, controls.execute_bot_action, action, params, requested_by)
+
+    st.markdown("### Entrenamiento")
+    with st.form("simple_training"):
+        c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
+        symbols = c1.text_input("Symbols", value=",".join(status.get("symbols") or []))
+        timeframe = c2.text_input("Timeframe", value=str(status.get("timeframe") or "1h"))
+        scope = c3.selectbox("Scope", ["both", "multi_symbol", "per_symbol"], index=0)
+        attempts = c4.number_input("Attempts", min_value=1, max_value=500, value=50, step=1)
+        if st.form_submit_button("Train new model", use_container_width=True):
+            render_action_result(
+                st,
+                controls.execute_bot_action,
+                "REQUEST_RETRAIN",
+                {"symbols": symbols, "timeframe": timeframe, "training_scope": scope, "max_attempts": int(attempts)},
+                requested_by,
+            )
+
+    st.markdown("### Trading real")
+    st.warning("No se permite activar trading real saltándose `.env`. El botón requiere contraseña y que el VPS ya tenga activados explícitamente ENABLE_LIVE_TRADING, ENABLE_REAL_ORDER_EXECUTION, ENABLE_REAL_BINANCE_ACCOUNT, DRY_RUN=false y LIVE_TRADING_ALLOWED=true.")
+    st.caption(controls.live_trading_locked_reason())
+    live_cols = st.columns([1, 1])
+    with live_cols[0].form("enable_live_form"):
+        password = st.text_input("Password para activar live runtime", type="password")
+        confirm = st.checkbox("Confirmo que entiendo que puede enviar órdenes reales si los flags externos ya están activos")
+        submitted = st.form_submit_button("Activate live runtime", use_container_width=True)
+        if submitted:
+            if not confirm:
+                st.error("Confirma explícitamente la acción.")
+            elif not auth.verify_user_password(password):
+                st.error("Password incorrecta.")
+            else:
+                render_action_result(st, controls.execute_bot_action, "ENABLE_LIVE_RUNTIME", {"source": "dashboard_reauth"}, requested_by)
+    with live_cols[1]:
+        if st.button("Disable live runtime", use_container_width=True):
+            render_action_result(st, controls.execute_bot_action, "DISABLE_LIVE_RUNTIME", {"source": "dashboard"}, requested_by)
+
+    st.markdown("### Últimas acciones")
+    show_df(st, controls.load_control_actions(80), height=300, empty="No actions yet.")
+
+
+def render_configuration_tab(st, requested_by: str) -> None:
+    st.subheader("Runtime configuration")
+    st.caption("Safe runtime settings are stored in SQLite runtime_config with audit history. Secrets and API keys are never editable here.")
+    cfg = controls.load_runtime_config()
+    show_df(st, cfg, height=360, empty="No runtime config found. It will be initialized when the DB is available.")
+    schema = controls.RUNTIME_CONFIG_SCHEMA
+    key = st.selectbox("Configuration key", sorted(schema.keys()), key="config_key")
+    spec = schema[key]
+    current_value = None
+    if not cfg.empty and "key" in cfg.columns:
+        rows = cfg[cfg["key"].astype(str) == key]
+        if not rows.empty:
+            current_value = rows.iloc[0].get("value")
+    if current_value is None:
+        current_value = spec.get("default", "")
+    st.info(f"{spec.get('description', '')} Type: {spec.get('type')}.")
+    if spec.get("dangerous"):
+        st.warning("Dangerous setting. Enabling live trading is blocked by dashboard guardrails unless external env gates are already explicitly set.")
+    with st.form("runtime_config_editor"):
+        if spec["type"] == "bool":
+            proposed = st.checkbox("New value", value=str(current_value).lower() in {"true", "1", "yes", "on"})
+        else:
+            proposed = st.text_input("New value", value=str(current_value))
+        reason = st.text_input("Change reason", value="dashboard_operator_update")
+        st.write("Preview")
+        show_df(
+            st,
+            pd.DataFrame(
+                [
+                    {"field": "key", "value": key},
+                    {"field": "old_value", "value": current_value},
+                    {"field": "new_value", "value": proposed},
+                    {"field": "requested_by", "value": requested_by},
+                    {"field": "audit", "value": True},
+                ]
+            ),
+            height=190,
+        )
+        confirm = st.checkbox("Confirm audited configuration update")
+        submitted = st.form_submit_button("Save configuration change")
+    if submitted:
+        if not confirm:
+            st.error("Please confirm the audited update before saving.")
+        else:
+            try:
+                controls.update_runtime_config(key, proposed, requested_by, reason=reason)
+                st.success("Configuration saved to runtime_config and audit log.")
+            except Exception as exc:
+                st.error(f"Configuration rejected: {exc}")
+
+    st.markdown("#### Configuration audit")
+    audit = data.read_table("runtime_config_audit", 300, "updated_at_utc")
+    show_df(st, audit, height=330, empty="No configuration changes recorded yet.")
+
+
 def render_no_data_page(st, inventory: dict[str, Any]) -> None:
     st.markdown("<div class='panel'>", unsafe_allow_html=True)
     st.error("No SQLite database is available for the dashboard.")
@@ -478,7 +935,7 @@ def render_no_data_page(st, inventory: dict[str, Any]) -> None:
         language="bash",
     )
     st.write("Available reports/logs can still be used once the DB path is configured correctly.")
-    st.json(inventory)
+    render_key_value_table(st, "Dashboard inventory", inventory, height=260)
     st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -487,12 +944,31 @@ def main() -> None:
 
     st.set_page_config(page_title="AI Trading Bot - Operations", page_icon=None, layout="wide")
     inject_css(st)
+    requested_by = auth.require_login(st)
+    if requested_by is None:
+        return
 
     status = data.load_system_status()
     inventory = data.load_data_inventory()
+    if inventory.get("db_exists"):
+        try:
+            controls.ensure_dashboard_tables()
+            inventory = data.load_data_inventory()
+        except Exception as exc:
+            st.warning(f"Dashboard control tables are not writable: {exc}")
     render_header(st, status)
 
     with st.sidebar:
+        st.header("Operator")
+        st.write(f"User: **{requested_by}**")
+        if auth.load_auth_config().enabled:
+            st.success("AUTH ENABLED")
+            if st.button("Logout", use_container_width=True):
+                auth.logout(st)
+                st.rerun()
+        else:
+            st.warning("AUTH DISABLED")
+        st.divider()
         st.header("Controls")
         if st.button("Refresh now", use_container_width=True):
             st.rerun()
@@ -505,7 +981,11 @@ def main() -> None:
         st.write(f"Latest data: `{status.get('latest_data_ts') or 'N/A'}`")
         st.divider()
         st.subheader("Safety flags")
-        st.json(status.get("safety_flags", {}))
+        flags = pd.DataFrame([{"flag": k, "value": v} for k, v in (status.get("safety_flags") or {}).items()])
+        if flags.empty:
+            st.info("No safety flags available.")
+        else:
+            st.dataframe(flags, use_container_width=True, height=230, hide_index=True)
         if status.get("real_order_possible"):
             st.error("LIVE TRADING flags allow real orders. Verify intentionally.")
         else:
@@ -524,13 +1004,12 @@ def main() -> None:
         active = registry[registry["model_id"].astype(str) == str(status.get("active_model_id"))]
         model_row = active.iloc[0] if not active.empty else registry.iloc[0]
 
-    render_kpis(st, summary, status, model_row, coverage, gaps)
-
     signals = data.load_recent_signals(1000)
     orders = data.load_recent_orders(1000)
     positions = data.load_open_positions()
     fills = data.load_recent_fills(1000)
     snapshots = data.load_portfolio_snapshots()
+    model_control = data.load_model_control()
 
     all_symbols = sorted(set(status.get("symbols") or ["BTCUSDT"]) | set(signals["symbol"].dropna().astype(str).tolist() if "symbol" in signals.columns else []) | set(orders["symbol"].dropna().astype(str).tolist() if "symbol" in orders.columns else []) | set(positions["symbol"].dropna().astype(str).tolist() if "symbol" in positions.columns else []))
     all_models = sorted(set(registry["model_id"].dropna().astype(str).tolist() if "model_id" in registry.columns else []) | set(signals["model_id"].dropna().astype(str).tolist() if "model_id" in signals.columns else []) | set(orders["model_id"].dropna().astype(str).tolist() if "model_id" in orders.columns else []) | set(snapshots["model_id"].dropna().astype(str).tolist() if "model_id" in snapshots.columns else []))
@@ -540,18 +1019,24 @@ def main() -> None:
 
     with st.sidebar:
         st.divider()
-        st.subheader("Global filters")
-        selected_models = st.multiselect("Models", all_models, default=[], help="Empty = all models")
-        selected_symbols = st.multiselect("Symbols", all_symbols, default=[], help="Empty = all symbols")
-        selected_accounts = st.multiselect("Account modes", all_accounts, default=[], help="Empty = all account modes")
-        selected_order_statuses = st.multiselect("Order statuses", all_statuses, default=[], help="Affects order charts/tables")
-        selected_signal_labels = st.multiselect("Signal labels", all_signal_labels, default=[], help="Affects signal charts/tables")
-        st.divider()
         st.subheader("Price chart")
-        symbol_options = selected_symbols or all_symbols or ["BTCUSDT"]
+        selected_symbols: list[str] = []
+        selected_models: list[str] = []
+        selected_accounts: list[str] = []
+        selected_order_statuses: list[str] = []
+        selected_signal_labels: list[str] = []
+        symbol_options = all_symbols or ["BTCUSDT"]
         symbol = st.selectbox("Primary symbol", symbol_options, index=0)
         timeframe = st.text_input("Timeframe", value=str(status.get("timeframe") or "1h"))
         price_limit = st.slider("Price bars", 100, 3000, 800, 100)
+        with st.expander("Advanced filters", expanded=False):
+            selected_models = st.multiselect("Models", all_models, default=[], help="Empty = all models")
+            selected_symbols = st.multiselect("Symbols", all_symbols, default=[], help="Empty = all symbols")
+            selected_accounts = st.multiselect("Account modes", all_accounts, default=[], help="Empty = all account modes")
+            selected_order_statuses = st.multiselect("Order statuses", all_statuses, default=[], help="Affects order charts/tables")
+            selected_signal_labels = st.multiselect("Signal labels", all_signal_labels, default=[], help="Affects signal charts/tables")
+            if selected_symbols and symbol not in selected_symbols:
+                st.caption("The chart symbol is independent from table filters.")
 
     signals_f = apply_selection_filters(signals, model_ids=selected_models, symbols=selected_symbols, account_modes=selected_accounts, signal_labels=selected_signal_labels)
     orders_f = apply_selection_filters(orders, model_ids=selected_models, symbols=selected_symbols, account_modes=selected_accounts, statuses=selected_order_statuses)
@@ -563,79 +1048,53 @@ def main() -> None:
     if filtered_equity.empty and not (selected_models or selected_accounts):
         filtered_equity = data.load_equity_curve()
 
-    tabs = st.tabs(["Overview", "Portfolio", "Signals", "Orders", "Models", "Data Quality", "Logs / Ops"])
+    tabs = st.tabs(["Control", "Portfolio", "Models", "Data / Logs"])
 
     with tabs[0]:
-        c1, c2 = st.columns([2, 1])
+        render_compact_kpis(st, summary, status, registry_f, positions_f, gaps)
+        render_price_signals(st, symbol, timeframe, data.load_price_series(symbol, timeframe, price_limit), signals_f, orders_f, key_prefix="control")
+        render_simple_control_panel(st, status, requested_by)
+        c1, c2 = st.columns([1, 1])
         with c1:
-            render_equity(st, filtered_equity, key_prefix="overview")
+            st.subheader("Recent signals")
+            sig_cols = [c for c in ["datetime_utc", "symbol", "model_id", "signal", "confidence"] if c in signals_f.columns]
+            show_df(st, signals_f[sig_cols].head(12) if sig_cols and not signals_f.empty else signals_f.head(12), height=260, empty="No recent signals.")
         with c2:
-            render_exposure(st, data.load_exposure_breakdown(), key_prefix="overview")
-            st.subheader("Operational inventory")
-            st.json({"tables": len(inventory["existing_tables"]), "missing_expected": inventory["missing_expected_tables"][:8], "reports": inventory["reports_count"], "logs": inventory["logs_count"]})
-        render_price_signals(st, symbol, timeframe, data.load_price_series(symbol, timeframe, price_limit), signals_f, orders_f, key_prefix="overview")
+            st.subheader("Recent orders")
+            ord_cols = [c for c in ["created_at_utc", "symbol", "side", "quantity", "status", "dry_run", "account_mode", "model_id"] if c in orders_f.columns]
+            show_df(st, orders_f[ord_cols].head(12) if ord_cols and not orders_f.empty else orders_f.head(12), height=260, empty="No recent orders.")
+        render_symbol_bot_matrix(st, merge_model_controls(registry_f, model_control), positions_f, orders_f)
 
     with tabs[1]:
-        c1, c2 = st.columns([1.4, 1])
+        c1, c2 = st.columns([1.5, 1])
         with c1:
-            render_equity(st, filtered_equity, key_prefix="portfolio")
+            render_equity(st, filtered_equity, key_prefix="simple_portfolio")
         with c2:
-            render_trade_pnl(st, data.load_trade_pnl(), key_prefix="portfolio")
-        render_model_equity_matrix(st, snapshots_f, key_prefix="portfolio")
-        st.subheader("Current positions")
-        show_df(st, positions_f, height=360, empty="No open/current positions for selected filters. Run paper trading first.")
+            render_exposure(st, data.load_exposure_breakdown(), key_prefix="simple_portfolio")
+            render_trade_pnl(st, data.load_trade_pnl(), key_prefix="simple_portfolio")
+        st.subheader("Positions")
+        pos_preferred = [c for c in ["symbol", "quantity", "avg_entry_price", "current_price", "market_value", "unrealized_pnl", "realized_pnl", "exposure_pct", "model_id", "account_mode", "updated_at_utc"] if c in positions_f.columns]
+        show_df(st, positions_f[pos_preferred] if pos_preferred else positions_f, height=360, empty="No open/current positions.")
 
     with tabs[2]:
-        st.subheader("Latest signals")
-        view = filter_df(st, signals_f, "signals")
-        preferred = [c for c in ["datetime_utc", "symbol", "timeframe", "model_id", "signal", "confidence", "prob_short", "prob_flat", "prob_long", "persisted_at"] if c in view.columns]
-        show_df(st, view[preferred] if preferred else view, height=520, empty="No signals found. Run prediction/trading bot first.")
+        render_models_tab(st, registry_f, model_control, requested_by, selected_models)
 
     with tabs[3]:
-        st.subheader("Recent orders")
-        view = filter_df(st, orders_f, "orders")
-        preferred = [c for c in ["created_at_utc", "symbol", "side", "type", "order_type", "quantity", "requested_price", "fill_price", "notional", "status", "dry_run", "account_mode", "order_id", "reason"] if c in view.columns]
-        show_df(st, view[preferred] if preferred else view, height=420, empty="No orders found. Run paper trading first.")
-        st.subheader("Fills")
-        show_df(st, filter_df(st, fills_f, "fills", ["model_id", "symbol", "account_mode"]), height=320, empty="No fills found.")
-
-    with tabs[4]:
-        st.subheader("Model registry and OOS/backtest comparison")
-        comparison = data.load_model_comparison()
-        comparison = apply_selection_filters(comparison, model_ids=selected_models)
-        if not comparison.empty and {"model_id", "strategy_return"}.issubset(comparison.columns):
-            plot_df = comparison.dropna(subset=["strategy_return"]).head(30)
-            if not plot_df.empty:
-                fig = px.bar(plot_df, x="model_id", y="strategy_return", color="status", hover_data=[c for c in ["sharpe", "max_drawdown", "profit_factor", "trade_count"] if c in plot_df.columns])
-                fig.update_yaxes(tickformat=".1%")
-                safe_plotly_chart(st, fig, height=420, key=f"models_comparison_{len(plot_df)}_{','.join(selected_models) if selected_models else 'all'}")
-        show_df(st, comparison, height=520, empty="No models/reports found. Run model maintenance/backtest first.")
-        st.subheader("Latest report summaries")
-        st.json(data.load_latest_report_summary(), expanded=False)
-
-    with tabs[5]:
         c1, c2 = st.columns([1, 1])
         with c1:
-            st.subheader("Coverage by dataset/symbol/timeframe")
-            show_df(st, coverage, height=460, empty="No data_coverage rows. Run ingestion/data quality first.")
-        with c2:
+            st.subheader("Data quality")
+            show_df(st, coverage, height=260, empty="No coverage rows.")
             st.subheader("Open gaps")
-            show_df(st, gaps, height=460, empty="No open gaps detected or data_gaps table is empty.")
-        st.subheader("Table row counts")
-        show_df(st, data.load_table_counts(), height=300)
-
-    with tabs[6]:
-        c1, c2 = st.columns([1, 1])
-        with c1:
-            st.subheader("Risk limits")
-            limits = data.get_risk_limits()
-            st.dataframe(pd.DataFrame([{"limit": k, "value": v} for k, v in limits.items()]), use_container_width=True, height=260)
-            risk_events = data.read_table("risk_events", 500, "created_at_utc")
-            st.subheader("Risk events")
-            show_df(st, risk_events, height=360, empty="No risk events recorded.")
+            show_df(st, gaps, height=260, empty="No open gaps.")
+            st.subheader("Ingestion log")
+            show_df(st, data.read_table("ingestion_log", 200, "loaded_at_utc"), height=240, empty="No ingestion log.")
         with c2:
-            st.subheader("Critical logs and bot events")
-            show_df(st, data.load_recent_logs(250), height=680, empty="No warning/error/rejection logs found.")
+            st.subheader("Risk events")
+            show_df(st, data.read_table("risk_events", 200, "created_at_utc"), height=260, empty="No risk events.")
+            st.subheader("Critical logs")
+            show_df(st, data.load_recent_logs(120), height=520, empty="No warning/error/rejection logs found.")
+        st.subheader("Runtime configuration")
+        render_configuration_tab(st, requested_by)
 
 
 if __name__ == "__main__":

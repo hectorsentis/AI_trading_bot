@@ -21,6 +21,7 @@ from config import (
     COST_PER_TRADE,
     REPORTS_DIR,
     MIN_TRAIN_ROWS,
+    LOOKAHEAD_BARS,
 )
 from db_utils import init_research_tables, ensure_project_directories, save_validation_predictions
 from model_registry import (
@@ -35,6 +36,7 @@ from modeling_utils import (
     probabilities_to_signal,
 )
 from strategy_evaluator import evaluate_model_acceptance
+from temporal_utils import apply_label_embargo_cutoff
 
 
 def parse_args():
@@ -46,6 +48,7 @@ def parse_args():
     parser.add_argument("--step-size", type=int, default=RETRAIN_STEP, help="Step between folds in unique datetimes")
     parser.add_argument("--max-folds", type=int, default=25, help="Limit fold count to keep runtime reasonable")
     parser.add_argument("--min-train-rows", type=int, default=MIN_TRAIN_ROWS)
+    parser.add_argument("--embargo-bars", type=int, default=LOOKAHEAD_BARS, help="Bars to embargo before each validation fold to avoid label lookahead leakage.")
     parser.add_argument("--model-id", type=str, default=None, help="Model id to attach validation results to")
     parser.add_argument("--validation-run-id", type=str, default=None, help="Optional explicit validation run id")
     parser.add_argument("--short-threshold", type=float, default=None, help="Override short probability threshold")
@@ -135,6 +138,10 @@ def add_symbol_code(df: pd.DataFrame, mapping: dict[str, int]) -> pd.DataFrame:
     out = out.dropna(subset=["symbol_code"]).copy()
     out["symbol_code"] = out["symbol_code"].astype(int)
     return out
+
+
+def has_min_classes(y: pd.Series, n: int = 2) -> bool:
+    return len(set(pd.Series(y).dropna().astype(int).unique().tolist())) >= int(n)
 
 
 def walk_forward_splits(
@@ -235,7 +242,8 @@ def main():
     )
 
     for fold_id, (test_start, test_end) in enumerate(splits, start=1):
-        train_df = df[df["datetime_utc"] < test_start].copy()
+        train_cutoff = apply_label_embargo_cutoff(test_start, args.timeframe, args.embargo_bars)
+        train_df = df[df["datetime_utc"] < train_cutoff].copy()
         test_df = df[(df["datetime_utc"] >= test_start) & (df["datetime_utc"] <= test_end)].copy()
 
         if len(train_df) < args.min_train_rows or test_df.empty:
@@ -244,6 +252,8 @@ def main():
         train_df = add_symbol_code(train_df, symbol_mapping)
         test_df = add_symbol_code(test_df, symbol_mapping)
         if train_df.empty or test_df.empty:
+            continue
+        if not has_min_classes(train_df["label_class"], 2):
             continue
 
         model = LGBMClassifier(**model_params)
@@ -273,6 +283,7 @@ def main():
                 "fold_id": fold_id,
                 "train_start": train_df["datetime_utc"].min().isoformat(),
                 "train_end": train_df["datetime_utc"].max().isoformat(),
+                "train_cutoff_after_embargo": train_cutoff.isoformat(),
                 "test_start": test_df["datetime_utc"].min().isoformat(),
                 "test_end": test_df["datetime_utc"].max().isoformat(),
                 "train_rows": int(len(train_df)),
@@ -362,6 +373,8 @@ def main():
         "test_size": args.test_size,
         "step_size": args.step_size,
         "max_folds": args.max_folds,
+        "embargo_bars": int(args.embargo_bars),
+        "embargo_policy": "training rows whose labels could see validation bars are excluded from every fold",
         "short_threshold": short_threshold,
         "long_threshold": long_threshold,
         "model_params": model_params,

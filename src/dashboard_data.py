@@ -1,7 +1,8 @@
-"""Read-only data access layer for the operational Streamlit dashboard.
+"""Defensive data access layer for the operational Streamlit dashboard.
 
 All functions are defensive: missing DBs, tables, columns, reports or logs
 return empty DataFrames / N/A dictionaries instead of crashing the UI.
+Mutation is intentionally isolated in ``dashboard_controls.py``.
 """
 from __future__ import annotations
 
@@ -80,6 +81,10 @@ ALLOWED_TABLES = {
     "risk_events",
     "ingestion_log",
     "validation_predictions",
+    "bot_control_actions",
+    "model_control",
+    "runtime_config",
+    "runtime_config_audit",
 }
 
 DB_PATH = Path(DB_FILE).expanduser()
@@ -317,19 +322,32 @@ def load_model_registry(limit: int = 1000) -> pd.DataFrame:
             data = data.get(key)
         return data
 
+    def first_metric(row: pd.Series, paths: list[list[str]]) -> Any:
+        for path in paths:
+            value = metric(row, path)
+            if value is not None:
+                return value
+        return None
+
     paths = {
-        "accuracy": ["classification", "accuracy"],
-        "f1_macro": ["classification", "f1_macro"],
-        "strategy_return": ["economic", "strategy_return"],
-        "buy_hold_return": ["economic", "buy_hold_return"],
-        "sharpe": ["economic", "sharpe"],
-        "max_drawdown": ["economic", "max_drawdown"],
-        "profit_factor": ["economic", "profit_factor"],
-        "trade_count": ["economic", "trade_count"],
+        "accuracy": [["backtest_oos", "classification", "accuracy"], ["walk_forward", "classification", "overall_accuracy"], ["holdout", "classification", "accuracy"]],
+        "f1_macro": [["walk_forward", "classification", "overall_f1_macro"], ["holdout", "classification", "f1_macro"]],
+        "strategy_return": [["backtest_oos", "economic", "strategy_return"], ["walk_forward", "economic", "overall_strategy_return"], ["holdout", "economic", "strategy_return"]],
+        "buy_hold_return": [["backtest_oos", "economic", "buy_hold_return"], ["walk_forward", "economic", "overall_buy_hold_return"], ["holdout", "economic", "buy_hold_return"]],
+        "sharpe": [["backtest_oos", "economic", "sharpe"], ["walk_forward", "economic", "overall_sharpe"], ["holdout", "economic", "sharpe"]],
+        "max_drawdown": [["backtest_oos", "economic", "max_drawdown"], ["walk_forward", "economic", "overall_max_drawdown"], ["holdout", "economic", "max_drawdown"]],
+        "profit_factor": [["backtest_oos", "economic", "profit_factor"], ["walk_forward", "economic", "overall_profit_factor"], ["holdout", "economic", "profit_factor"]],
+        "trade_count": [["backtest_oos", "economic", "trade_count"], ["walk_forward", "economic", "overall_trade_count"], ["holdout", "economic", "trade_count"]],
     }
-    for name, path in paths.items():
-        out[name] = out.apply(lambda r, p=path: metric(r, p), axis=1)
-    out = _num(out, list(paths) + ["is_active"])
+    for name, metric_paths in paths.items():
+        out[name] = out.apply(lambda r, p=metric_paths: first_metric(r, p), axis=1)
+    out["excess_return"] = pd.to_numeric(out.get("strategy_return"), errors="coerce") - pd.to_numeric(out.get("buy_hold_return"), errors="coerce")
+    out["risk_adjusted_score"] = (
+        pd.to_numeric(out.get("strategy_return"), errors="coerce").fillna(0)
+        + 0.02 * pd.to_numeric(out.get("sharpe"), errors="coerce").fillna(0)
+        - pd.to_numeric(out.get("max_drawdown"), errors="coerce").abs().fillna(0)
+    )
+    out = _num(out, list(paths) + ["is_active", "excess_return", "risk_adjusted_score"])
     if "training_ts_utc" in out.columns:
         out["training_ts_utc"] = _dt(out["training_ts_utc"])
         out = out.sort_values("training_ts_utc", ascending=False)
@@ -461,6 +479,18 @@ def load_portfolio_snapshots(limit: int = 10000) -> pd.DataFrame:
 def load_paper_model_metrics(limit: int = 1000) -> pd.DataFrame:
     cols = ["trades", "filled_trades", "win_rate", "realized_pnl", "unrealized_pnl", "total_pnl", "equity", "total_return", "max_drawdown", "profit_factor", "average_trade_return", "days_active", "current_exposure"]
     return _num(read_table("paper_model_metrics", limit, "evaluated_at_utc"), cols)
+
+
+def load_model_control() -> pd.DataFrame:
+    return _num(read_table("model_control", 5000, "updated_at_utc"), ["signal_enabled", "paper_enabled", "live_enabled"])
+
+
+def load_runtime_config() -> pd.DataFrame:
+    return read_table("runtime_config", 5000, "key", descending=False)
+
+
+def load_control_actions(limit: int = 500) -> pd.DataFrame:
+    return read_table("bot_control_actions", limit, "requested_at_utc")
 
 
 def load_portfolio_summary() -> dict[str, Any]:

@@ -24,6 +24,7 @@ from config import (
     POSITIONS_TABLE,
     SIGNALS_TABLE,
     TIMEFRAME,
+    TIMEFRAMES,
     MODEL_EVALUATION_INTERVAL_SECONDS,
 )
 from db_utils import init_research_tables
@@ -199,12 +200,18 @@ def evaluate_active_models(account_mode: str | None = None, timeframe: str = TIM
     return results
 
 
+def evaluate_active_models_many(account_mode: str | None = None, timeframes: list[str] | None = None) -> dict[str, list[dict]]:
+    selected = [tf.strip() for tf in (timeframes or TIMEFRAMES) if str(tf).strip()]
+    return {timeframe: evaluate_active_models(account_mode=account_mode, timeframe=timeframe) for timeframe in selected}
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate paper trading performance per model_id/account_mode.")
     parser.add_argument("--evaluate-active", action="store_true")
     parser.add_argument("--model-id", default=None)
     parser.add_argument("--account-mode", default=None)
     parser.add_argument("--timeframe", default=TIMEFRAME)
+    parser.add_argument("--timeframes", nargs="*", default=None)
     parser.add_argument("--loop", action="store_true")
     parser.add_argument("--interval-seconds", type=int, default=MODEL_EVALUATION_INTERVAL_SECONDS)
     return parser.parse_args()
@@ -212,17 +219,18 @@ def parse_args():
 
 def main():
     args = parse_args()
+    timeframes = [tf.strip() for tf in (args.timeframes or []) if str(tf).strip()]
     if args.loop:
         update_status("paper_model_evaluator", "running", pid=os.getpid(), message="loop starting")
         while True:
             try:
-                results = evaluate_active_models(account_mode=args.account_mode, timeframe=args.timeframe)
+                results = evaluate_active_models_many(account_mode=args.account_mode, timeframes=timeframes) if timeframes else evaluate_active_models(account_mode=args.account_mode, timeframe=args.timeframe)
                 update_status(
                     "paper_model_evaluator",
                     "running",
                     pid=os.getpid(),
-                    message=f"evaluated {len(results)} active models",
-                    metadata={"count": len(results)},
+                    message="evaluated active paper models",
+                    metadata={"timeframes": timeframes or [args.timeframe]},
                 )
                 print(json.dumps({"component": "paper_model_evaluator", "results": results}, ensure_ascii=True), flush=True)
             except KeyboardInterrupt:
@@ -235,7 +243,8 @@ def main():
             time.sleep(max(10, int(args.interval_seconds)))
 
     if args.evaluate_active:
-        print(json.dumps(evaluate_active_models(account_mode=args.account_mode, timeframe=args.timeframe), ensure_ascii=True, indent=2))
+        results = evaluate_active_models_many(account_mode=args.account_mode, timeframes=timeframes) if timeframes else evaluate_active_models(account_mode=args.account_mode, timeframe=args.timeframe)
+        print(json.dumps(results, ensure_ascii=True, indent=2))
         return
     if not args.model_id:
         raise SystemExit("Use --evaluate-active or --model-id")

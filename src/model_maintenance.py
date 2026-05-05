@@ -17,6 +17,7 @@ from config import (
     SYMBOLS,
     TARGET_ACCEPTED_MODELS,
     TIMEFRAME,
+    TIMEFRAMES,
     MODEL_MAINTENANCE_INTERVAL_SECONDS,
     TRAINING_SCOPE,
 )
@@ -61,14 +62,15 @@ def _b64_json(payload: dict) -> str:
 def build_trial_plan(max_attempts: int) -> list[TrainingTrial]:
     base = dict(MODEL_PARAMS)
     candidates = [
-        (0.55, 0.55, {"n_estimators": 300, "learning_rate": 0.03, "num_leaves": 31}),
-        (0.45, 0.45, {"n_estimators": 400, "learning_rate": 0.025, "num_leaves": 31}),
-        (0.40, 0.40, {"n_estimators": 500, "learning_rate": 0.02, "num_leaves": 63}),
-        (0.36, 0.36, {"n_estimators": 350, "learning_rate": 0.03, "num_leaves": 15}),
-        (0.34, 0.34, {"n_estimators": 600, "learning_rate": 0.015, "num_leaves": 31}),
-        (0.32, 0.32, {"n_estimators": 450, "learning_rate": 0.02, "num_leaves": 63, "min_child_samples": 50}),
-        (0.38, 0.38, {"n_estimators": 300, "learning_rate": 0.04, "num_leaves": 15, "min_child_samples": 100}),
-        (0.42, 0.42, {"n_estimators": 700, "learning_rate": 0.015, "num_leaves": 31, "feature_fraction": 0.85}),
+        (0.55, 0.55, {"n_estimators": 500, "learning_rate": 0.03, "num_leaves": 31, "min_child_samples": 40}),
+        (0.48, 0.48, {"n_estimators": 650, "learning_rate": 0.022, "num_leaves": 31, "min_child_samples": 60, "subsample": 0.80}),
+        (0.42, 0.42, {"n_estimators": 800, "learning_rate": 0.018, "num_leaves": 63, "min_child_samples": 80, "colsample_bytree": 0.75}),
+        (0.38, 0.38, {"n_estimators": 500, "learning_rate": 0.028, "num_leaves": 15, "min_child_samples": 100, "reg_lambda": 0.75}),
+        (0.34, 0.46, {"n_estimators": 700, "learning_rate": 0.02, "num_leaves": 31, "min_child_samples": 50, "reg_alpha": 0.10}),
+        (0.46, 0.34, {"n_estimators": 700, "learning_rate": 0.02, "num_leaves": 31, "min_child_samples": 50, "reg_alpha": 0.10}),
+        (0.32, 0.32, {"n_estimators": 900, "learning_rate": 0.015, "num_leaves": 63, "min_child_samples": 120, "subsample": 0.75, "colsample_bytree": 0.75}),
+        (0.40, 0.52, {"n_estimators": 600, "learning_rate": 0.025, "num_leaves": 15, "min_child_samples": 70, "reg_lambda": 1.0}),
+        (0.52, 0.40, {"n_estimators": 600, "learning_rate": 0.025, "num_leaves": 15, "min_child_samples": 70, "reg_lambda": 1.0}),
     ]
     trials: list[TrainingTrial] = []
     for short_thr, long_thr, overrides in candidates:
@@ -231,6 +233,8 @@ def maintain_model_pool(
             timeframe,
             "--model-id",
             model_id,
+            "--symbols",
+            *symbols_args,
         ]
         code, out = _run_command(backtest_cmd)
         attempt["stages"]["backtest_oos"] = {"returncode": code, "tail": out[-4000:]}
@@ -240,7 +244,7 @@ def maintain_model_pool(
         attempt["final_status"] = record.get("status") if record else None
         attempt["rejection_reasons"] = record.get("rejection_reasons_json") if record else None
 
-        if record and record.get("acceptance_status") == "accepted" and not _eligible_existing_accepted(timeframe, training_scope=training_scope, symbols=symbols):
+        if record and record.get("acceptance_status") == "accepted":
             set_active_model(model_id, timeframe=timeframe)
             attempt["set_active"] = True
 
@@ -257,6 +261,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train/validate/backtest models until accepted-model pool target is met.")
     parser.add_argument("--symbols", nargs="*", default=None)
     parser.add_argument("--timeframe", default=TIMEFRAME)
+    parser.add_argument("--timeframes", nargs="*", default=None, help="Multiple timeframes to maintain. Overrides --timeframe when provided.")
     parser.add_argument("--target-accepted-models", type=int, default=TARGET_ACCEPTED_MODELS)
     parser.add_argument("--max-attempts", type=int, default=MODEL_POOL_MAX_TRAINING_ATTEMPTS_PER_CYCLE)
     parser.add_argument("--validation-max-folds", type=int, default=MODEL_POOL_VALIDATION_MAX_FOLDS)
@@ -269,16 +274,17 @@ def parse_args():
 def main():
     args = parse_args()
     symbols = [s.upper().strip() for s in args.symbols] if args.symbols else [s.upper() for s in SYMBOLS]
+    timeframes = [tf.strip() for tf in (args.timeframes or []) if str(tf).strip()] or [args.timeframe] or TIMEFRAMES
 
     training_scope = _normalize_training_scope(args.training_scope)
 
-    def _cycle():
+    def _cycle_for_timeframe(timeframe: str):
         if training_scope == "per_symbol" and len(symbols) > 1:
             per_symbol = {}
             for symbol in symbols:
                 per_symbol[symbol] = maintain_model_pool(
                     symbols=[symbol],
-                    timeframe=args.timeframe,
+                    timeframe=timeframe,
                     target_accepted_models=args.target_accepted_models,
                     max_attempts=args.max_attempts,
                     validation_max_folds=args.validation_max_folds,
@@ -291,12 +297,21 @@ def main():
             }
         return maintain_model_pool(
             symbols=symbols,
-            timeframe=args.timeframe,
+            timeframe=timeframe,
             target_accepted_models=args.target_accepted_models,
             max_attempts=args.max_attempts,
             validation_max_folds=args.validation_max_folds,
             training_scope=training_scope,
         )
+
+    def _cycle():
+        results = {timeframe: _cycle_for_timeframe(timeframe) for timeframe in timeframes}
+        if len(results) == 1:
+            return next(iter(results.values()))
+        return {
+            "timeframes": results,
+            "target_met": all(bool(item.get("target_met")) for item in results.values()),
+        }
 
     if args.loop:
         update_status("model_maintenance", "running", pid=os.getpid(), message="loop starting")

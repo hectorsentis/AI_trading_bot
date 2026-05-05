@@ -11,6 +11,7 @@ from config import (
     FEATURES_TABLE,
     SYMBOLS,
     TIMEFRAME,
+    TIMEFRAMES,
     FEATURE_COLUMNS,
     FEATURE_VERSION,
     LABEL_VERSION,
@@ -24,11 +25,21 @@ from db_utils import init_research_tables, refresh_coverage_from_table
 from features import compute_features
 from labels import generate_triple_barrier_labels
 
+LABEL_METADATA_COLUMNS = [
+    "label_take_profit_price",
+    "label_stop_loss_price",
+    "label_risk_reward",
+    "label_lookahead_bars",
+    "label_tp_multiplier",
+    "label_sl_multiplier",
+]
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Build and persist features + labels into SQLite feature store.")
     parser.add_argument("--symbols", nargs="*", default=None, help="Symbols to process. Default: config SYMBOLS")
     parser.add_argument("--timeframe", default=TIMEFRAME, help="Timeframe to process")
+    parser.add_argument("--timeframes", nargs="*", default=None, help="Multiple timeframes to process. Overrides --timeframe when provided.")
     parser.add_argument("--lookahead-bars", type=int, default=LOOKAHEAD_BARS)
     parser.add_argument("--tp-multiplier", type=float, default=TP_MULTIPLIER)
     parser.add_argument("--sl-multiplier", type=float, default=SL_MULTIPLIER)
@@ -181,6 +192,7 @@ def _to_upsert_rows(df: pd.DataFrame) -> list[tuple]:
                 _db_value(row["label_class"]),
                 _db_value(row["label_name"]),
                 _db_value(row["label_position"]),
+                *[_db_value(row.get(col)) for col in LABEL_METADATA_COLUMNS],
                 _db_value(row["feature_version"]),
                 _db_value(row["label_version"]),
                 _db_value(row["updated_at_utc"]),
@@ -195,7 +207,8 @@ def upsert_feature_rows(df: pd.DataFrame) -> int:
         return 0
 
     feature_sql_columns = ", ".join(FEATURE_COLUMNS)
-    placeholders = ", ".join(["?"] * (6 + len(FEATURE_COLUMNS) + 6))
+    label_metadata_sql_columns = ", ".join(LABEL_METADATA_COLUMNS)
+    placeholders = ", ".join(["?"] * (6 + len(FEATURE_COLUMNS) + 6 + len(LABEL_METADATA_COLUMNS)))
 
     query = f"""
     INSERT OR REPLACE INTO {FEATURES_TABLE} (
@@ -209,6 +222,7 @@ def upsert_feature_rows(df: pd.DataFrame) -> int:
         label_class,
         label_name,
         label_position,
+        {label_metadata_sql_columns},
         feature_version,
         label_version,
         updated_at_utc
@@ -295,22 +309,25 @@ def run_feature_store(symbols: Iterable[str], timeframe: str, args) -> None:
 def main():
     args = parse_args()
 
-    available = available_symbols_for_timeframe(args.timeframe)
-    if not available:
-        print("No data available in prices table for selected timeframe.")
-        return
+    timeframes = [tf.strip() for tf in (args.timeframes or []) if str(tf).strip()] or [args.timeframe] or TIMEFRAMES
 
-    if args.symbols:
-        symbols = [s.upper().strip() for s in args.symbols if s.upper().strip() in set(available)]
-    else:
-        symbols = [s for s in SYMBOLS if s in set(available)]
+    for timeframe in timeframes:
+        available = available_symbols_for_timeframe(timeframe)
+        if not available:
+            print(f"[{timeframe}] No data available in prices table for selected timeframe.")
+            continue
 
-    if not symbols:
-        print("No valid symbols selected.")
-        return
+        if args.symbols:
+            symbols = [s.upper().strip() for s in args.symbols if s.upper().strip() in set(available)]
+        else:
+            symbols = [s for s in SYMBOLS if s in set(available)]
 
-    print(f"Building feature store for symbols={symbols} timeframe={args.timeframe}")
-    run_feature_store(symbols, args.timeframe, args)
+        if not symbols:
+            print(f"[{timeframe}] No valid symbols selected.")
+            continue
+
+        print(f"Building feature store for symbols={symbols} timeframe={timeframe}")
+        run_feature_store(symbols, timeframe, args)
     print("Feature store updated successfully.")
 
 

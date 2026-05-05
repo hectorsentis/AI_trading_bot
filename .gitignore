@@ -10,6 +10,7 @@ __pycache__/
 wheelhouse/
 .tmp-pip/
 tmp_test/
+_test_runtime/
 
 # Data (NO subir datos)
 data/

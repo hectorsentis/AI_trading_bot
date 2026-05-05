@@ -318,6 +318,68 @@ class BinanceSpotClient:
             params["newClientOrderId"] = kwargs["newClientOrderId"]
         return self._request("POST", "/api/v3/order", params=self._signed_params(params))
 
+    def place_oco_sell(
+        self,
+        symbol: str,
+        quantity: float,
+        take_profit_price: float,
+        stop_loss_price: float,
+        stop_limit_price: float | None = None,
+        list_client_order_id: str | None = None,
+    ) -> dict:
+        """Place a SELL OCO bracket for a Spot long position.
+
+        Used after a filled long entry so paper/demo positions are always paired
+        with a take-profit and stop-loss. Real execution remains blocked by the
+        same hard live-trading gates as `place_order`.
+        """
+        if self.config.client_role not in {"simulated_execution", "testnet_execution", "real_execution", "execution"}:
+            raise LiveTradingBlockedError(
+                f"Client role {self.config.client_role!r} is not an execution client."
+            )
+        if self.config.dry_run:
+            return {
+                "symbol": symbol.upper(),
+                "side": "SELL",
+                "type": "OCO",
+                "quantity": float(quantity),
+                "take_profit_price": float(take_profit_price),
+                "stop_loss_price": float(stop_loss_price),
+                "stop_limit_price": float(stop_limit_price) if stop_limit_price is not None else None,
+                "status": "SIMULATED",
+                "dry_run": True,
+                "reason": "dry_run_oco_simulation",
+                "transactTime": int(time.time() * 1000),
+            }
+        if self.config.client_role == "real_execution":
+            if not (ENABLE_LIVE_TRADING and ENABLE_REAL_ORDER_EXECUTION and ENABLE_REAL_BINANCE_ACCOUNT and not DRY_RUN):
+                raise LiveTradingBlockedError(
+                    "Real OCO order blocked. Required: ENABLE_LIVE_TRADING=true, "
+                    "ENABLE_REAL_ORDER_EXECUTION=true, ENABLE_REAL_BINANCE_ACCOUNT=true, DRY_RUN=false."
+                )
+        elif self.config.client_role == "testnet_execution":
+            if not ENABLE_TESTNET_PAPER_TRADING:
+                raise LiveTradingBlockedError("ENABLE_TESTNET_PAPER_TRADING is false; testnet paper OCO orders are blocked.")
+        if not self.config.enable_trading:
+            raise LiveTradingBlockedError("Execution client is not enabled.")
+
+        def _fmt_decimal(value: float | str) -> str:
+            return f"{float(value):.8f}".rstrip("0").rstrip(".")
+
+        stop_limit = float(stop_limit_price) if stop_limit_price is not None else float(stop_loss_price) * 0.999
+        params: dict[str, Any] = {
+            "symbol": symbol.upper(),
+            "side": "SELL",
+            "quantity": _fmt_decimal(quantity),
+            "price": _fmt_decimal(take_profit_price),
+            "stopPrice": _fmt_decimal(stop_loss_price),
+            "stopLimitPrice": _fmt_decimal(stop_limit),
+            "stopLimitTimeInForce": "GTC",
+        }
+        if list_client_order_id:
+            params["listClientOrderId"] = list_client_order_id
+        return self._request("POST", "/api/v3/orderList/oco", params=self._signed_params(params))
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Safe Binance Spot REST client checks.")

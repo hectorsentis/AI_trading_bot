@@ -2,7 +2,7 @@
 import json
 import time
 
-from config import BOT_POLL_SECONDS, SYMBOLS, TIMEFRAME
+from config import BOT_POLL_SECONDS, SYMBOLS, TIMEFRAME, TIMEFRAMES
 from data_quality_service import run_quality_checks
 from trading_bot import sync_latest_from_binance
 
@@ -11,6 +11,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Realtime/incremental Binance kline ingestor into SQLite.")
     parser.add_argument("--symbols", nargs="*", default=None)
     parser.add_argument("--timeframe", default=TIMEFRAME)
+    parser.add_argument("--timeframes", nargs="*", default=None, help="Multiple timeframes to ingest, e.g. 15m 1h 4h.")
     parser.add_argument("--recent-bars", type=int, default=200)
     parser.add_argument("--loop", action="store_true")
     parser.add_argument("--poll-seconds", type=int, default=BOT_POLL_SECONDS)
@@ -27,14 +28,22 @@ def run_once(symbols: list[str], timeframe: str, recent_bars: int) -> dict:
     return {"sync": sync, "quality": quality}
 
 
+def run_once_many(symbols: list[str], timeframes: list[str], recent_bars: int) -> dict:
+    return {
+        timeframe: run_once(symbols=symbols, timeframe=timeframe, recent_bars=recent_bars)
+        for timeframe in timeframes
+    }
+
+
 def main():
     args = parse_args()
     symbols = _symbols(args.symbols)
+    timeframes = [tf.strip() for tf in (args.timeframes or []) if str(tf).strip()] or [args.timeframe] or TIMEFRAMES
     if not args.loop:
-        print(json.dumps(run_once(symbols, args.timeframe, args.recent_bars), ensure_ascii=True, indent=2))
+        print(json.dumps(run_once_many(symbols, timeframes, args.recent_bars), ensure_ascii=True, indent=2))
         return
     while True:
-        print(json.dumps(run_once(symbols, args.timeframe, args.recent_bars), ensure_ascii=True, indent=2))
+        print(json.dumps(run_once_many(symbols, timeframes, args.recent_bars), ensure_ascii=True, indent=2))
         time.sleep(max(1, int(args.poll_seconds)))
 
 

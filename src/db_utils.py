@@ -143,6 +143,12 @@ def init_research_tables() -> None:
                 label_class INTEGER,
                 label_name TEXT,
                 label_position INTEGER,
+                label_take_profit_price REAL,
+                label_stop_loss_price REAL,
+                label_risk_reward REAL,
+                label_lookahead_bars INTEGER,
+                label_tp_multiplier REAL,
+                label_sl_multiplier REAL,
                 feature_version TEXT,
                 label_version TEXT,
                 updated_at_utc TEXT,
@@ -152,6 +158,12 @@ def init_research_tables() -> None:
         )
         for feature_col in FEATURE_COLUMNS:
             _ensure_column(conn, FEATURES_TABLE, feature_col, "REAL")
+        _ensure_column(conn, FEATURES_TABLE, "label_take_profit_price", "REAL")
+        _ensure_column(conn, FEATURES_TABLE, "label_stop_loss_price", "REAL")
+        _ensure_column(conn, FEATURES_TABLE, "label_risk_reward", "REAL")
+        _ensure_column(conn, FEATURES_TABLE, "label_lookahead_bars", "INTEGER")
+        _ensure_column(conn, FEATURES_TABLE, "label_tp_multiplier", "REAL")
+        _ensure_column(conn, FEATURES_TABLE, "label_sl_multiplier", "REAL")
         _ensure_column(conn, FEATURES_TABLE, "feature_version", "TEXT")
         _ensure_column(conn, FEATURES_TABLE, "label_version", "TEXT")
 
@@ -247,12 +259,22 @@ def init_research_tables() -> None:
                 prob_short REAL NOT NULL,
                 prob_flat REAL NOT NULL,
                 prob_long REAL NOT NULL,
+                entry_price REAL,
+                take_profit_price REAL,
+                stop_loss_price REAL,
+                risk_reward REAL,
+                protection_required INTEGER NOT NULL DEFAULT 1,
                 created_at_utc TEXT NOT NULL,
                 UNIQUE(model_id, symbol, timeframe, datetime_utc)
             )
             """
         )
         _ensure_column(conn, SIGNALS_TABLE, "account_mode", "TEXT NOT NULL DEFAULT 'local_paper'")
+        _ensure_column(conn, SIGNALS_TABLE, "entry_price", "REAL")
+        _ensure_column(conn, SIGNALS_TABLE, "take_profit_price", "REAL")
+        _ensure_column(conn, SIGNALS_TABLE, "stop_loss_price", "REAL")
+        _ensure_column(conn, SIGNALS_TABLE, "risk_reward", "REAL")
+        _ensure_column(conn, SIGNALS_TABLE, "protection_required", "INTEGER NOT NULL DEFAULT 1")
 
         conn.execute(
             f"""
@@ -295,6 +317,12 @@ def init_research_tables() -> None:
                 reason TEXT,
                 signal_position INTEGER,
                 research_signal_label TEXT,
+                take_profit_price REAL,
+                stop_loss_price REAL,
+                risk_reward REAL,
+                protection_required INTEGER NOT NULL DEFAULT 1,
+                protection_status TEXT,
+                linked_exit_order_id TEXT,
                 decision_json TEXT,
                 dry_run INTEGER NOT NULL,
                 created_at_utc TEXT NOT NULL,
@@ -305,6 +333,12 @@ def init_research_tables() -> None:
         _ensure_column(conn, ORDERS_TABLE, "signal_datetime_utc", "TEXT")
         _ensure_column(conn, ORDERS_TABLE, "executable_action", "TEXT")
         _ensure_column(conn, ORDERS_TABLE, "research_signal_label", "TEXT")
+        _ensure_column(conn, ORDERS_TABLE, "take_profit_price", "REAL")
+        _ensure_column(conn, ORDERS_TABLE, "stop_loss_price", "REAL")
+        _ensure_column(conn, ORDERS_TABLE, "risk_reward", "REAL")
+        _ensure_column(conn, ORDERS_TABLE, "protection_required", "INTEGER NOT NULL DEFAULT 1")
+        _ensure_column(conn, ORDERS_TABLE, "protection_status", "TEXT")
+        _ensure_column(conn, ORDERS_TABLE, "linked_exit_order_id", "TEXT")
         _ensure_column(conn, ORDERS_TABLE, "decision_json", "TEXT")
         _ensure_column(conn, ORDERS_TABLE, "exchange_order_id", "TEXT")
         _ensure_column(conn, ORDERS_TABLE, "account_mode", "TEXT NOT NULL DEFAULT 'local_paper'")

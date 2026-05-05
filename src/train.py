@@ -1,6 +1,7 @@
 import argparse
 import base64
 import json
+import math
 import sqlite3
 
 import joblib
@@ -26,6 +27,10 @@ from config import (
     TRAINING_CUTOFF_HOURS_BEFORE_NOW,
     VALIDATION_WINDOW_HOURS,
     TRAINING_SCOPE,
+    LOOKAHEAD_BARS,
+    TP_MULTIPLIER,
+    SL_MULTIPLIER,
+    REQUIRE_TP_SL_ON_ENTRY,
 )
 from db_utils import init_research_tables, ensure_project_directories
 from model_registry import register_model
@@ -35,6 +40,7 @@ from modeling_utils import (
     probabilities_to_signal,
 )
 from strategy_evaluator import evaluate_model_acceptance
+from temporal_utils import apply_label_embargo_cutoff, strict_train_validation_split
 
 
 def parse_args():
@@ -131,33 +137,17 @@ def _load_dataset(symbols: list[str], timeframe: str) -> pd.DataFrame:
     return df
 
 
-def _split_train_test(df: pd.DataFrame, test_size_dates: int) -> tuple[pd.DataFrame, pd.DataFrame]:
-    reference_now = pd.Timestamp.now(tz="UTC")
-    dataset_max = df["datetime_utc"].max()
-    # If the local dataset is historical/stale, anchor the temporal holdout to dataset_max
-    # so research remains usable without ever training on rows after the validation window.
-    if dataset_max < reference_now - pd.Timedelta(hours=TRAINING_CUTOFF_HOURS_BEFORE_NOW + VALIDATION_WINDOW_HOURS):
-        reference_now = dataset_max + pd.Timedelta(hours=TRAINING_CUTOFF_HOURS_BEFORE_NOW)
-    validation_end = reference_now - pd.Timedelta(hours=TRAINING_CUTOFF_HOURS_BEFORE_NOW)
-    validation_start = validation_end - pd.Timedelta(hours=VALIDATION_WINDOW_HOURS)
-    train_df = df[df["datetime_utc"] < validation_start].copy()
-    test_df = df[(df["datetime_utc"] >= validation_start) & (df["datetime_utc"] < validation_end)].copy()
-    if not train_df.empty and not test_df.empty:
-        return train_df, test_df
-
-    unique_dates = sorted(df["datetime_utc"].unique())
-    if len(unique_dates) <= test_size_dates:
-        raise ValueError(
-            f"Not enough unique datetimes ({len(unique_dates)}) for test_size={test_size_dates}."
-        )
-
-    test_start = unique_dates[-test_size_dates]
-    train_df = df[df["datetime_utc"] < test_start].copy()
-    test_df = df[df["datetime_utc"] >= test_start].copy()
-
-    if train_df.empty or test_df.empty:
-        raise ValueError("Temporal split produced empty train/test segment.")
-    return train_df, test_df
+def _split_train_test(df: pd.DataFrame, test_size_dates: int, timeframe: str) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    train_df, test_df, split_meta = strict_train_validation_split(
+        df,
+        timestamp_col="datetime_utc",
+        timeframe=timeframe,
+        training_cutoff_hours_before_now=TRAINING_CUTOFF_HOURS_BEFORE_NOW,
+        validation_window_hours=VALIDATION_WINDOW_HOURS,
+        fallback_test_size_dates=test_size_dates,
+        lookahead_bars=LOOKAHEAD_BARS,
+    )
+    return train_df, test_df, split_meta.to_dict()
 
 
 def _build_symbol_mapping(df: pd.DataFrame) -> dict[str, int]:
@@ -173,13 +163,136 @@ def _apply_symbol_code(df: pd.DataFrame, mapping: dict[str, int]) -> pd.DataFram
     return out
 
 
+def _has_all_classes(y: pd.Series) -> bool:
+    return set(pd.Series(y).dropna().astype(int).unique().tolist()) == {0, 1, 2}
+
+
+def _has_min_classes(y: pd.Series, n: int = 2) -> bool:
+    return len(set(pd.Series(y).dropna().astype(int).unique().tolist())) >= int(n)
+
+
+def _threshold_score(econ) -> float:
+    pf = min(float(econ.profit_factor), 10.0) if econ.profit_factor != float("inf") else 10.0
+    return float(
+        econ.strategy_return
+        + 0.02 * econ.sharpe
+        + 0.01 * math.log1p(pf)
+        - abs(econ.max_drawdown)
+        + min(0.03, econ.active_ratio * 0.03)
+    )
+
+
+def _calibrate_thresholds(
+    train_df: pd.DataFrame,
+    feature_cols: list[str],
+    model_params: dict,
+    timeframe: str,
+    user_short_threshold: float | None,
+    user_long_threshold: float | None,
+) -> tuple[float, float, dict]:
+    default_short = float(user_short_threshold) if user_short_threshold is not None else float(SHORT_THRESHOLD)
+    default_long = float(user_long_threshold) if user_long_threshold is not None else float(LONG_THRESHOLD)
+    if user_short_threshold is not None or user_long_threshold is not None:
+        return default_short, default_long, {"enabled": False, "reason": "manual_threshold_override"}
+
+    unique_dates = sorted(train_df["datetime_utc"].dropna().unique().tolist())
+    min_dates = 120
+    if len(unique_dates) < min_dates:
+        return default_short, default_long, {"enabled": False, "reason": "not_enough_train_dates"}
+
+    calib_dates = max(30, min(240, len(unique_dates) // 5))
+    calib_start = pd.Timestamp(unique_dates[-calib_dates])
+    if calib_start.tzinfo is None:
+        calib_start = calib_start.tz_localize("UTC")
+    else:
+        calib_start = calib_start.tz_convert("UTC")
+    fit_cutoff = apply_label_embargo_cutoff(calib_start, timeframe, LOOKAHEAD_BARS)
+    fit_df = train_df[train_df["datetime_utc"] < fit_cutoff].copy()
+    calib_df = train_df[train_df["datetime_utc"] >= calib_start].copy()
+    if len(fit_df) < 300 or len(calib_df) < 30 or not _has_all_classes(fit_df["label_class"]):
+        return default_short, default_long, {
+            "enabled": False,
+            "reason": "calibration_split_too_small_or_missing_classes",
+            "fit_rows": int(len(fit_df)),
+            "calibration_rows": int(len(calib_df)),
+        }
+
+    tmp_model = LGBMClassifier(**model_params)
+    tmp_model.fit(fit_df[feature_cols], fit_df["label_class"])
+    probas = tmp_model.predict_proba(calib_df[feature_cols])
+
+    grid = [0.34, 0.38, 0.42, 0.46, 0.50, 0.55, 0.60, 0.65]
+    best = {
+        "short_threshold": default_short,
+        "long_threshold": default_long,
+        "score": float("-inf"),
+        "economic": None,
+    }
+    for short_thr in grid:
+        for long_thr in grid:
+            signal_position = probabilities_to_signal(probas, short_threshold=short_thr, long_threshold=long_thr)
+            econ_input = calib_df[["symbol", "datetime_utc", "fwd_return_1"]].copy()
+            econ_input["signal_position"] = signal_position
+            _, _, econ = compute_economic_metrics(
+                frame=econ_input,
+                timeframe=timeframe,
+                cost_per_trade=COST_PER_TRADE,
+            )
+            if econ.trade_count < 3:
+                continue
+            score = _threshold_score(econ)
+            if score > float(best["score"]):
+                best = {
+                    "short_threshold": float(short_thr),
+                    "long_threshold": float(long_thr),
+                    "score": float(score),
+                    "economic": {
+                        "strategy_return": econ.strategy_return,
+                        "sharpe": econ.sharpe,
+                        "max_drawdown": econ.max_drawdown,
+                        "profit_factor": econ.profit_factor,
+                        "trade_count": econ.trade_count,
+                        "active_ratio": econ.active_ratio,
+                    },
+                }
+
+    if best["economic"] is None:
+        return default_short, default_long, {"enabled": False, "reason": "no_threshold_with_min_trades"}
+    return float(best["short_threshold"]), float(best["long_threshold"]), {
+        "enabled": True,
+        "fit_rows": int(len(fit_df)),
+        "calibration_rows": int(len(calib_df)),
+        "calibration_start": calib_start.isoformat(),
+        "fit_train_cutoff_after_embargo": fit_cutoff.isoformat(),
+        "selected": best,
+    }
+
+
+def _per_symbol_economic_metrics(test_df: pd.DataFrame, signal_position, timeframe: str) -> dict:
+    frame = test_df[["symbol", "datetime_utc", "fwd_return_1"]].copy()
+    frame["signal_position"] = signal_position
+    out: dict[str, dict] = {}
+    for symbol, part in frame.groupby("symbol"):
+        _, _, econ = compute_economic_metrics(part, timeframe=timeframe, cost_per_trade=COST_PER_TRADE)
+        out[str(symbol)] = {
+            "strategy_return": econ.strategy_return,
+            "buy_hold_return": econ.buy_hold_return,
+            "sharpe": econ.sharpe,
+            "max_drawdown": econ.max_drawdown,
+            "profit_factor": econ.profit_factor,
+            "trade_count": econ.trade_count,
+            "active_ratio": econ.active_ratio,
+            "periods": econ.periods,
+        }
+    return out
+
 
 def train_one_scope(args, symbols: list[str], model_id_override: str | None = None) -> dict:
     df = _load_dataset(symbols=symbols, timeframe=args.timeframe)
     if df.empty:
         raise ValueError(f"No rows found in features table for symbols={symbols} timeframe={args.timeframe}.")
 
-    train_df, test_df = _split_train_test(df, test_size_dates=args.test_size)
+    train_df, test_df, split_meta = _split_train_test(df, test_size_dates=args.test_size, timeframe=args.timeframe)
     if len(train_df) < args.min_train_rows:
         raise ValueError(
             f"Train rows too low ({len(train_df)}) for symbols={symbols}. "
@@ -201,8 +314,19 @@ def train_one_scope(args, symbols: list[str], model_id_override: str | None = No
     y_test = test_df["label_class"]
 
     model_params = _resolve_model_params(args.model_params_json, args.model_params_b64)
-    short_threshold = float(args.short_threshold) if args.short_threshold is not None else float(SHORT_THRESHOLD)
-    long_threshold = float(args.long_threshold) if args.long_threshold is not None else float(LONG_THRESHOLD)
+    short_threshold, long_threshold, threshold_calibration = _calibrate_thresholds(
+        train_df=train_df,
+        feature_cols=feature_cols,
+        model_params=model_params,
+        timeframe=args.timeframe,
+        user_short_threshold=args.short_threshold,
+        user_long_threshold=args.long_threshold,
+    )
+    if not _has_min_classes(y_train, 2):
+        raise ValueError(
+            f"Training labels for symbols={symbols} contain fewer than two classes; "
+            "refusing to train a brittle model."
+        )
 
     model = LGBMClassifier(**model_params)
     model.fit(X_train, y_train)
@@ -250,6 +374,13 @@ def train_one_scope(args, symbols: list[str], model_id_override: str | None = No
         "feature_version": FEATURE_VERSION,
         "label_version": LABEL_VERSION,
         "model_params": model_params,
+        "label_policy": {
+            "type": "atr_triple_barrier_with_mandatory_entry_tp_sl",
+            "lookahead_bars": int(LOOKAHEAD_BARS),
+            "tp_multiplier": float(TP_MULTIPLIER),
+            "sl_multiplier": float(SL_MULTIPLIER),
+            "require_tp_sl_on_entry": bool(REQUIRE_TP_SL_ON_ENTRY),
+        },
         "model": model,
     }
     joblib.dump(artifact, model_path)
@@ -279,9 +410,11 @@ def train_one_scope(args, symbols: list[str], model_id_override: str | None = No
             "train_end": train_df["datetime_utc"].max().isoformat(),
             "test_start": test_df["datetime_utc"].min().isoformat(),
             "test_end": test_df["datetime_utc"].max().isoformat(),
+            **split_meta,
         },
         "training_scope": training_scope,
         "symbols": included_symbols,
+        "per_symbol_economic": _per_symbol_economic_metrics(test_df, signal_position, args.timeframe),
     }
 
     acceptance = evaluate_model_acceptance(metrics_bundle={"holdout": metrics})
@@ -303,6 +436,8 @@ def train_one_scope(args, symbols: list[str], model_id_override: str | None = No
             "long_threshold": long_threshold,
             "cost_per_trade": COST_PER_TRADE,
             "training_scope": training_scope,
+            "threshold_calibration": threshold_calibration,
+            "label_policy": artifact["label_policy"],
         },
     }
     report_path.write_text(json.dumps(report_payload, ensure_ascii=True, indent=2), encoding="utf-8")
@@ -330,6 +465,7 @@ def train_one_scope(args, symbols: list[str], model_id_override: str | None = No
             "feature_columns": feature_cols,
             "training_scope": training_scope,
             "symbols": included_symbols,
+            "label_policy": artifact["label_policy"],
         },
         status=registry_status,
         acceptance_status=acceptance_status,

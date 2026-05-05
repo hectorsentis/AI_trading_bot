@@ -14,9 +14,14 @@ from config import (
     PAPER_FEE_RATE,
     ACCOUNT_MODE_LOCAL_PAPER,
     ACCOUNT_MODE_TESTNET_PAPER,
+    REQUIRE_TP_SL_ON_ENTRY,
+    MIN_TP_SL_RISK_REWARD,
+    TP_MULTIPLIER,
+    SL_MULTIPLIER,
 )
 from broker_client import BinanceCredentialsError, BinanceSpotClient, LiveTradingBlockedError
 from db_utils import init_research_tables
+from trade_protection import build_long_protection, validate_long_protection
 
 
 class ExecutionEngine:
@@ -60,6 +65,12 @@ class ExecutionEngine:
         decision_payload: dict | None = None,
         exchange_order_id: str | None = None,
         raw_exchange_response: dict | None = None,
+        take_profit_price: float | None = None,
+        stop_loss_price: float | None = None,
+        risk_reward: float | None = None,
+        protection_required: bool = True,
+        protection_status: str | None = None,
+        linked_exit_order_id: str | None = None,
     ) -> None:
         notional = abs(quantity * (fill_price if fill_price is not None else requested_price))
         conn = self._connect()
@@ -70,10 +81,11 @@ class ExecutionEngine:
                     order_id, model_id, symbol, timeframe, signal_datetime_utc,
                     exchange_order_id, account_mode, side, executable_action, order_type, type, quantity,
                     requested_price, price_requested, fill_price, price_filled, notional, status, reason, signal_position,
-                    research_signal_label, decision_json, dry_run, created_at_utc, updated_at_utc, filled_at_utc,
-                    raw_exchange_response_json
+                    research_signal_label, take_profit_price, stop_loss_price, risk_reward, protection_required,
+                    protection_status, linked_exit_order_id, decision_json, dry_run, created_at_utc, updated_at_utc,
+                    filled_at_utc, raw_exchange_response_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     order_id,
@@ -97,6 +109,12 @@ class ExecutionEngine:
                     reason,
                     int(signal_position),
                     research_signal_label,
+                    float(take_profit_price) if take_profit_price is not None else None,
+                    float(stop_loss_price) if stop_loss_price is not None else None,
+                    float(risk_reward) if risk_reward is not None else None,
+                    1 if protection_required else 0,
+                    protection_status,
+                    linked_exit_order_id,
                     json.dumps(decision_payload or {}, ensure_ascii=True, sort_keys=True),
                     1 if self.dry_run else 0,
                     pd.Timestamp.now(tz="UTC").isoformat(),
@@ -108,6 +126,37 @@ class ExecutionEngine:
             conn.commit()
         finally:
             conn.close()
+
+    def _protection_from_payload(self, signal_payload: dict, entry_price: float) -> dict:
+        tp = signal_payload.get("take_profit_price")
+        sl = signal_payload.get("stop_loss_price")
+        rr = signal_payload.get("risk_reward")
+        atr = signal_payload.get("atr_14")
+
+        if (tp is None or sl is None) and atr is not None:
+            protection = build_long_protection(
+                entry_price=entry_price,
+                atr=float(atr),
+                tp_multiplier=float(signal_payload.get("tp_multiplier", TP_MULTIPLIER)),
+                sl_multiplier=float(signal_payload.get("sl_multiplier", SL_MULTIPLIER)),
+            )
+            tp = protection.take_profit_price
+            sl = protection.stop_loss_price
+            rr = protection.risk_reward
+
+        if rr is None and tp is not None and sl is not None:
+            _, _, details = validate_long_protection(
+                entry_price=entry_price,
+                take_profit_price=float(tp),
+                stop_loss_price=float(sl),
+                min_risk_reward=MIN_TP_SL_RISK_REWARD,
+            )
+            rr = details.get("risk_reward")
+        return {
+            "take_profit_price": float(tp) if tp is not None else None,
+            "stop_loss_price": float(sl) if sl is not None else None,
+            "risk_reward": float(rr) if rr is not None else None,
+        }
 
     def _already_processed_signal(
         self,
@@ -232,12 +281,20 @@ class ExecutionEngine:
             }
 
         side = executable_action
+        protection = self._protection_from_payload(signal_payload, market_price) if delta_qty > 0 else {
+            "take_profit_price": signal_payload.get("take_profit_price"),
+            "stop_loss_price": signal_payload.get("stop_loss_price"),
+            "risk_reward": signal_payload.get("risk_reward"),
+        }
         risk = self.risk_manager.validate_order(
             symbol=symbol,
             price=market_price,
             delta_quantity=delta_qty,
             projected_position_quantity=current_qty + delta_qty,
             portfolio_state=state,
+            side=side,
+            take_profit_price=protection.get("take_profit_price"),
+            stop_loss_price=protection.get("stop_loss_price"),
         )
 
         order_id = self._order_id()
@@ -259,6 +316,11 @@ class ExecutionEngine:
                 signal_position=research_position,
                 research_signal_label=research_label,
                 decision_payload=signal_payload,
+                take_profit_price=protection.get("take_profit_price"),
+                stop_loss_price=protection.get("stop_loss_price"),
+                risk_reward=protection.get("risk_reward"),
+                protection_required=bool(REQUIRE_TP_SL_ON_ENTRY and delta_qty > 0),
+                protection_status="REJECTED_BEFORE_ENTRY" if delta_qty > 0 else None,
             )
             return {
                 "order_id": order_id,
@@ -288,6 +350,11 @@ class ExecutionEngine:
                 signal_position=research_position,
                 research_signal_label=research_label,
                 decision_payload=signal_payload,
+                take_profit_price=protection.get("take_profit_price"),
+                stop_loss_price=protection.get("stop_loss_price"),
+                risk_reward=protection.get("risk_reward"),
+                protection_required=bool(REQUIRE_TP_SL_ON_ENTRY and delta_qty > 0),
+                protection_status="SKIPPED_BEFORE_ENTRY" if delta_qty > 0 else None,
             )
             return {
                 "order_id": order_id,
@@ -301,8 +368,10 @@ class ExecutionEngine:
 
         raw_exchange_response = {}
         exchange_order_id = None
+        linked_exit_order_id = None
         fill_price = self._simulated_fill_price(side=side, market_price=market_price)
         reason = "dry_run_fill"
+        protection_status = "NOT_REQUIRED"
 
         if self.account_mode == ACCOUNT_MODE_TESTNET_PAPER and self.broker_client is not None:
             try:
@@ -348,6 +417,111 @@ class ExecutionEngine:
                         "raw_exchange_response": raw_exchange_response,
                     }
 
+        if side == "BUY" and REQUIRE_TP_SL_ON_ENTRY:
+            # Re-anchor TP/SL to actual fill price so slippage cannot leave a
+            # filled entry with stale or invalid protection.
+            if signal_payload.get("atr_14") is not None:
+                fill_protection = self._protection_from_payload(signal_payload, fill_price)
+                protection.update(fill_protection)
+            ok, protection_reasons, protection_details = validate_long_protection(
+                entry_price=fill_price,
+                take_profit_price=protection.get("take_profit_price"),
+                stop_loss_price=protection.get("stop_loss_price"),
+                min_risk_reward=MIN_TP_SL_RISK_REWARD,
+            )
+            if not ok:
+                self._insert_order(
+                    order_id=order_id,
+                    model_id=model_id,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    signal_datetime_utc=signal_datetime_utc,
+                    side=side,
+                    executable_action=executable_action,
+                    quantity=qty,
+                    requested_price=market_price,
+                    fill_price=None,
+                    status="REJECTED",
+                    reason="invalid_tp_sl_after_fill_anchor:" + ";".join(protection_reasons),
+                    signal_position=research_position,
+                    research_signal_label=research_label,
+                    decision_payload=signal_payload,
+                    raw_exchange_response=raw_exchange_response,
+                    take_profit_price=protection.get("take_profit_price"),
+                    stop_loss_price=protection.get("stop_loss_price"),
+                    risk_reward=protection.get("risk_reward"),
+                    protection_required=True,
+                    protection_status="REJECTED_INVALID_BRACKET",
+                )
+                return {
+                    "order_id": order_id,
+                    "status": "REJECTED",
+                    "reason": "invalid_tp_sl_after_fill_anchor:" + ";".join(protection_reasons),
+                    "protection": protection_details,
+                }
+            protection["risk_reward"] = protection_details.get("risk_reward")
+
+            if self.account_mode == ACCOUNT_MODE_TESTNET_PAPER and self.broker_client is not None:
+                try:
+                    oco_response = self.broker_client.place_oco_sell(
+                        symbol=symbol,
+                        quantity=qty,
+                        take_profit_price=float(protection["take_profit_price"]),
+                        stop_loss_price=float(protection["stop_loss_price"]),
+                        list_client_order_id=f"bracket_{uuid.uuid4().hex[:20]}",
+                    )
+                    raw_exchange_response = {"entry_order": raw_exchange_response, "protective_oco": oco_response}
+                    linked_exit_order_id = str(oco_response.get("orderListId") or oco_response.get("listClientOrderId") or "")
+                    protection_status = "BINANCE_OCO_ACTIVE"
+                except Exception as exc:
+                    emergency_flatten_response = None
+                    try:
+                        emergency_flatten_response = self.broker_client.place_order(
+                            symbol=symbol,
+                            side="SELL",
+                            order_type=DEFAULT_ORDER_TYPE,
+                            quantity=qty,
+                        )
+                    except Exception as flatten_exc:
+                        emergency_flatten_response = {"error": str(flatten_exc)}
+                    raw_exchange_response = {
+                        "entry_order": raw_exchange_response,
+                        "protective_oco_error": str(exc),
+                        "emergency_flatten_order": emergency_flatten_response,
+                    }
+                    self._insert_order(
+                        order_id=order_id,
+                        model_id=model_id,
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        signal_datetime_utc=signal_datetime_utc,
+                        side=side,
+                        executable_action=executable_action,
+                        quantity=qty,
+                        requested_price=market_price,
+                        fill_price=fill_price,
+                        status="REJECTED",
+                        reason=f"protective_oco_failed_after_entry:{exc}",
+                        signal_position=research_position,
+                        research_signal_label=research_label,
+                        decision_payload=signal_payload,
+                        exchange_order_id=exchange_order_id,
+                        raw_exchange_response=raw_exchange_response,
+                        take_profit_price=protection.get("take_profit_price"),
+                        stop_loss_price=protection.get("stop_loss_price"),
+                        risk_reward=protection.get("risk_reward"),
+                        protection_required=True,
+                        protection_status="BRACKET_FAILED_REVIEW_REQUIRED",
+                    )
+                    return {
+                        "order_id": order_id,
+                        "status": "REJECTED",
+                        "reason": f"protective_oco_failed_after_entry:{exc}",
+                        "raw_exchange_response": raw_exchange_response,
+                    }
+            else:
+                protection_status = "LOCAL_BRACKET_RECORDED"
+
         fill = self.portfolio_manager.apply_fill(
             symbol=symbol,
             side=side,
@@ -384,6 +558,12 @@ class ExecutionEngine:
             decision_payload=signal_payload,
             exchange_order_id=exchange_order_id,
             raw_exchange_response=raw_exchange_response,
+            take_profit_price=protection.get("take_profit_price"),
+            stop_loss_price=protection.get("stop_loss_price"),
+            risk_reward=protection.get("risk_reward"),
+            protection_required=bool(REQUIRE_TP_SL_ON_ENTRY and side == "BUY"),
+            protection_status=protection_status,
+            linked_exit_order_id=linked_exit_order_id,
         )
 
         return {
@@ -397,6 +577,11 @@ class ExecutionEngine:
             "fill_price": fill_price,
             "reason": reason,
             "exchange_order_id": exchange_order_id,
+            "linked_exit_order_id": linked_exit_order_id,
+            "take_profit_price": protection.get("take_profit_price"),
+            "stop_loss_price": protection.get("stop_loss_price"),
+            "risk_reward": protection.get("risk_reward"),
+            "protection_status": protection_status,
             "raw_exchange_response": raw_exchange_response,
             "risk": risk,
             "fill": fill,

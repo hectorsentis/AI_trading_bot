@@ -5,6 +5,7 @@ import pandas as pd
 
 from config import LOOKAHEAD_BARS, TP_MULTIPLIER, SL_MULTIPLIER
 from modeling_utils import CLASS_FLAT, CLASS_LONG, CLASS_SHORT, CLASS_TO_NAME, CLASS_TO_POSITION
+from trade_protection import build_long_protection
 
 
 def parse_args():
@@ -57,6 +58,9 @@ def generate_triple_barrier_labels(
     label_class = [pd.NA] * n
     label_name = [None] * n
     label_position = [pd.NA] * n
+    label_take_profit_price = [pd.NA] * n
+    label_stop_loss_price = [pd.NA] * n
+    label_risk_reward = [pd.NA] * n
 
     for i in range(n):
         if i + lookahead_bars >= n:
@@ -122,10 +126,33 @@ def generate_triple_barrier_labels(
         label_class[i] = cls
         label_name[i] = CLASS_TO_NAME[cls]
         label_position[i] = CLASS_TO_POSITION[cls]
+        if cls == CLASS_LONG and long_sl > 0:
+            protection = build_long_protection(
+                entry_price=entry,
+                atr=atr,
+                tp_multiplier=tp_multiplier,
+                sl_multiplier=sl_multiplier,
+            )
+            label_take_profit_price[i] = protection.take_profit_price
+            label_stop_loss_price[i] = protection.stop_loss_price
+            label_risk_reward[i] = protection.risk_reward
+        elif cls == CLASS_SHORT:
+            # SHORT remains a research label for market regime learning. Binance
+            # Spot execution is long/flat only, but recording the symmetric
+            # barrier keeps the training target auditable.
+            label_take_profit_price[i] = short_tp
+            label_stop_loss_price[i] = short_sl
+            label_risk_reward[i] = (entry - short_tp) / max(short_sl - entry, 1e-12)
 
     df["label_class"] = pd.Series(label_class, dtype="Int64")
     df["label_name"] = label_name
     df["label_position"] = pd.Series(label_position, dtype="Int64")
+    df["label_take_profit_price"] = pd.Series(label_take_profit_price, dtype="Float64")
+    df["label_stop_loss_price"] = pd.Series(label_stop_loss_price, dtype="Float64")
+    df["label_risk_reward"] = pd.Series(label_risk_reward, dtype="Float64")
+    df["label_lookahead_bars"] = int(lookahead_bars)
+    df["label_tp_multiplier"] = float(tp_multiplier)
+    df["label_sl_multiplier"] = float(sl_multiplier)
     return df
 
 

@@ -103,10 +103,19 @@ def compute_features(prices_df: pd.DataFrame) -> pd.DataFrame:
     ma_5 = close.rolling(5, min_periods=5).mean()
     ma_10 = close.rolling(10, min_periods=10).mean()
     ma_20 = close.rolling(20, min_periods=20).mean()
+    ema_12 = close.ewm(span=12, adjust=False, min_periods=12).mean()
+    ema_26 = close.ewm(span=26, adjust=False, min_periods=26).mean()
 
     df["dist_ma_5"] = (close / ma_5) - 1.0
     df["dist_ma_10"] = (close / ma_10) - 1.0
     df["dist_ma_20"] = (close / ma_20) - 1.0
+    df["atr_pct"] = df["atr_14"] / close.replace(0, np.nan)
+    df["ema_12_dist"] = (close / ema_12) - 1.0
+    df["ema_26_dist"] = (close / ema_26) - 1.0
+    df["ema_12_26_spread"] = (ema_12 / ema_26.replace(0, np.nan)) - 1.0
+    df["macd"] = ema_12 - ema_26
+    df["macd_signal"] = df["macd"].ewm(span=9, adjust=False, min_periods=9).mean()
+    df["macd_hist"] = df["macd"] - df["macd_signal"]
 
     df["slope_ma_5"] = ma_5.pct_change()
     df["slope_ma_10"] = ma_10.pct_change()
@@ -117,6 +126,26 @@ def compute_features(prices_df: pd.DataFrame) -> pd.DataFrame:
     df["rolling_min_dist_20"] = (close / rolling_min_20) - 1.0
 
     df["rsi_14"] = _compute_rsi(close, period=14)
+    ret_mean_20 = returns_1.rolling(20, min_periods=20).mean()
+    ret_std_20 = returns_1.rolling(20, min_periods=20).std()
+    df["ret_zscore_20"] = (returns_1 - ret_mean_20) / ret_std_20.replace(0, np.nan)
+    df["volatility_ratio_10_20"] = df["volatility_10"] / df["volatility_20"].replace(0, np.nan)
+
+    bb_std_20 = close.rolling(20, min_periods=20).std()
+    bb_upper_20 = ma_20 + (2.0 * bb_std_20)
+    bb_lower_20 = ma_20 - (2.0 * bb_std_20)
+    bb_width = bb_upper_20 - bb_lower_20
+    df["bb_width_20"] = bb_width / ma_20.replace(0, np.nan)
+    df["bb_percent_b_20"] = (close - bb_lower_20) / bb_width.replace(0, np.nan)
+
+    low_14 = low.rolling(14, min_periods=14).min()
+    high_14 = high.rolling(14, min_periods=14).max()
+    stoch_range = high_14 - low_14
+    df["stoch_k_14"] = (close - low_14) / stoch_range.replace(0, np.nan)
+    df["stoch_d_3"] = df["stoch_k_14"].rolling(3, min_periods=3).mean()
+
+    df["volume_change_1"] = volume.pct_change(1)
+    df["volume_trend_5"] = volume.rolling(5, min_periods=5).mean() / vol_ma_20.replace(0, np.nan) - 1.0
 
     candle_range = (high - low).replace(0, np.nan)
     body = (close - df["open"]).abs()
@@ -126,6 +155,20 @@ def compute_features(prices_df: pd.DataFrame) -> pd.DataFrame:
     df["body_ratio"] = body / candle_range
     df["upper_wick_ratio"] = upper_wick / candle_range
     df["lower_wick_ratio"] = lower_wick / candle_range
+    range_mean_20 = candle_range.rolling(20, min_periods=20).mean()
+    range_std_20 = candle_range.rolling(20, min_periods=20).std()
+    df["range_zscore_20"] = (candle_range - range_mean_20) / range_std_20.replace(0, np.nan)
+    df["trend_strength_20"] = (close - ma_20) / (20.0 * df["atr_14"].replace(0, np.nan))
+    df["consecutive_up_3"] = (
+        (close > close.shift(1))
+        & (close.shift(1) > close.shift(2))
+        & (close.shift(2) > close.shift(3))
+    ).astype(float)
+    df["consecutive_down_3"] = (
+        (close < close.shift(1))
+        & (close.shift(1) < close.shift(2))
+        & (close.shift(2) < close.shift(3))
+    ).astype(float)
 
     # Candlestick / chart-pattern proxy features. They use only current and past bars.
     df["is_doji"] = (df["body_ratio"] <= 0.10).astype(float)

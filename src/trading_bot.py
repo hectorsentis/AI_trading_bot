@@ -39,6 +39,7 @@ from config import (
     SYMBOLS,
     TARGET_ACCEPTED_MODELS,
     TIMEFRAME,
+    TIMEFRAMES,
     TP_MULTIPLIER,
     TRAINING_SCOPE,
 )
@@ -58,6 +59,7 @@ from model_registry import get_latest_model, get_model_by_id, list_accepted_mode
 from portfolio_manager import PortfolioManager
 from risk_manager import RiskManager
 from signal_engine import generate_signal_from_probabilities
+from trade_protection import build_long_protection
 
 
 LOGGER = logging.getLogger("trading_bot")
@@ -88,6 +90,7 @@ def parse_args():
     parser.add_argument("--poll-seconds", type=int, default=BOT_POLL_SECONDS)
     parser.add_argument("--symbols", nargs="*", default=None, help="Comma or space separated symbols.")
     parser.add_argument("--timeframe", default=TIMEFRAME)
+    parser.add_argument("--timeframes", nargs="*", default=None, help="Multiple timeframes to execute, e.g. 15m 1h 4h. Overrides --timeframe when provided.")
     parser.add_argument("--model-id", type=str, default=None)
     parser.add_argument("--paper-initial-cash", type=float, default=PAPER_INITIAL_CASH_USDT)
     parser.add_argument("--sync-latest-from-binance", action="store_true")
@@ -158,7 +161,7 @@ def _resolve_model(model_id_arg: str | None, timeframe: str) -> tuple[str, Path]
 
 def _normalize_training_scope_arg(raw: str | None) -> str | None:
     if not raw or raw == "auto":
-        return None
+        return TRAINING_SCOPE
     return raw.replace("-", "_")
 
 
@@ -237,6 +240,47 @@ def _resolve_model_pool(args, symbols: list[str]) -> list[tuple[str, Path]]:
     return [(model_id, model_path)]
 
 
+def _load_model_control_flags() -> dict[str, dict[str, int]]:
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='model_control'"
+        ).fetchone()
+        if not exists:
+            return {}
+        df = pd.read_sql_query(
+            "SELECT model_id, signal_enabled, paper_enabled FROM model_control",
+            conn,
+        )
+    finally:
+        conn.close()
+    flags: dict[str, dict[str, int]] = {}
+    for _, row in df.iterrows():
+        signal_enabled = pd.to_numeric(row.get("signal_enabled"), errors="coerce")
+        paper_enabled = pd.to_numeric(row.get("paper_enabled"), errors="coerce")
+        flags[str(row["model_id"])] = {
+            "signal_enabled": 0 if pd.isna(signal_enabled) else int(signal_enabled),
+            "paper_enabled": 0 if pd.isna(paper_enabled) else int(paper_enabled),
+        }
+    return flags
+
+
+def _filter_operator_enabled_models(pool: list[tuple[str, Path]]) -> list[tuple[str, Path]]:
+    """Respect dashboard manual deactivation without requiring control rows by default."""
+    flags = _load_model_control_flags()
+    if not flags:
+        return pool
+    enabled: list[tuple[str, Path]] = []
+    for model_id, path in pool:
+        model_flags = flags.get(model_id)
+        if model_flags is None:
+            enabled.append((model_id, path))
+            continue
+        if model_flags.get("signal_enabled", 0) and model_flags.get("paper_enabled", 0):
+            enabled.append((model_id, path))
+    return enabled
+
+
 def _load_latest_features(symbol: str, timeframe: str, base_feature_columns: list[str]) -> pd.DataFrame:
     conn = sqlite3.connect(DB_FILE)
     try:
@@ -274,6 +318,11 @@ def _save_signal(
     prob_flat: float,
     prob_long: float,
     account_mode: str = ACCOUNT_MODE_LOCAL_PAPER,
+    entry_price: float | None = None,
+    take_profit_price: float | None = None,
+    stop_loss_price: float | None = None,
+    risk_reward: float | None = None,
+    protection_required: bool = True,
 ) -> None:
     conn = sqlite3.connect(DB_FILE)
     try:
@@ -281,9 +330,10 @@ def _save_signal(
             f"""
             INSERT OR REPLACE INTO {SIGNALS_TABLE} (
                 model_id, symbol, timeframe, account_mode, datetime_utc, signal_position, signal_label,
-                prob_short, prob_flat, prob_long, created_at_utc
+                prob_short, prob_flat, prob_long, entry_price, take_profit_price, stop_loss_price,
+                risk_reward, protection_required, created_at_utc
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 model_id,
@@ -296,12 +346,48 @@ def _save_signal(
                 float(prob_short),
                 float(prob_flat),
                 float(prob_long),
+                float(entry_price) if entry_price is not None else None,
+                float(take_profit_price) if take_profit_price is not None else None,
+                float(stop_loss_price) if stop_loss_price is not None else None,
+                float(risk_reward) if risk_reward is not None else None,
+                1 if protection_required else 0,
                 pd.Timestamp.now(tz="UTC").isoformat(),
             ),
         )
         conn.commit()
     finally:
         conn.close()
+
+
+def _attach_tp_sl(signal: dict, latest_row, close_price: float) -> dict:
+    """Attach mandatory ATR-based TP/SL to executable long signals.
+
+    Training labels use the same TP_MULTIPLIER/SL_MULTIPLIER triple-barrier
+    geometry, so live/paper decisions are aligned with the target definition.
+    """
+    signal["entry_price"] = float(close_price)
+    signal["tp_multiplier"] = float(TP_MULTIPLIER)
+    signal["sl_multiplier"] = float(SL_MULTIPLIER)
+    signal["protection_required"] = int(signal.get("final_signal_position", 0)) > 0
+
+    if int(signal.get("final_signal_position", 0)) <= 0:
+        return signal
+
+    if latest_row is None:
+        raise ValueError("latest_row is required to attach TP/SL to a long signal")
+    atr = float(latest_row.get("atr_14"))
+    protection = build_long_protection(
+        entry_price=float(close_price),
+        atr=atr,
+        tp_multiplier=TP_MULTIPLIER,
+        sl_multiplier=SL_MULTIPLIER,
+    )
+    signal["atr_14"] = atr
+    signal["take_profit_price"] = protection.take_profit_price
+    signal["stop_loss_price"] = protection.stop_loss_price
+    signal["risk_reward"] = protection.risk_reward
+    signal["protection_policy"] = "mandatory_atr_tp_sl_bracket_for_long_entries"
+    return signal
 
 
 def sync_latest_from_binance(symbols: list[str], timeframe: str, recent_bars: int) -> dict:
@@ -383,6 +469,22 @@ def _default_paper_account_mode() -> str:
 
 
 def run_once(args) -> dict:
+    selected_timeframes = [tf.strip() for tf in (getattr(args, "timeframes", None) or []) if str(tf).strip()]
+    if selected_timeframes:
+        reports: dict[str, dict] = {}
+        for timeframe in selected_timeframes:
+            tf_args = SimpleNamespace(**vars(args))
+            tf_args.timeframe = timeframe
+            tf_args.timeframes = None
+            reports[timeframe] = run_once(tf_args)
+        return {
+            "mode": getattr(args, "mode", "paper"),
+            "paper_mode": getattr(args, "paper_mode", "per-model"),
+            "multi_timeframe": True,
+            "timeframes": reports,
+            "created_at_utc": pd.Timestamp.now(tz="UTC").isoformat(),
+        }
+
     _assert_safety(args.mode)
     ensure_project_directories()
     init_research_tables()
@@ -426,7 +528,9 @@ def run_once(args) -> dict:
         )
         LOGGER.info("Model maintenance summary: %s", maintenance_summary)
 
-    model_pool = _resolve_model_pool(args, symbols=symbols)
+    model_pool = _filter_operator_enabled_models(_resolve_model_pool(args, symbols=symbols))
+    if not model_pool:
+        raise FileNotFoundError("No operator-enabled accepted models are available for paper trading.")
     artifacts = []
     for model_id, model_path in model_pool:
         artifact = joblib.load(model_path)
@@ -459,8 +563,9 @@ def run_once(args) -> dict:
             feature_columns = artifact["feature_columns"]
             base_feature_columns = artifact["base_feature_columns"]
             symbol_mapping = artifact["symbol_mapping"]
+            model_symbols = [symbol for symbol in symbols if symbol in symbol_mapping]
 
-            for symbol in symbols:
+            for symbol in model_symbols:
                 if symbol not in symbol_mapping:
                     symbol_reports.append({"symbol": symbol, "status": "SKIPPED", "reason": "symbol_not_in_model_mapping"})
                     continue
@@ -478,6 +583,7 @@ def run_once(args) -> dict:
                 prob_short, prob_flat, prob_long = [float(x) for x in probas[0]]
                 signal = generate_signal_from_probabilities(prob_short=prob_short, prob_flat=prob_flat, prob_long=prob_long)
                 signal["datetime_utc"] = dt.isoformat()
+                signal = _attach_tp_sl(signal, latest.iloc[0], close_price)
                 _save_signal(
                     model_id=model_id,
                     symbol=symbol,
@@ -488,6 +594,11 @@ def run_once(args) -> dict:
                     prob_flat=prob_flat,
                     prob_long=prob_long,
                     account_mode=account_mode,
+                    entry_price=signal.get("entry_price"),
+                    take_profit_price=signal.get("take_profit_price"),
+                    stop_loss_price=signal.get("stop_loss_price"),
+                    risk_reward=signal.get("risk_reward"),
+                    protection_required=bool(signal.get("protection_required")),
                 )
                 execution = execution_engine.execute_signal(
                     model_id=model_id,
@@ -565,6 +676,7 @@ def run_once(args) -> dict:
         model_votes = []
         close_price = None
         dt = None
+        latest_row_for_protection = None
 
         for model_id, model_path, artifact in artifacts:
             model = artifact["model"]
@@ -598,6 +710,7 @@ def run_once(args) -> dict:
             if dt is None or vote_dt > dt:
                 dt = vote_dt
                 close_price = vote_close
+                latest_row_for_protection = latest.iloc[0]
 
         if not model_votes:
             symbol_reports.append({"symbol": symbol, "status": "SKIPPED", "reason": "symbol_not_in_model_mapping"})
@@ -613,9 +726,11 @@ def run_once(args) -> dict:
             prob_short=prob_short,
             prob_flat=prob_flat,
             prob_long=prob_long,
-            account_mode=ACCOUNT_MODE_LOCAL_PAPER,
         )
         signal["datetime_utc"] = dt.isoformat()
+        # Use the latest row of one voting model for ATR-based TP/SL. All
+        # accepted artifacts share the same feature schema and timeframe.
+        signal = _attach_tp_sl(signal, latest_row_for_protection, close_price)
 
         _save_signal(
             model_id=execution_model_id,
@@ -626,6 +741,11 @@ def run_once(args) -> dict:
             prob_short=prob_short,
             prob_flat=prob_flat,
             prob_long=prob_long,
+            entry_price=signal.get("entry_price"),
+            take_profit_price=signal.get("take_profit_price"),
+            stop_loss_price=signal.get("stop_loss_price"),
+            risk_reward=signal.get("risk_reward"),
+            protection_required=bool(signal.get("protection_required")),
         )
 
         execution = execution_engine.execute_signal(

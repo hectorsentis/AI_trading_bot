@@ -222,16 +222,37 @@ FEATURE_COLUMNS = [
     "ma_cross_5_20",
     "double_top_proxy",
     "double_bottom_proxy",
+    "atr_pct",
+    "ema_12_dist",
+    "ema_26_dist",
+    "ema_12_26_spread",
+    "macd",
+    "macd_signal",
+    "macd_hist",
+    "bb_width_20",
+    "bb_percent_b_20",
+    "stoch_k_14",
+    "stoch_d_3",
+    "ret_zscore_20",
+    "volatility_ratio_10_20",
+    "volume_change_1",
+    "volume_trend_5",
+    "range_zscore_20",
+    "trend_strength_20",
+    "consecutive_up_3",
+    "consecutive_down_3",
     "hour_sin",
     "hour_cos",
 ]
 
-FEATURE_VERSION = "v2_ta_patterns"
-LABEL_VERSION = "triple_barrier_v1"
+FEATURE_VERSION = "v3_symbol_pattern_regime"
+LABEL_VERSION = "triple_barrier_tp_sl_v2"
 
 LOOKAHEAD_BARS = 6
 TP_MULTIPLIER = 1.5
 SL_MULTIPLIER = 1.0
+REQUIRE_TP_SL_ON_ENTRY = True
+MIN_TP_SL_RISK_REWARD = 1.0
 
 # Feature store incremental:
 # recalculate only the latest overlap window instead of the full history each run.
@@ -241,11 +262,19 @@ FEATURE_STORE_WARMUP_BARS = 120
 MODEL_PARAMS = {
     "objective": "multiclass",
     "num_class": 3,
-    "n_estimators": 300,
+    "n_estimators": 500,
     "learning_rate": 0.03,
     "num_leaves": 31,
     "max_depth": -1,
+    "min_child_samples": 40,
+    "subsample": 0.85,
+    "subsample_freq": 1,
+    "colsample_bytree": 0.85,
+    "reg_alpha": 0.05,
+    "reg_lambda": 0.25,
+    "class_weight": "balanced",
     "random_state": 42,
+    "verbosity": -1,
 }
 
 LONG_THRESHOLD = 0.55
@@ -391,6 +420,7 @@ BINANCE_TESTNET_BASE_URL = _env_str(
     _env_str("BINANCE_REST_BASE_URL", "https://testnet.binance.vision"),
 )
 if BINANCE_ENV in {"demo", "demo_mode", "spot_demo", "spot_demo_mode"}:
+    BINANCE_USE_TESTNET = True
     BINANCE_TESTNET_BASE_URL = BINANCE_REST_BASE_URL
 BINANCE_REAL_API_KEY = _env_str("BINANCE_REAL_API_KEY", "") or None
 BINANCE_REAL_API_SECRET = _env_str("BINANCE_REAL_API_SECRET", "") or None
@@ -400,7 +430,12 @@ BINANCE_EXECUTION_REST_BASE_URL = BINANCE_ACCOUNT_REST_BASE_URL
 
 SYMBOLS = _env_list("SYMBOLS", SYMBOLS)
 TIMEFRAME = _env_str("TIMEFRAME", TIMEFRAME) or TIMEFRAME
-TRAINING_SCOPE = (_env_str("TRAINING_SCOPE", "both") or "both").replace("-", "_")
+TIMEFRAMES = _env_list("TIMEFRAMES", [TIMEFRAME])
+if not TIMEFRAMES:
+    TIMEFRAMES = [TIMEFRAME]
+if TIMEFRAME not in TIMEFRAMES:
+    TIMEFRAMES = [TIMEFRAME] + [tf for tf in TIMEFRAMES if tf != TIMEFRAME]
+TRAINING_SCOPE = (_env_str("TRAINING_SCOPE", "per_symbol") or "per_symbol").replace("-", "_")
 if TRAINING_SCOPE not in {"multi_symbol", "per_symbol", "both"}:
     TRAINING_SCOPE = "both"
 TARGET_ACCEPTED_MODELS = _env_int("TARGET_ACCEPTED_MODELS", 5)
@@ -410,6 +445,11 @@ AUTO_REPLACE_REJECTED_MODELS = _env_bool("AUTO_REPLACE_REJECTED_MODELS", True)
 TRAINING_CUTOFF_HOURS_BEFORE_NOW = _env_int("TRAINING_CUTOFF_HOURS_BEFORE_NOW", 168)
 VALIDATION_WINDOW_HOURS = _env_int("VALIDATION_WINDOW_HOURS", 168)
 WALK_FORWARD_ENABLED = _env_bool("WALK_FORWARD_ENABLED", True)
+LOOKAHEAD_BARS = _env_int("LOOKAHEAD_BARS", LOOKAHEAD_BARS)
+TP_MULTIPLIER = _env_float("TP_MULTIPLIER", TP_MULTIPLIER)
+SL_MULTIPLIER = _env_float("SL_MULTIPLIER", SL_MULTIPLIER)
+REQUIRE_TP_SL_ON_ENTRY = _env_bool("REQUIRE_TP_SL_ON_ENTRY", True)
+MIN_TP_SL_RISK_REWARD = _env_float("MIN_TP_SL_RISK_REWARD", 1.0)
 
 MIN_PAPER_VALIDATION_DAYS = _env_int("MIN_PAPER_VALIDATION_DAYS", 7)
 MIN_PAPER_VALIDATION_TRADES = _env_int("MIN_PAPER_VALIDATION_TRADES", 20)

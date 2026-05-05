@@ -18,6 +18,7 @@ from config import (
     SYMBOLS,
     TARGET_ACCEPTED_MODELS,
     TIMEFRAME,
+    TIMEFRAMES,
     TRAINING_SCOPE,
 )
 from db_utils import init_research_tables
@@ -33,9 +34,10 @@ class ServiceSpec:
 
 
 class AutonomousRunner:
-    def __init__(self, symbols: list[str], timeframe: str, no_dashboard: bool = False, no_maintenance: bool = False):
+    def __init__(self, symbols: list[str], timeframe: str, timeframes: list[str] | None = None, no_dashboard: bool = False, no_maintenance: bool = False):
         self.symbols = symbols
         self.timeframe = timeframe
+        self.timeframes = [tf for tf in (timeframes or [timeframe]) if tf]
         self.no_dashboard = no_dashboard
         self.no_maintenance = no_maintenance
         self.procs: dict[str, subprocess.Popen] = {}
@@ -58,7 +60,7 @@ class AutonomousRunner:
         specs = [
             ServiceSpec(
                 "realtime_ingestor",
-                [sys.executable, "src/realtime_ingestor.py", "--symbols", *sym_args, "--timeframe", self.timeframe, "--loop", "--poll-seconds", str(BOT_POLL_SECONDS)],
+                [sys.executable, "src/realtime_ingestor.py", "--symbols", *sym_args, "--timeframes", *self.timeframes, "--loop", "--poll-seconds", str(BOT_POLL_SECONDS)],
                 "realtime_ingestor.log",
             ),
             ServiceSpec(
@@ -73,8 +75,8 @@ class AutonomousRunner:
                     "--loop",
                     "--symbols",
                     *sym_args,
-                    "--timeframe",
-                    self.timeframe,
+                    "--timeframes",
+                    *self.timeframes,
                     "--sync-latest-from-binance",
                     "--refresh-features",
                     "--skip-model-maintenance",
@@ -97,7 +99,7 @@ class AutonomousRunner:
             specs.append(
                 ServiceSpec(
                     "model_maintenance",
-                    [sys.executable, "src/model_maintenance.py", "--symbols", *sym_args, "--timeframe", self.timeframe, "--target-accepted-models", str(TARGET_ACCEPTED_MODELS), "--loop", "--interval-seconds", str(MODEL_MAINTENANCE_INTERVAL_SECONDS)],
+                    [sys.executable, "src/model_maintenance.py", "--symbols", *sym_args, "--timeframes", *self.timeframes, "--target-accepted-models", str(TARGET_ACCEPTED_MODELS), "--loop", "--interval-seconds", str(MODEL_MAINTENANCE_INTERVAL_SECONDS)],
                     "model_maintenance.log",
                 )
             )
@@ -149,9 +151,18 @@ class AutonomousRunner:
 
     def run(self) -> int:
         specs = self.specs()
-        update_status("autonomous_runner", "running", pid=os.getpid(), message="runner starting", metadata={"symbols": self.symbols, "timeframe": self.timeframe})
+        update_status("autonomous_runner", "running", pid=os.getpid(), message="runner starting", metadata={"symbols": self.symbols, "timeframes": self.timeframes})
         for spec in specs:
             self.start_service(spec)
+        def _request_shutdown(signum, frame):
+            raise KeyboardInterrupt
+
+        try:
+            signal.signal(signal.SIGTERM, _request_shutdown)
+            if hasattr(signal, "SIGBREAK"):
+                signal.signal(signal.SIGBREAK, _request_shutdown)
+        except Exception:
+            pass
         try:
             while True:
                 update_status("autonomous_runner", "running", pid=os.getpid(), message="supervising services", metadata={"services": list(self.procs.keys())})
@@ -181,6 +192,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Run the full autonomous local trading platform and dashboard.")
     parser.add_argument("--symbols", nargs="*", default=None)
     parser.add_argument("--timeframe", default=TIMEFRAME)
+    parser.add_argument("--timeframes", nargs="*", default=None)
     parser.add_argument("--no-dashboard", action="store_true")
     parser.add_argument("--no-maintenance", action="store_true")
     return parser.parse_args()
@@ -189,7 +201,8 @@ def parse_args():
 def main() -> None:
     args = parse_args()
     symbols = [s.upper().strip() for s in args.symbols] if args.symbols else [s.upper() for s in SYMBOLS]
-    runner = AutonomousRunner(symbols=symbols, timeframe=args.timeframe, no_dashboard=args.no_dashboard, no_maintenance=args.no_maintenance)
+    timeframes = [tf.strip() for tf in (args.timeframes or []) if str(tf).strip()] or [args.timeframe] or TIMEFRAMES
+    runner = AutonomousRunner(symbols=symbols, timeframe=timeframes[0], timeframes=timeframes, no_dashboard=args.no_dashboard, no_maintenance=args.no_maintenance)
     raise SystemExit(runner.run())
 
 
