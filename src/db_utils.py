@@ -77,6 +77,307 @@ def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
     return row is not None
 
 
+def _create_index_if_columns_exist(conn: sqlite3.Connection, table_name: str, index_name: str, columns: list[str]) -> None:
+    if not _table_exists(conn, table_name):
+        return
+    present = _table_columns(conn, table_name)
+    if not set(columns).issubset(present):
+        return
+    cols_sql = ", ".join(columns)
+    conn.execute(f"CREATE INDEX IF NOT EXISTS {index_name} ON {table_name} ({cols_sql})")
+
+
+def _ensure_operational_relationship_indexes_and_views(conn: sqlite3.Connection) -> None:
+    """Create dashboard/query relationships for model/trade lineage.
+
+    SQLite cannot add FOREIGN KEY constraints to existing tables without a
+    table rebuild, so this migration creates stable join indexes plus read-only
+    lineage/integrity views. New code still preserves model_id/prediction_id/
+    proposal_id/allocation_id/trade_id/order_id/fill_id columns for attribution.
+    """
+    index_specs = [
+        (MODEL_REGISTRY_TABLE, "idx_model_registry_status", ["status"]),
+        (SIGNALS_TABLE, "idx_signals_model_symbol_account_ts", ["model_id", "symbol", "account_mode", "datetime_utc"]),
+        (ORDERS_TABLE, "idx_orders_model_symbol_account_created", ["model_id", "symbol", "account_mode", "created_at_utc"]),
+        (ORDERS_TABLE, "idx_orders_trade_id", ["trade_id"]),
+        (ORDERS_TABLE, "idx_orders_proposal_id", ["proposal_id"]),
+        (ORDERS_TABLE, "idx_orders_allocation_id", ["allocation_id"]),
+        (ORDERS_TABLE, "idx_orders_prediction_id", ["prediction_id"]),
+        (FILLS_TABLE, "idx_fills_order_id", ["order_id"]),
+        (FILLS_TABLE, "idx_fills_trade_id", ["trade_id"]),
+        (FILLS_TABLE, "idx_fills_model_symbol_account_ts", ["model_id", "symbol", "account_mode", "timestamp_utc"]),
+        (POSITIONS_TABLE, "idx_positions_model_symbol_account", ["model_id", "symbol", "account_mode"]),
+        (PORTFOLIO_SNAPSHOTS_TABLE, "idx_portfolio_model_account_ts", ["model_id", "account_mode", "datetime_utc"]),
+        (PAPER_MODEL_METRICS_TABLE, "idx_paper_metrics_model_account_ts", ["model_id", "account_mode", "evaluated_at_utc"]),
+        (MODEL_PREDICTIONS_TABLE, "idx_predictions_model_symbol_ts", ["model_id", "symbol", "timestamp_utc"]),
+        (TRADE_PROPOSALS_TABLE, "idx_proposals_model_symbol_created", ["model_id", "symbol", "created_at_utc"]),
+        (TRADE_PROPOSALS_TABLE, "idx_proposals_prediction_id", ["prediction_id"]),
+        (ALLOCATIONS_TABLE, "idx_allocations_model_symbol_created", ["model_id", "symbol", "created_at_utc"]),
+        (ALLOCATIONS_TABLE, "idx_allocations_proposal_id", ["proposal_id"]),
+        (ALLOCATIONS_TABLE, "idx_allocations_prediction_id", ["prediction_id"]),
+        (TRADES_TABLE, "idx_trades_model_symbol_account_status", ["model_id", "symbol", "account_mode", "status"]),
+        (TRADES_TABLE, "idx_trades_proposal_id", ["proposal_id"]),
+        (TRADES_TABLE, "idx_trades_allocation_id", ["allocation_id"]),
+        (TRADES_TABLE, "idx_trades_prediction_id", ["prediction_id"]),
+        (SHADOW_TRADES_TABLE, "idx_shadow_model_symbol_status", ["model_id", "symbol", "status"]),
+        (SHADOW_TRADES_TABLE, "idx_shadow_proposal_id", ["proposal_id"]),
+        (MODEL_PERFORMANCE_TABLE, "idx_model_performance_model_symbol_account_ts", ["model_id", "symbol", "account_mode", "timestamp_utc"]),
+        (MODEL_LIFECYCLE_EVENTS_TABLE, "idx_lifecycle_model_created", ["model_id", "created_at_utc"]),
+        (RISK_EVENTS_TABLE, "idx_risk_model_symbol_created", ["model_id", "symbol", "created_at_utc"]),
+        (ACCOUNT_SNAPSHOTS_TABLE, "idx_account_snapshots_mode_ts", ["account_mode", "timestamp_utc"]),
+        (BALANCE_SNAPSHOTS_TABLE, "idx_balance_snapshots_mode_asset_ts", ["account_mode", "asset", "timestamp_utc"]),
+        (RECONCILIATION_EVENTS_TABLE, "idx_reconciliation_mode_created", ["account_mode", "created_at_utc"]),
+    ]
+    for table_name, index_name, columns in index_specs:
+        _create_index_if_columns_exist(conn, table_name, index_name, columns)
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS model_aliases (
+            alias_model_id TEXT PRIMARY KEY,
+            canonical_model_id TEXT NOT NULL,
+            relation_type TEXT NOT NULL,
+            created_at_utc TEXT NOT NULL,
+            FOREIGN KEY (canonical_model_id) REFERENCES model_registry(model_id)
+        )
+        """
+    )
+    conn.execute(
+        f"""
+        INSERT OR IGNORE INTO model_aliases (alias_model_id, canonical_model_id, relation_type, created_at_utc)
+        SELECT 'ensemble:' || model_id, model_id, 'ensemble_prefix', datetime('now')
+        FROM {MODEL_REGISTRY_TABLE}
+        """
+    )
+    _create_index_if_columns_exist(conn, "model_aliases", "idx_model_aliases_canonical", ["canonical_model_id"])
+    conn.execute(
+        f"""
+        INSERT OR IGNORE INTO {MODEL_REGISTRY_TABLE} (
+            model_id,
+            symbol_scope,
+            timeframe,
+            train_start,
+            train_end,
+            test_start,
+            test_end,
+            feature_version,
+            label_version,
+            model_path,
+            training_ts_utc,
+            metrics_json,
+            params_json,
+            status,
+            acceptance_status,
+            rejection_reasons_json,
+            evaluation_scope,
+            is_active,
+            updated_at_utc,
+            account_mode,
+            training_scope,
+            symbols_json
+        )
+        WITH operational_models AS (
+            SELECT model_id, symbol, timeframe, account_mode FROM {SIGNALS_TABLE} WHERE model_id IS NOT NULL
+            UNION ALL
+            SELECT model_id, symbol, timeframe, account_mode FROM {ORDERS_TABLE} WHERE model_id IS NOT NULL
+            UNION ALL
+            SELECT model_id, symbol, timeframe, account_mode FROM {FILLS_TABLE} WHERE model_id IS NOT NULL
+            UNION ALL
+            SELECT model_id, symbol, timeframe, account_mode FROM {POSITIONS_TABLE} WHERE model_id IS NOT NULL
+        ),
+        missing AS (
+            SELECT
+                om.model_id,
+                GROUP_CONCAT(DISTINCT om.symbol) AS symbol_scope,
+                COALESCE(MAX(om.timeframe), 'unknown') AS timeframe,
+                COALESCE(MAX(om.account_mode), 'unknown') AS account_mode
+            FROM operational_models om
+            LEFT JOIN {MODEL_REGISTRY_TABLE} mr ON mr.model_id = om.model_id
+            LEFT JOIN model_aliases ma ON ma.alias_model_id = om.model_id
+            WHERE mr.model_id IS NULL
+              AND ma.alias_model_id IS NULL
+              AND om.model_id != ''
+            GROUP BY om.model_id
+        )
+        SELECT
+            model_id,
+            COALESCE(symbol_scope, 'UNKNOWN'),
+            timeframe,
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            'unknown',
+            'unknown',
+            'external_or_unregistered',
+            datetime('now'),
+            '{{}}',
+            '{{"source":"auto_registered_from_operational_tables"}}',
+            'archived',
+            'external_unregistered',
+            '["auto_registered_missing_model_registry_relation"]',
+            'operational_history',
+            0,
+            datetime('now'),
+            account_mode,
+            'external_or_probe',
+            '[' || '"' || REPLACE(COALESCE(symbol_scope, 'UNKNOWN'), ',', '","') || '"' || ']'
+        FROM missing
+        """
+    )
+
+    conn.execute("DROP VIEW IF EXISTS dashboard_model_activity")
+    conn.execute(
+        f"""
+        CREATE VIEW dashboard_model_activity AS
+        SELECT
+            mr.model_id,
+            mr.status,
+            mr.acceptance_status,
+            mr.symbol_scope,
+            mr.timeframe,
+            mr.training_scope,
+            mr.is_active,
+            mr.training_ts_utc,
+            COALESCE(sig.signals_count, 0) AS signals_count,
+            sig.last_signal_utc,
+            COALESCE(pred.predictions_count, 0) AS predictions_count,
+            pred.last_prediction_utc,
+            COALESCE(prop.proposals_count, 0) AS proposals_count,
+            prop.last_proposal_utc,
+            COALESCE(ord.orders_count, 0) AS orders_count,
+            ord.last_order_utc,
+            COALESCE(pos.open_positions_count, 0) AS open_positions_count,
+            COALESCE(pos.open_exposure_usdt, 0) AS open_exposure_usdt,
+            COALESCE(tr.open_trades_count, 0) AS open_trades_count,
+            COALESCE(tr.closed_trades_count, 0) AS closed_trades_count,
+            COALESCE(tr.realized_pnl_usdt, 0) AS realized_pnl_usdt,
+            COALESCE(tr.unrealized_pnl_usdt, 0) AS unrealized_pnl_usdt
+        FROM {MODEL_REGISTRY_TABLE} mr
+        LEFT JOIN (
+            SELECT COALESCE(ma.canonical_model_id, s.model_id) AS model_id, COUNT(*) AS signals_count, MAX(s.created_at_utc) AS last_signal_utc
+            FROM {SIGNALS_TABLE} s
+            LEFT JOIN model_aliases ma ON ma.alias_model_id = s.model_id
+            GROUP BY COALESCE(ma.canonical_model_id, s.model_id)
+        ) sig ON sig.model_id = mr.model_id
+        LEFT JOIN (
+            SELECT model_id, COUNT(*) AS predictions_count, MAX(created_at_utc) AS last_prediction_utc
+            FROM {MODEL_PREDICTIONS_TABLE}
+            GROUP BY model_id
+        ) pred ON pred.model_id = mr.model_id
+        LEFT JOIN (
+            SELECT model_id, COUNT(*) AS proposals_count, MAX(created_at_utc) AS last_proposal_utc
+            FROM {TRADE_PROPOSALS_TABLE}
+            GROUP BY model_id
+        ) prop ON prop.model_id = mr.model_id
+        LEFT JOIN (
+            SELECT COALESCE(ma.canonical_model_id, o.model_id) AS model_id, COUNT(*) AS orders_count, MAX(o.created_at_utc) AS last_order_utc
+            FROM {ORDERS_TABLE} o
+            LEFT JOIN model_aliases ma ON ma.alias_model_id = o.model_id
+            GROUP BY COALESCE(ma.canonical_model_id, o.model_id)
+        ) ord ON ord.model_id = mr.model_id
+        LEFT JOIN (
+            SELECT model_id, COUNT(*) AS open_positions_count, SUM(ABS(COALESCE(notional_usdt, quantity * avg_price))) AS open_exposure_usdt
+            FROM {POSITIONS_TABLE}
+            WHERE ABS(quantity) > 0.000000000001
+            GROUP BY model_id
+        ) pos ON pos.model_id = mr.model_id
+        LEFT JOIN (
+            SELECT
+                model_id,
+                SUM(CASE WHEN status IN ('OPEN','PARTIALLY_FILLED','REDUCING','CLOSING','ORDER_SENT','ORDER_PENDING') THEN 1 ELSE 0 END) AS open_trades_count,
+                SUM(CASE WHEN status IN ('CLOSED','FORCE_CLOSED','EXPIRED') THEN 1 ELSE 0 END) AS closed_trades_count,
+                SUM(realized_pnl_usdt) AS realized_pnl_usdt,
+                SUM(unrealized_pnl_usdt) AS unrealized_pnl_usdt
+            FROM {TRADES_TABLE}
+            GROUP BY model_id
+        ) tr ON tr.model_id = mr.model_id
+        """
+    )
+
+    conn.execute("DROP VIEW IF EXISTS dashboard_trade_lineage")
+    conn.execute(
+        f"""
+        CREATE VIEW dashboard_trade_lineage AS
+        SELECT
+            tr.trade_id,
+            tr.model_id,
+            tr.symbol,
+            tr.account_mode,
+            tr.status,
+            tr.prediction_id,
+            tr.proposal_id,
+            tr.allocation_id,
+            tr.approved_notional_usdt,
+            tr.qty,
+            tr.avg_entry_price,
+            tr.tp_price,
+            tr.sl_price,
+            tr.realized_pnl_usdt,
+            tr.unrealized_pnl_usdt,
+            pr.status AS proposal_status,
+            pr.proposal_score,
+            al.decision AS allocation_decision,
+            al.allocator_score,
+            COUNT(o.order_id) AS linked_orders,
+            COUNT(f.fill_id) AS linked_fills,
+            tr.opened_at_utc,
+            tr.closed_at_utc,
+            tr.updated_at_utc
+        FROM {TRADES_TABLE} tr
+        LEFT JOIN {TRADE_PROPOSALS_TABLE} pr ON pr.proposal_id = tr.proposal_id
+        LEFT JOIN {ALLOCATIONS_TABLE} al ON al.allocation_id = tr.allocation_id
+        LEFT JOIN {ORDERS_TABLE} o ON o.trade_id = tr.trade_id
+        LEFT JOIN {FILLS_TABLE} f ON f.trade_id = tr.trade_id
+        GROUP BY tr.trade_id
+        """
+    )
+
+    conn.execute("DROP VIEW IF EXISTS dashboard_relationship_issues")
+    conn.execute(
+        f"""
+        CREATE VIEW dashboard_relationship_issues AS
+        SELECT 'signals' AS source_table, CAST(s.signal_id AS TEXT) AS source_id, s.model_id, s.symbol,
+               'missing_model_registry' AS issue_type, 'signals.model_id has no model_registry row' AS message
+        FROM {SIGNALS_TABLE} s
+        LEFT JOIN model_aliases ma ON ma.alias_model_id = s.model_id
+        LEFT JOIN {MODEL_REGISTRY_TABLE} mr ON mr.model_id = COALESCE(ma.canonical_model_id, s.model_id)
+        WHERE mr.model_id IS NULL
+        UNION ALL
+        SELECT 'orders', o.order_id, o.model_id, o.symbol,
+               'missing_model_registry', 'orders.model_id has no model_registry row'
+        FROM {ORDERS_TABLE} o
+        LEFT JOIN model_aliases ma ON ma.alias_model_id = o.model_id
+        LEFT JOIN {MODEL_REGISTRY_TABLE} mr ON mr.model_id = COALESCE(ma.canonical_model_id, o.model_id)
+        WHERE o.model_id IS NOT NULL AND mr.model_id IS NULL
+        UNION ALL
+        SELECT 'fills', f.fill_id, f.model_id, f.symbol,
+               'missing_order', 'fills.order_id has no orders row'
+        FROM {FILLS_TABLE} f
+        LEFT JOIN {ORDERS_TABLE} o ON o.order_id = f.order_id
+        WHERE o.order_id IS NULL
+        UNION ALL
+        SELECT 'trade_proposals', p.proposal_id, p.model_id, p.symbol,
+               'missing_prediction', 'trade_proposals.prediction_id has no model_predictions row'
+        FROM {TRADE_PROPOSALS_TABLE} p
+        LEFT JOIN {MODEL_PREDICTIONS_TABLE} mp ON mp.prediction_id = p.prediction_id
+        WHERE p.prediction_id IS NOT NULL AND mp.prediction_id IS NULL
+        UNION ALL
+        SELECT 'allocations', a.allocation_id, a.model_id, a.symbol,
+               'missing_proposal', 'allocations.proposal_id has no trade_proposals row'
+        FROM {ALLOCATIONS_TABLE} a
+        LEFT JOIN {TRADE_PROPOSALS_TABLE} p ON p.proposal_id = a.proposal_id
+        WHERE p.proposal_id IS NULL
+        UNION ALL
+        SELECT 'trades', tr.trade_id, tr.model_id, tr.symbol,
+               'missing_allocation', 'trades.allocation_id has no allocations row'
+        FROM {TRADES_TABLE} tr
+        LEFT JOIN {ALLOCATIONS_TABLE} a ON a.allocation_id = tr.allocation_id
+        WHERE tr.allocation_id IS NOT NULL AND a.allocation_id IS NULL
+        """
+    )
+
+
 def init_research_tables() -> None:
     ensure_project_directories()
 
@@ -847,6 +1148,8 @@ def init_research_tables() -> None:
         _ensure_column(conn, FILLS_TABLE, "slippage_usdt", "REAL")
         _ensure_column(conn, POSITIONS_TABLE, "notional_usdt", "REAL")
 
+        _ensure_operational_relationship_indexes_and_views(conn)
+
         conn.commit()
     finally:
         conn.close()
@@ -1045,6 +1348,7 @@ def assert_required_schema() -> dict:
         SHADOW_TRADE_EVENTS_TABLE,
         RECONCILIATION_EVENTS_TABLE,
         SYSTEM_STATUS_TABLE,
+        "model_aliases",
     ]
     model_scoped = {
         SIGNALS_TABLE: "model_id",
@@ -1071,7 +1375,13 @@ def assert_required_schema() -> dict:
             row[0]
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
         }
+        views = {
+            row[0]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='view'").fetchall()
+        }
         missing_tables = [t for t in required_tables if t not in tables]
+        required_views = ["dashboard_model_activity", "dashboard_trade_lineage", "dashboard_relationship_issues"]
+        missing_views = [v for v in required_views if v not in views]
         missing_columns = {
             table: col
             for table, col in model_scoped.items()
@@ -1088,9 +1398,10 @@ def assert_required_schema() -> dict:
     finally:
         conn.close()
     return {
-        "ok": not missing_tables and not missing_columns and not missing_attribution_columns,
+        "ok": not missing_tables and not missing_views and not missing_columns and not missing_attribution_columns,
         "db_file": str(DB_FILE),
         "missing_tables": missing_tables,
+        "missing_relationship_views": missing_views,
         "missing_model_id_columns": missing_columns,
         "missing_attribution_columns": missing_attribution_columns,
     }

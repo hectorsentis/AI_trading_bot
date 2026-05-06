@@ -53,6 +53,24 @@ def fmt_pct(value: Any) -> str:
         return "N/A"
 
 
+def numeric_or_none(value: Any) -> float | None:
+    try:
+        if value is None or pd.isna(value):
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def boolish(value: Any) -> bool:
+    try:
+        if value is None or pd.isna(value):
+            return False
+    except Exception:
+        pass
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 def fmt_num(value: Any, digits: int = 2) -> str:
     try:
         if value is None or pd.isna(value):
@@ -60,6 +78,50 @@ def fmt_num(value: Any, digits: int = 2) -> str:
         return f"{float(value):,.{digits}f}"
     except Exception:
         return "N/A"
+
+
+def pnl_color(value: Any) -> str:
+    number = numeric_or_none(value)
+    if number is None:
+        return "color: #cbd5e1"
+    if number > 0:
+        return "color: #86efac; font-weight: 700"
+    if number < 0:
+        return "color: #fecaca; font-weight: 700"
+    return "color: #cbd5e1"
+
+
+def status_color(value: Any) -> str:
+    text = str(value).lower()
+    if any(x in text for x in ["active", "accepted", "validated", "ready", "open", "running"]):
+        return "color: #86efac; font-weight: 700"
+    if any(x in text for x in ["rejected", "quarantine", "error", "failed", "paused", "degraded"]):
+        return "color: #fecaca; font-weight: 700"
+    return "color: #cbd5e1"
+
+
+def simple_display_df(df: pd.DataFrame, *, pct_cols: list[str] | None = None, money_cols: list[str] | None = None, digits: int = 3) -> pd.DataFrame:
+    """Return a plain dataframe for Streamlit; no Styler, no complex rendering."""
+    if df.empty:
+        return df
+    out = df.copy()
+    for col in pct_cols or []:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").map(lambda v: "N/A" if pd.isna(v) else f"{v * 100:,.2f}%")
+    for col in money_cols or []:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").map(lambda v: "N/A" if pd.isna(v) else f"${v:,.2f}")
+    for col in out.select_dtypes(include=["float", "float64", "float32"]).columns:
+        if col not in set((pct_cols or []) + (money_cols or [])):
+            out[col] = out[col].round(digits)
+    return out
+
+
+def show_simple_df(st, df: pd.DataFrame, *, height: int = 280, empty: str = "No data available.", pct_cols: list[str] | None = None, money_cols: list[str] | None = None) -> None:
+    if df.empty:
+        st.info(df.attrs.get("message") or empty)
+        return
+    st.dataframe(simple_display_df(df, pct_cols=pct_cols, money_cols=money_cols), use_container_width=True, height=height, hide_index=True)
 
 
 def inject_css(st) -> None:
@@ -147,6 +209,112 @@ def show_df(st, df: pd.DataFrame, *, height: int = 320, empty: str = "No data av
         if display[col].map(lambda v: isinstance(v, (dict, list))).any():
             display[col] = display[col].apply(humanize_nested_value)
     st.dataframe(display, use_container_width=True, height=height)
+
+
+def show_colored_df(
+    st,
+    df: pd.DataFrame,
+    *,
+    height: int = 320,
+    empty: str = "No data available.",
+    money_cols: list[str] | None = None,
+    pct_cols: list[str] | None = None,
+    pnl_cols: list[str] | None = None,
+    status_cols: list[str] | None = None,
+) -> None:
+    """Compact dataframe renderer with operational green/red styling."""
+    if df.empty:
+        st.info(df.attrs.get("message") or empty)
+        return
+    display = df.copy()
+    money_cols = [c for c in (money_cols or []) if c in display.columns]
+    pct_cols = [c for c in (pct_cols or []) if c in display.columns]
+    pnl_cols = [c for c in (pnl_cols or []) if c in display.columns]
+    status_cols = [c for c in (status_cols or []) if c in display.columns]
+    for col in set(money_cols + pct_cols + pnl_cols):
+        display[col] = pd.to_numeric(display[col], errors="coerce")
+    formatter: dict[str, Any] = {}
+    formatter.update({c: "${:,.2f}" for c in money_cols + pnl_cols})
+    formatter.update({c: "{:,.2%}" for c in pct_cols})
+    styled = display.style.format(formatter, na_rep="N/A")
+    if pnl_cols:
+        try:
+            styled = styled.map(pnl_color, subset=pnl_cols)
+        except AttributeError:  # pandas < 2.1
+            styled = styled.applymap(pnl_color, subset=pnl_cols)
+    if status_cols:
+        try:
+            styled = styled.map(status_color, subset=status_cols)
+        except AttributeError:  # pandas < 2.1
+            styled = styled.applymap(status_color, subset=status_cols)
+    st.dataframe(styled, use_container_width=True, height=height)
+
+
+def render_selectable_colored_df(
+    st,
+    df: pd.DataFrame,
+    *,
+    key: str,
+    height: int = 320,
+    empty: str = "No data available.",
+    money_cols: list[str] | None = None,
+    pct_cols: list[str] | None = None,
+    pnl_cols: list[str] | None = None,
+    status_cols: list[str] | None = None,
+) -> int | None:
+    """Render a selectable dataframe and return the selected row position."""
+    if df.empty:
+        st.info(df.attrs.get("message") or empty)
+        return None
+    display = df.copy()
+    money_cols = [c for c in (money_cols or []) if c in display.columns]
+    pct_cols = [c for c in (pct_cols or []) if c in display.columns]
+    pnl_cols = [c for c in (pnl_cols or []) if c in display.columns]
+    status_cols = [c for c in (status_cols or []) if c in display.columns]
+    for col in set(money_cols + pct_cols + pnl_cols):
+        display[col] = pd.to_numeric(display[col], errors="coerce")
+    formatter: dict[str, Any] = {}
+    formatter.update({c: "${:,.2f}" for c in money_cols + pnl_cols})
+    formatter.update({c: "{:,.2%}" for c in pct_cols})
+    styled = display.style.format(formatter, na_rep="N/A")
+    if pnl_cols:
+        try:
+            styled = styled.map(pnl_color, subset=pnl_cols)
+        except AttributeError:
+            styled = styled.applymap(pnl_color, subset=pnl_cols)
+    if status_cols:
+        try:
+            styled = styled.map(status_color, subset=status_cols)
+        except AttributeError:
+            styled = styled.applymap(status_color, subset=status_cols)
+    try:
+        event = st.dataframe(
+            styled,
+            use_container_width=True,
+            height=height,
+            key=key,
+            on_select="rerun",
+            selection_mode="single-row",
+        )
+        rows = getattr(getattr(event, "selection", None), "rows", None)
+        if rows:
+            return int(rows[0])
+    except Exception:
+        try:
+            event = st.dataframe(
+                display,
+                use_container_width=True,
+                height=height,
+                key=f"{key}_plain",
+                on_select="rerun",
+                selection_mode="single-row",
+            )
+            rows = getattr(getattr(event, "selection", None), "rows", None)
+            if rows:
+                return int(rows[0])
+        except Exception:
+            st.dataframe(display, use_container_width=True, height=height)
+    return None
 
 
 def parse_jsonish_for_display(value: Any) -> Any:
@@ -429,8 +597,18 @@ def render_trade_pnl(st, trades: pd.DataFrame, *, key_prefix: str = "trade_pnl")
     st.caption(f"Source: {trades['source'].iloc[0] if 'source' in trades.columns and len(trades) else 'N/A'}")
 
 
-def render_price_signals(st, symbol: str, timeframe: str, price: pd.DataFrame, signals: pd.DataFrame, orders: pd.DataFrame, *, key_prefix: str = "price") -> None:
-    st.subheader(f"Market chart - {symbol} - {timeframe}")
+def render_price_signals(
+    st,
+    symbol: str,
+    timeframe: str,
+    price: pd.DataFrame,
+    signals: pd.DataFrame,
+    orders: pd.DataFrame,
+    positions: pd.DataFrame | None = None,
+    *,
+    key_prefix: str = "price",
+) -> None:
+    st.subheader(f"Gráfico de velas - {symbol} - {timeframe}")
     if price.empty:
         st.info(price.attrs.get("message", "No price data available for this symbol/timeframe."))
         return
@@ -491,6 +669,49 @@ def render_price_signals(st, symbol: str, timeframe: str, price: pd.DataFrame, s
             od = od.dropna(subset=["created_at_utc", "plot_price"])
             if not od.empty:
                 fig.add_trace(go.Scatter(x=od["created_at_utc"], y=od["plot_price"], mode="markers", name="Orders", marker=dict(color="#facc15", size=11, symbol="x")), row=1, col=1)
+
+    if positions is not None and not positions.empty and {"symbol", "quantity"}.issubset(positions.columns):
+        pos = positions[positions["symbol"].astype(str) == symbol].copy()
+        if not pos.empty:
+            pos["quantity"] = pd.to_numeric(pos["quantity"], errors="coerce")
+            pos = pos[pos["quantity"].fillna(0).abs() > 1e-12]
+        if not pos.empty:
+            x0 = price["datetime_utc"].min()
+            x1 = price["datetime_utc"].max()
+            entry_col = "avg_entry_price" if "avg_entry_price" in pos.columns else ("avg_price" if "avg_price" in pos.columns else None)
+            if entry_col:
+                for idx, row in pos.head(12).iterrows():
+                    entry = numeric_or_none(row.get(entry_col))
+                    if entry is None:
+                        continue
+                    model_id = str(row.get("model_id", "model N/A"))
+                    qty = numeric_or_none(row.get("quantity")) or 0.0
+                    pnl = numeric_or_none(row.get("unrealized_pnl"))
+                    fig.add_trace(
+                        go.Scatter(
+                            x=[x0, x1],
+                            y=[entry, entry],
+                            mode="lines",
+                            name=f"Open position {model_id}",
+                            line=dict(color="#38bdf8", width=1.6, dash="dash"),
+                            hovertemplate=f"model={model_id}<br>qty={qty:,.8f}<br>entry={entry:,.4f}<br>unrealized={fmt_money(pnl)}<extra></extra>",
+                        ),
+                        row=1,
+                        col=1,
+                    )
+            marker_price = pd.to_numeric(pos.get("current_price"), errors="coerce") if "current_price" in pos.columns else pd.Series([pd.NA] * len(pos), index=pos.index)
+            if marker_price.notna().any():
+                fig.add_trace(
+                    go.Scatter(
+                        x=[price["datetime_utc"].max()] * int(marker_price.notna().sum()),
+                        y=marker_price.dropna(),
+                        mode="markers",
+                        name="Open positions",
+                        marker=dict(color="#38bdf8", size=12, symbol="diamond", line=dict(color="#020617", width=1)),
+                    ),
+                    row=1,
+                    col=1,
+                )
     fig.update_xaxes(rangeslider_visible=False)
     fig.update_yaxes(title_text="Price", row=1, col=1)
     if has_volume:
@@ -525,8 +746,9 @@ def apply_selection_filters(
     if df.empty:
         return df
     out = df.copy()
+    expanded_model_ids = expand_model_ids_for_filter(model_ids)
     filters = [
-        ("model_id", model_ids),
+        ("model_id", expanded_model_ids),
         ("symbol", symbols),
         ("account_mode", account_modes),
         ("status", statuses),
@@ -539,6 +761,24 @@ def apply_selection_filters(
         if label_col:
             out = out[out[label_col].astype(str).isin([str(v) for v in signal_labels])]
     return out
+
+
+def expand_model_ids_for_filter(model_ids: list[str] | None) -> list[str] | None:
+    if not model_ids:
+        return model_ids
+    selected = {str(v) for v in model_ids if str(v)}
+    try:
+        aliases = data.load_model_aliases()
+    except Exception:
+        aliases = pd.DataFrame()
+    if not aliases.empty and {"alias_model_id", "canonical_model_id"}.issubset(aliases.columns):
+        for _, row in aliases.iterrows():
+            alias = str(row.get("alias_model_id"))
+            canonical = str(row.get("canonical_model_id"))
+            if canonical in selected or alias in selected:
+                selected.add(alias)
+                selected.add(canonical)
+    return sorted(selected)
 
 
 def build_equity_curve_from_snapshots(snapshots: pd.DataFrame) -> pd.DataFrame:
@@ -561,6 +801,391 @@ def build_equity_curve_from_snapshots(snapshots: pd.DataFrame) -> pd.DataFrame:
     curve["drawdown"] = curve["equity"] / curve["equity"].cummax() - 1
     curve["source"] = "portfolio_snapshots_filtered"
     return curve
+
+
+def choose_account_modes(all_accounts: list[str], view_real: bool) -> list[str]:
+    """Map the real/demo switch to known account_mode values without assuming one exact label."""
+    if not all_accounts:
+        return []
+    real_keywords = ("real", "live")
+    real_modes = [m for m in all_accounts if any(k in str(m).lower() for k in real_keywords)]
+    if view_real:
+        return real_modes or ["__NO_REAL_ACCOUNT_MODE__"]
+    return [m for m in all_accounts if m not in real_modes]
+
+
+def calculate_portfolio_view_summary(snapshots: pd.DataFrame, positions: pd.DataFrame, fallback: dict[str, Any]) -> dict[str, Any]:
+    """Current portfolio position and global/daily PnL for the selected account/symbol filters."""
+    summary = dict(fallback)
+    if not snapshots.empty and {"datetime_utc", "equity"}.issubset(snapshots.columns):
+        df = snapshots.copy()
+        df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True, errors="coerce")
+        for col in ["equity", "cash", "realized_pnl", "unrealized_pnl"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["datetime_utc", "equity"])
+        if not df.empty:
+            group_cols = [c for c in ["model_id", "account_mode"] if c in df.columns]
+            latest = _latest_by_group_dashboard(df, group_cols, "datetime_utc") if group_cols else df.sort_values("datetime_utc").tail(1)
+            summary["total_equity"] = latest["equity"].sum()
+            if "cash" in latest.columns:
+                summary["cash_usdt"] = latest["cash"].sum()
+            if "realized_pnl" in latest.columns:
+                summary["realized_pnl"] = latest["realized_pnl"].sum()
+            if "unrealized_pnl" in latest.columns:
+                summary["unrealized_pnl"] = latest["unrealized_pnl"].sum()
+            equity_curve = df.groupby("datetime_utc", dropna=False)["equity"].sum().sort_index()
+            if len(equity_curve) > 1:
+                first = float(equity_curve.iloc[0])
+                last = float(equity_curve.iloc[-1])
+                summary["total_return"] = (last / first - 1) if first else None
+                summary["max_drawdown"] = (equity_curve / equity_curve.cummax() - 1).min()
+                recent = equity_curve[equity_curve.index >= pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=24)]
+                if len(recent):
+                    base = float(recent.iloc[0])
+                    summary["daily_pnl"] = last - base
+                    summary["daily_return"] = (last / base - 1) if base else None
+            summary["source"] = "portfolio_snapshots_filtered"
+
+    total_pnl = (numeric_or_none(summary.get("realized_pnl")) or 0.0) + (numeric_or_none(summary.get("unrealized_pnl")) or 0.0)
+    summary["total_pnl"] = total_pnl
+    if not positions.empty and "market_value" in positions.columns:
+        exposure = pd.to_numeric(positions["market_value"], errors="coerce").abs().sum()
+        equity = numeric_or_none(summary.get("total_equity"))
+        summary["invested_value"] = exposure
+        summary["exposure_pct"] = exposure / equity if equity else summary.get("exposure_pct")
+    return summary
+
+
+def _latest_by_group_dashboard(df: pd.DataFrame, group_cols: list[str], ts_col: str) -> pd.DataFrame:
+    if not group_cols:
+        return df.sort_values(ts_col).tail(1)
+    return df.sort_values(ts_col).groupby(group_cols, dropna=False).tail(1)
+
+
+def render_portfolio_position_header(st, summary: dict[str, Any], account_label: str) -> None:
+    st.subheader(f"Posición actual de cartera · {account_label}")
+    cols = st.columns(7)
+    total_pnl = numeric_or_none(summary.get("total_pnl"))
+    daily_pnl = numeric_or_none(summary.get("daily_pnl"))
+    cols[0].metric("Equity total", fmt_money(summary.get("total_equity")))
+    cols[1].metric("USDT libre", fmt_money(summary.get("cash_usdt")))
+    cols[2].metric("Invertido", fmt_money(summary.get("invested_value")))
+    cols[3].metric("PnL total", fmt_money(total_pnl), delta=fmt_pct(summary.get("total_return")))
+    cols[4].metric("PnL diario", fmt_money(daily_pnl), delta=fmt_pct(summary.get("daily_return")))
+    cols[5].metric("Exposición", fmt_pct(summary.get("exposure_pct")))
+    cols[6].metric("Drawdown", fmt_pct(summary.get("max_drawdown")))
+
+
+def build_compact_model_view(registry: pd.DataFrame, model_control: pd.DataFrame, selected_models: list[str] | None = None) -> pd.DataFrame:
+    merged = merge_model_controls(registry, model_control)
+    if not merged.empty:
+        merged = apply_selection_filters(merged, model_ids=selected_models or [])
+    if merged.empty:
+        return merged
+    rows = []
+    for _, row in merged.iterrows():
+        rows.append(
+            {
+                "model_id": row.get("model_id"),
+                "estado": row.get("status", row.get("acceptance_status")),
+                "símbolos": row.get("symbol_scope"),
+                "tf": row.get("timeframe"),
+                "activo": boolish(row.get("dashboard_signal_enabled")),
+                "paper": boolish(row.get("dashboard_paper_enabled")),
+                "total_return": row.get("strategy_return"),
+                "exceso_vs_bh": row.get("excess_return"),
+                "drawdown": row.get("max_drawdown"),
+                "profit_factor": row.get("profit_factor"),
+                "trades": row.get("trade_count"),
+                "score": row.get("risk_adjusted_score"),
+                "entrenado_utc": row.get("training_ts_utc"),
+            }
+        )
+    out = pd.DataFrame(rows)
+    if "score" in out.columns:
+        out = out.sort_values("score", ascending=False, na_position="last")
+    return out
+
+
+def render_main_models_table(st, registry: pd.DataFrame, model_control: pd.DataFrame, requested_by: str, selected_models: list[str]) -> str | None:
+    st.subheader("Modelos")
+    view = build_compact_model_view(registry, model_control, selected_models)
+    if view.empty:
+        st.info("No hay modelos registrados todavía. Ejecuta model_maintenance/train primero.")
+        return None
+    visible_cols = ["model_id", "estado", "símbolos", "tf", "activo", "paper", "total_return", "drawdown", "profit_factor", "trades", "score"]
+    table = view[[c for c in visible_cols if c in view.columns]].copy()
+    st.caption("Puedes clicar una fila si tu versión de Streamlit lo permite. Si no, usa el selector debajo.")
+    clicked_model_id = None
+    try:
+        event = st.dataframe(
+            simple_display_df(table, pct_cols=["total_return", "drawdown"]),
+            use_container_width=True,
+            height=330,
+            hide_index=True,
+            key="models_plain_select_table",
+            on_select="rerun",
+            selection_mode="single-row",
+        )
+        selection = getattr(event, "selection", None)
+        if selection is None and isinstance(event, dict):
+            selection = event.get("selection")
+        rows = getattr(selection, "rows", None)
+        if rows is None and isinstance(selection, dict):
+            rows = selection.get("rows")
+        if rows:
+            clicked_model_id = str(view.iloc[int(rows[0])].get("model_id"))
+    except Exception:
+        show_simple_df(st, table, height=330, pct_cols=["total_return", "drawdown"])
+
+    model_ids = view["model_id"].dropna().astype(str).tolist()
+    current = clicked_model_id or st.session_state.get("dashboard_selected_model_id")
+    index = model_ids.index(current) if current in model_ids else 0
+    selected = st.selectbox("Modelo seleccionado", model_ids, index=index, key="main_model_selectbox")
+    if selected:
+        st.session_state["dashboard_selected_model_id"] = selected
+    selected_row_df = view[view["model_id"].astype(str) == str(selected)]
+    if not selected_row_df.empty:
+        row = selected_row_df.iloc[0]
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Return", fmt_pct(row.get("total_return")))
+        c2.metric("Drawdown", fmt_pct(row.get("drawdown")))
+        c3.metric("Profit factor", fmt_num(row.get("profit_factor")))
+        signal_new = c4.toggle("Signals", value=bool(row.get("activo")), key=f"selected_signal_toggle_{selected}")
+        paper_new = c5.toggle("Paper", value=bool(row.get("paper")), key=f"selected_paper_toggle_{selected}")
+        if signal_new != bool(row.get("activo")):
+            render_action_result(st, controls.activate_model if signal_new else controls.deactivate_model, selected, requested_by)
+            st.rerun()
+        if paper_new != bool(row.get("paper")):
+            render_action_result(st, controls.set_model_paper, selected, paper_new, requested_by)
+            st.rerun()
+    return selected
+
+
+def build_open_positions_view(positions: pd.DataFrame, trades: pd.DataFrame | None = None) -> pd.DataFrame:
+    if positions.empty:
+        return positions
+    out = positions.copy()
+    for col in ["quantity", "avg_entry_price", "avg_price", "current_price", "market_value", "unrealized_pnl", "realized_pnl", "exposure_pct"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    if "avg_entry_price" not in out.columns and "avg_price" in out.columns:
+        out["avg_entry_price"] = out["avg_price"]
+    if {"current_price", "avg_entry_price"}.issubset(out.columns):
+        out["pnl_pct"] = out["current_price"] / out["avg_entry_price"] - 1
+    if trades is not None and not trades.empty and "symbol" in out.columns and "symbol" in trades.columns:
+        tr = trades.copy()
+        if "status" in tr.columns:
+            tr = tr[tr["status"].astype(str).str.upper().isin(["OPEN", "PARTIALLY_FILLED", "REDUCING", "CLOSING", "ORDER_SENT", "ORDER_PENDING"])]
+        keep = [c for c in ["trade_id", "model_id", "symbol", "tp_price", "sl_price", "emergency_sl_price", "horizon_bars", "opened_at_utc", "exit_reason"] if c in tr.columns]
+        if keep:
+            dedupe = [c for c in ["model_id", "symbol"] if c in keep]
+            if dedupe:
+                tr = tr[keep].drop_duplicates(dedupe, keep="last")
+                out = out.merge(tr, on=dedupe, how="left", suffixes=("", "_trade"))
+    if {"current_price", "tp_price"}.issubset(out.columns):
+        out["dist_tp_pct"] = pd.to_numeric(out["tp_price"], errors="coerce") / out["current_price"] - 1
+    if {"current_price", "sl_price"}.issubset(out.columns):
+        out["dist_sl_pct"] = pd.to_numeric(out["sl_price"], errors="coerce") / out["current_price"] - 1
+    preferred = [
+        "symbol", "model_id", "account_mode", "quantity", "avg_entry_price", "current_price",
+        "market_value", "unrealized_pnl", "pnl_pct", "realized_pnl", "exposure_pct",
+        "tp_price", "sl_price", "dist_tp_pct", "dist_sl_pct", "trade_id", "updated_at_utc",
+    ]
+    return out[[c for c in preferred if c in out.columns]]
+
+
+def build_filtered_exposure_breakdown(positions: pd.DataFrame, summary: dict[str, Any]) -> pd.DataFrame:
+    if not positions.empty and "market_value" in positions.columns and "symbol" in positions.columns:
+        by_asset = positions.copy()
+        by_asset["market_value"] = pd.to_numeric(by_asset["market_value"], errors="coerce")
+        by_asset = by_asset.groupby("symbol", dropna=False)["market_value"].sum().reset_index()
+        by_asset = by_asset.rename(columns={"symbol": "asset", "market_value": "value_usdt"})
+        by_asset["asset"] = by_asset["asset"].astype(str).str.replace("USDT", "", regex=False)
+        cash = numeric_or_none(summary.get("cash_usdt"))
+        if cash is not None:
+            by_asset = pd.concat([by_asset, pd.DataFrame([{"asset": "USDT", "value_usdt": cash}])], ignore_index=True)
+        return by_asset.dropna(subset=["value_usdt"])
+    cash = numeric_or_none(summary.get("cash_usdt"))
+    if cash is not None:
+        return pd.DataFrame([{"asset": "USDT", "value_usdt": cash}])
+    return pd.DataFrame(columns=["asset", "value_usdt"])
+
+
+def filter_model_context_df(df: pd.DataFrame, model_id: str, selected_symbols: list[str], selected_accounts: list[str]) -> pd.DataFrame:
+    return apply_selection_filters(df, model_ids=[model_id], symbols=selected_symbols, account_modes=selected_accounts)
+
+
+def render_selected_model_context(
+    st,
+    *,
+    model_id: str | None,
+    registry: pd.DataFrame,
+    signals: pd.DataFrame,
+    orders: pd.DataFrame,
+    fills: pd.DataFrame,
+    positions: pd.DataFrame,
+    snapshots: pd.DataFrame,
+    trades: pd.DataFrame,
+    selected_symbols: list[str],
+    selected_accounts: list[str],
+) -> None:
+    if not model_id:
+        st.info("Clica un modelo en la tabla para abrir su ficha operativa y usarlo como contexto de navegación.")
+        return
+    st.markdown(f"### Modelo seleccionado: `{model_id}`")
+    c0, c1, c2 = st.columns([1.2, 1, 1])
+    apply_filter = c0.toggle(
+        "Usar este modelo como filtro global",
+        value=bool(st.session_state.get("dashboard_apply_selected_model_filter", True)),
+        key="selected_model_filter_toggle",
+    )
+    st.session_state["dashboard_apply_selected_model_filter"] = bool(apply_filter)
+    if c1.button("Limpiar modelo seleccionado", use_container_width=True):
+        st.session_state.pop("dashboard_selected_model_id", None)
+        st.session_state["dashboard_apply_selected_model_filter"] = False
+        st.rerun()
+    c2.caption("Atajo: usa las pestañas con este mismo contexto model_id/símbolo/cuenta.")
+
+    row = pd.DataFrame()
+    if not registry.empty and "model_id" in registry.columns:
+        row = registry[registry["model_id"].astype(str) == str(model_id)].head(1)
+    sig_m = filter_model_context_df(signals, model_id, selected_symbols, selected_accounts)
+    ord_m = filter_model_context_df(orders, model_id, selected_symbols, selected_accounts)
+    fill_m = filter_model_context_df(fills, model_id, selected_symbols, selected_accounts)
+    pos_m = filter_model_context_df(positions, model_id, selected_symbols, selected_accounts)
+    snap_m = apply_selection_filters(snapshots, model_ids=[model_id], account_modes=selected_accounts)
+    trade_m = filter_model_context_df(trades, model_id, selected_symbols, selected_accounts)
+    prop_m = filter_model_context_df(data.read_table("trade_proposals", 500, "created_at_utc"), model_id, selected_symbols, selected_accounts)
+    alloc_m = filter_model_context_df(data.read_table("allocations", 500, "created_at_utc"), model_id, selected_symbols, selected_accounts)
+    pred_m = filter_model_context_df(data.read_table("model_predictions", 500, "created_at_utc"), model_id, selected_symbols, selected_accounts)
+    perf_m = filter_model_context_df(data.read_table("model_performance", 500, "timestamp_utc"), model_id, selected_symbols, selected_accounts)
+    metrics_m = filter_model_context_df(data.load_paper_model_metrics(2000), model_id, selected_symbols, selected_accounts)
+
+    realized = pd.to_numeric(pos_m.get("realized_pnl"), errors="coerce").sum() if not pos_m.empty and "realized_pnl" in pos_m.columns else None
+    unrealized = pd.to_numeric(pos_m.get("unrealized_pnl"), errors="coerce").sum() if not pos_m.empty and "unrealized_pnl" in pos_m.columns else None
+    exposure = pd.to_numeric(pos_m.get("market_value"), errors="coerce").abs().sum() if not pos_m.empty and "market_value" in pos_m.columns else None
+    latest_metric = metrics_m.sort_values("evaluated_at_utc").tail(1) if not metrics_m.empty and "evaluated_at_utc" in metrics_m.columns else pd.DataFrame()
+    k = st.columns(7)
+    k[0].metric("Señales", len(sig_m))
+    k[1].metric("Propuestas", len(prop_m))
+    k[2].metric("Trades", len(trade_m) if not trade_m.empty else len(ord_m))
+    k[3].metric("Exposición", fmt_money(exposure))
+    k[4].metric("PnL realizado", fmt_money(realized))
+    k[5].metric("PnL abierto", fmt_money(unrealized))
+    k[6].metric("Return paper", fmt_pct(latest_metric.iloc[0].get("total_return") if not latest_metric.empty else None))
+
+    sub = st.tabs(["Resumen", "Predicciones/señales", "Propuestas/allocator", "Trades/posiciones", "Órdenes/fills", "Métricas"])
+    with sub[0]:
+        cols = [c for c in [
+            "model_id", "status", "acceptance_status", "symbol_scope", "timeframe", "training_scope",
+            "is_active", "training_ts_utc", "strategy_return", "excess_return", "max_drawdown",
+            "profit_factor", "trade_count", "sharpe", "f1_macro", "accuracy",
+        ] if c in row.columns]
+        show_colored_df(st, row[cols] if cols and not row.empty else row, height=150, pct_cols=["strategy_return", "excess_return", "max_drawdown"], pnl_cols=["strategy_return", "excess_return"], status_cols=["status", "acceptance_status"], empty="No hay fila de registry para este modelo.")
+        render_symbol_bot_matrix(st, row if not row.empty else registry[registry.get("model_id", pd.Series(dtype=str)).astype(str) == str(model_id)] if "model_id" in registry.columns else row, pos_m, ord_m)
+    with sub[1]:
+        pred_cols = [c for c in ["timestamp_utc", "symbol", "timeframe", "direction", "confidence", "expected_return_pct", "expected_adverse_move_pct", "horizon_bars", "signal_valid_until_utc"] if c in pred_m.columns]
+        show_colored_df(st, pred_m[pred_cols].head(80) if pred_cols and not pred_m.empty else pred_m.head(80), height=240, pct_cols=["expected_return_pct", "expected_adverse_move_pct"], pnl_cols=["expected_return_pct"], empty="No hay model_predictions para este modelo.")
+        sig_cols = [c for c in ["datetime_utc", "symbol", "timeframe", "account_mode", "signal", "confidence", "entry_price", "take_profit_price", "stop_loss_price", "risk_reward"] if c in sig_m.columns]
+        show_colored_df(st, sig_m[sig_cols].head(120) if sig_cols and not sig_m.empty else sig_m.head(120), height=260, money_cols=["entry_price", "take_profit_price", "stop_loss_price"], empty="No hay señales recientes.")
+    with sub[2]:
+        prop_cols = [c for c in ["created_at_utc", "proposal_id", "prediction_id", "symbol", "side", "confidence", "expected_return_pct", "expected_adverse_move_pct", "requested_notional_usdt", "proposal_score", "status", "rejection_reason"] if c in prop_m.columns]
+        show_colored_df(st, prop_m[prop_cols].head(120) if prop_cols and not prop_m.empty else prop_m.head(120), height=260, money_cols=["requested_notional_usdt"], pct_cols=["expected_return_pct", "expected_adverse_move_pct"], pnl_cols=["expected_return_pct"], status_cols=["status"], empty="No hay propuestas para este modelo.")
+        alloc_cols = [c for c in ["created_at_utc", "allocation_id", "proposal_id", "symbol", "decision", "requested_notional_usdt", "approved_notional_usdt", "allocator_score", "rejection_reason", "shadow_trade_id"] if c in alloc_m.columns]
+        show_colored_df(st, alloc_m[alloc_cols].head(120) if alloc_cols and not alloc_m.empty else alloc_m.head(120), height=240, money_cols=["requested_notional_usdt", "approved_notional_usdt"], status_cols=["decision"], empty="No hay decisiones de allocator para este modelo.")
+    with sub[3]:
+        show_colored_df(st, build_open_positions_view(pos_m, trade_m), height=280, money_cols=["avg_entry_price", "current_price", "market_value", "realized_pnl", "tp_price", "sl_price"], pct_cols=["pnl_pct", "exposure_pct", "dist_tp_pct", "dist_sl_pct"], pnl_cols=["unrealized_pnl", "realized_pnl", "pnl_pct"], empty="No hay posiciones abiertas para este modelo.")
+        trade_cols = [c for c in ["status", "trade_id", "proposal_id", "allocation_id", "symbol", "side", "approved_notional_usdt", "qty", "avg_entry_price", "tp_price", "sl_price", "unrealized_pnl_usdt", "realized_pnl_usdt", "exit_reason", "opened_at_utc", "updated_at_utc"] if c in trade_m.columns]
+        show_colored_df(st, trade_m[trade_cols].head(120) if trade_cols and not trade_m.empty else trade_m.head(120), height=260, money_cols=["approved_notional_usdt", "avg_entry_price", "tp_price", "sl_price"], pnl_cols=["unrealized_pnl_usdt", "realized_pnl_usdt"], status_cols=["status"], empty="No hay trades persistidos para este modelo.")
+    with sub[4]:
+        order_cols = [c for c in ["created_at_utc", "order_id", "trade_id", "proposal_id", "allocation_id", "symbol", "side", "type", "quantity", "fill_price", "status", "account_mode", "fees_usdt", "slippage_usdt", "reason"] if c in ord_m.columns]
+        show_colored_df(st, ord_m[order_cols].head(150) if order_cols and not ord_m.empty else ord_m.head(150), height=280, money_cols=["fill_price", "fees_usdt", "slippage_usdt"], status_cols=["status"], empty="No hay órdenes para este modelo.")
+        fill_cols = [c for c in ["timestamp_utc", "fill_id", "order_id", "trade_id", "proposal_id", "allocation_id", "symbol", "quantity", "price", "fee_usdt", "slippage_usdt", "account_mode"] if c in fill_m.columns]
+        show_colored_df(st, fill_m[fill_cols].head(150) if fill_cols and not fill_m.empty else fill_m.head(150), height=260, money_cols=["price", "fee_usdt", "slippage_usdt"], empty="No hay fills para este modelo.")
+    with sub[5]:
+        show_colored_df(st, metrics_m.head(80), height=260, money_cols=["realized_pnl", "unrealized_pnl", "total_pnl", "equity", "current_exposure"], pct_cols=["total_return", "max_drawdown", "win_rate"], pnl_cols=["realized_pnl", "unrealized_pnl", "total_pnl", "total_return"], status_cols=["validation_status"], empty="No hay paper_model_metrics para este modelo.")
+        perf_cols = [c for c in ["timestamp_utc", "symbol", "timeframe", "account_mode", "predictions", "proposals", "accepted_proposals", "rejected_proposals", "open_trades", "closed_trades", "realized_pnl_usdt", "unrealized_pnl_usdt", "total_return_pct", "max_drawdown_pct", "win_rate", "profit_factor", "degradation_status"] if c in perf_m.columns]
+        show_colored_df(st, perf_m[perf_cols].head(120) if perf_cols and not perf_m.empty else perf_m.head(120), height=260, money_cols=["realized_pnl_usdt", "unrealized_pnl_usdt"], pct_cols=["total_return_pct", "max_drawdown_pct", "win_rate"], pnl_cols=["realized_pnl_usdt", "unrealized_pnl_usdt", "total_return_pct"], status_cols=["degradation_status"], empty="No hay model_performance para este modelo.")
+
+
+def render_selected_model_simple(
+    st,
+    *,
+    model_id: str | None,
+    registry: pd.DataFrame,
+    signals: pd.DataFrame,
+    orders: pd.DataFrame,
+    fills: pd.DataFrame,
+    positions: pd.DataFrame,
+    trades: pd.DataFrame,
+    selected_symbols: list[str],
+    selected_accounts: list[str],
+) -> None:
+    """Simple model detail page: few sections, plain visible tables."""
+    if not model_id:
+        st.info("Selecciona un modelo en la pantalla principal.")
+        return
+    st.subheader(f"Modelo seleccionado: {model_id}")
+    apply_filter = st.toggle(
+        "Aplicar este modelo como filtro global",
+        value=bool(st.session_state.get("dashboard_apply_selected_model_filter", True)),
+        key="simple_selected_model_global_filter",
+    )
+    st.session_state["dashboard_apply_selected_model_filter"] = bool(apply_filter)
+    if st.button("Limpiar selección de modelo", use_container_width=False):
+        st.session_state.pop("dashboard_selected_model_id", None)
+        st.session_state["dashboard_apply_selected_model_filter"] = False
+        st.rerun()
+
+    sig_m = filter_model_context_df(signals, model_id, selected_symbols, selected_accounts)
+    ord_m = filter_model_context_df(orders, model_id, selected_symbols, selected_accounts)
+    fill_m = filter_model_context_df(fills, model_id, selected_symbols, selected_accounts)
+    pos_m = filter_model_context_df(positions, model_id, selected_symbols, selected_accounts)
+    trade_m = filter_model_context_df(trades, model_id, selected_symbols, selected_accounts)
+    row = registry[registry["model_id"].astype(str) == str(model_id)].head(1) if not registry.empty and "model_id" in registry.columns else pd.DataFrame()
+
+    realized = pd.to_numeric(pos_m.get("realized_pnl"), errors="coerce").sum() if not pos_m.empty and "realized_pnl" in pos_m.columns else 0
+    unrealized = pd.to_numeric(pos_m.get("unrealized_pnl"), errors="coerce").sum() if not pos_m.empty and "unrealized_pnl" in pos_m.columns else 0
+    exposure = pd.to_numeric(pos_m.get("market_value"), errors="coerce").abs().sum() if not pos_m.empty and "market_value" in pos_m.columns else 0
+    k = st.columns(6)
+    k[0].metric("Señales", len(sig_m))
+    k[1].metric("Órdenes", len(ord_m))
+    k[2].metric("Fills", len(fill_m))
+    k[3].metric("Posiciones", len(pos_m))
+    k[4].metric("Exposición", fmt_money(exposure))
+    k[5].metric("PnL abierto", fmt_money(unrealized))
+
+    st.markdown("#### Resumen")
+    reg_cols = [c for c in ["model_id", "status", "acceptance_status", "symbol_scope", "timeframe", "training_scope", "is_active", "strategy_return", "max_drawdown", "profit_factor", "trade_count"] if c in row.columns]
+    show_simple_df(st, row[reg_cols] if reg_cols and not row.empty else row, height=120, pct_cols=["strategy_return", "max_drawdown"])
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("#### Posiciones")
+        show_simple_df(
+            st,
+            build_open_positions_view(pos_m, trade_m),
+            height=260,
+            pct_cols=["pnl_pct", "exposure_pct", "dist_tp_pct", "dist_sl_pct"],
+            money_cols=["avg_entry_price", "current_price", "market_value", "realized_pnl"],
+            empty="Sin posiciones para este modelo.",
+        )
+    with c2:
+        st.markdown("#### Últimas señales")
+        sig_cols = [c for c in ["datetime_utc", "symbol", "timeframe", "account_mode", "signal", "confidence", "entry_price", "take_profit_price", "stop_loss_price"] if c in sig_m.columns]
+        show_simple_df(st, sig_m[sig_cols].head(50) if sig_cols and not sig_m.empty else sig_m.head(50), height=260, money_cols=["entry_price", "take_profit_price", "stop_loss_price"], empty="Sin señales para este modelo.")
+
+    c3, c4 = st.columns(2)
+    with c3:
+        st.markdown("#### Órdenes")
+        order_cols = [c for c in ["created_at_utc", "order_id", "symbol", "side", "quantity", "fill_price", "status", "account_mode", "reason"] if c in ord_m.columns]
+        show_simple_df(st, ord_m[order_cols].head(80) if order_cols and not ord_m.empty else ord_m.head(80), height=260, money_cols=["fill_price"], empty="Sin órdenes para este modelo.")
+    with c4:
+        st.markdown("#### Fills")
+        fill_cols = [c for c in ["timestamp_utc", "fill_id", "order_id", "symbol", "quantity", "price", "fee_usdt", "account_mode"] if c in fill_m.columns]
+        show_simple_df(st, fill_m[fill_cols].head(80) if fill_cols and not fill_m.empty else fill_m.head(80), height=260, money_cols=["price", "fee_usdt"], empty="Sin fills para este modelo.")
 
 
 def render_model_equity_matrix(st, snapshots: pd.DataFrame, *, key_prefix: str) -> None:
@@ -1019,24 +1644,53 @@ def main() -> None:
 
     with st.sidebar:
         st.divider()
-        st.subheader("Price chart")
+        st.subheader("Filtros")
         selected_symbols: list[str] = []
         selected_models: list[str] = []
         selected_accounts: list[str] = []
         selected_order_statuses: list[str] = []
         selected_signal_labels: list[str] = []
         symbol_options = all_symbols or ["BTCUSDT"]
-        symbol = st.selectbox("Primary symbol", symbol_options, index=0)
+        view_real_portfolio = st.toggle("Ver cartera real", value=False, help="OFF = demo/paper/testnet/local. ON = real/live si existen datos en SQLite.")
+        selected_accounts = choose_account_modes(all_accounts, view_real_portfolio)
+        account_label = "REAL" if view_real_portfolio else "DEMO / PAPER"
+        if view_real_portfolio and selected_accounts == ["__NO_REAL_ACCOUNT_MODE__"]:
+            st.warning("No hay datos de cartera real en SQLite para los filtros actuales.")
+        else:
+            st.caption(f"Vista cartera: {account_label}")
+        selected_symbols = st.multiselect("Símbolos", symbol_options, default=[], help="Vacío = todos los símbolos en tablas/KPIs.")
+        chart_symbol_options = selected_symbols or symbol_options
+        symbol = st.selectbox("Símbolo del gráfico", chart_symbol_options, index=0)
         timeframe = st.text_input("Timeframe", value=str(status.get("timeframe") or "1h"))
-        price_limit = st.slider("Price bars", 100, 3000, 800, 100)
+        price_limit = st.slider("Velas", 100, 3000, 800, 100)
         with st.expander("Advanced filters", expanded=False):
             selected_models = st.multiselect("Models", all_models, default=[], help="Empty = all models")
-            selected_symbols = st.multiselect("Symbols", all_symbols, default=[], help="Empty = all symbols")
-            selected_accounts = st.multiselect("Account modes", all_accounts, default=[], help="Empty = all account modes")
+            override_accounts = st.multiselect("Account modes override", all_accounts, default=[], help="Vacío = usa el switch real/demo")
+            if override_accounts:
+                selected_accounts = override_accounts
             selected_order_statuses = st.multiselect("Order statuses", all_statuses, default=[], help="Affects order charts/tables")
             selected_signal_labels = st.multiselect("Signal labels", all_signal_labels, default=[], help="Affects signal charts/tables")
             if selected_symbols and symbol not in selected_symbols:
                 st.caption("The chart symbol is independent from table filters.")
+
+    context_model_id = st.session_state.get("dashboard_selected_model_id")
+    if context_model_id:
+        with st.sidebar:
+            st.divider()
+            st.subheader("Modelo clicado")
+            st.code(str(context_model_id), language=None)
+            st.checkbox(
+                "Aplicar modelo clicado a todo",
+                value=bool(st.session_state.get("dashboard_apply_selected_model_filter", True)),
+                key="dashboard_apply_selected_model_filter",
+                help="Cuando está activo, todas las tablas con model_id se filtran por el modelo seleccionado.",
+            )
+            if st.button("Quitar modelo clicado", use_container_width=True):
+                st.session_state.pop("dashboard_selected_model_id", None)
+                st.session_state["dashboard_apply_selected_model_filter"] = False
+                st.rerun()
+    if context_model_id and st.session_state.get("dashboard_apply_selected_model_filter", True):
+        selected_models = [str(context_model_id)]
 
     signals_f = apply_selection_filters(signals, model_ids=selected_models, symbols=selected_symbols, account_modes=selected_accounts, signal_labels=selected_signal_labels)
     orders_f = apply_selection_filters(orders, model_ids=selected_models, symbols=selected_symbols, account_modes=selected_accounts, statuses=selected_order_statuses)
@@ -1044,129 +1698,106 @@ def main() -> None:
     fills_f = apply_selection_filters(fills, model_ids=selected_models, symbols=selected_symbols, account_modes=selected_accounts)
     snapshots_f = apply_selection_filters(snapshots, model_ids=selected_models, account_modes=selected_accounts)
     registry_f = apply_selection_filters(registry, model_ids=selected_models)
+    trades_all = data.read_table("trades", 1000, "created_at_utc")
+    trades_f = apply_selection_filters(trades_all, model_ids=selected_models, symbols=selected_symbols, account_modes=selected_accounts)
+    if selected_accounts == ["__NO_REAL_ACCOUNT_MODE__"]:
+        view_summary = {
+            "total_equity": None, "cash_usdt": None, "invested_value": None, "total_pnl": None,
+            "daily_pnl": None, "total_return": None, "daily_return": None, "exposure_pct": None,
+            "max_drawdown": None, "source": "no_real_account_data",
+        }
+    else:
+        view_summary = calculate_portfolio_view_summary(snapshots_f, positions_f, summary)
+    coverage_f = apply_selection_filters(coverage, symbols=selected_symbols)
+    gaps_f = apply_selection_filters(gaps, symbols=selected_symbols)
     filtered_equity = build_equity_curve_from_snapshots(snapshots_f)
-    if filtered_equity.empty and not (selected_models or selected_accounts):
+    if filtered_equity.empty and not selected_models and not view_real_portfolio:
         filtered_equity = data.load_equity_curve()
 
-    tabs = st.tabs(["Control", "Portfolio", "Models", "Proposals / Trades", "Safety / Sync", "Data / Logs"])
+    tabs = st.tabs(["Principal", "Posiciones", "Modelo", "Sistema", "Control"])
 
     with tabs[0]:
-        render_compact_kpis(st, summary, status, registry_f, positions_f, gaps)
-        render_price_signals(st, symbol, timeframe, data.load_price_series(symbol, timeframe, price_limit), signals_f, orders_f, key_prefix="control")
-        render_simple_control_panel(st, status, requested_by)
-        c1, c2 = st.columns([1, 1])
-        with c1:
-            st.subheader("Recent signals")
-            sig_cols = [c for c in ["datetime_utc", "symbol", "model_id", "signal", "confidence"] if c in signals_f.columns]
-            show_df(st, signals_f[sig_cols].head(12) if sig_cols and not signals_f.empty else signals_f.head(12), height=260, empty="No recent signals.")
-        with c2:
-            st.subheader("Recent orders")
-            ord_cols = [c for c in ["created_at_utc", "symbol", "side", "quantity", "status", "dry_run", "account_mode", "model_id"] if c in orders_f.columns]
-            show_df(st, orders_f[ord_cols].head(12) if ord_cols and not orders_f.empty else orders_f.head(12), height=260, empty="No recent orders.")
-        render_symbol_bot_matrix(st, merge_model_controls(registry_f, model_control), positions_f, orders_f)
+        render_portfolio_position_header(st, view_summary, account_label)
+        render_price_signals(
+            st,
+            symbol,
+            timeframe,
+            data.load_price_series(symbol, timeframe, price_limit),
+            signals_f,
+            orders_f,
+            positions_f,
+            key_prefix="principal",
+        )
+        selected_model_id = render_main_models_table(st, registry_f, model_control, requested_by, selected_models)
+        st.caption("Vista simplificada: cartera, gr?fico y modelos. Usa las pesta?as para detalle.")
 
     with tabs[1]:
-        c1, c2 = st.columns([1.5, 1])
-        with c1:
-            render_equity(st, filtered_equity, key_prefix="simple_portfolio")
-        with c2:
-            render_exposure(st, data.load_exposure_breakdown(), key_prefix="simple_portfolio")
-            render_trade_pnl(st, data.load_trade_pnl(), key_prefix="simple_portfolio")
-        st.subheader("Positions")
-        pos_preferred = [c for c in ["symbol", "quantity", "avg_entry_price", "current_price", "market_value", "unrealized_pnl", "realized_pnl", "exposure_pct", "model_id", "account_mode", "updated_at_utc"] if c in positions_f.columns]
-        show_df(st, positions_f[pos_preferred] if pos_preferred else positions_f, height=360, empty="No open/current positions.")
+        st.subheader("Posiciones abiertas")
+        positions_view = build_open_positions_view(positions_f, trades_f)
+        show_simple_df(
+            st,
+            positions_view,
+            height=420,
+            pct_cols=["pnl_pct", "exposure_pct", "dist_tp_pct", "dist_sl_pct"],
+            money_cols=["avg_entry_price", "current_price", "market_value", "realized_pnl", "tp_price", "sl_price"],
+            empty="No hay posiciones abiertas para la vista seleccionada.",
+        )
+        c_pos1, c_pos2 = st.columns([1.4, 1])
+        with c_pos1:
+            render_equity(st, filtered_equity, key_prefix="positions_simple")
+        with c_pos2:
+            render_exposure(st, build_filtered_exposure_breakdown(positions_f, view_summary), key_prefix="positions_simple")
 
     with tabs[2]:
-        render_models_tab(st, registry_f, model_control, requested_by, selected_models)
+        model_for_detail = st.session_state.get("dashboard_selected_model_id")
+        if not model_for_detail and not registry_f.empty and "model_id" in registry_f.columns:
+            model_for_detail = str(registry_f.iloc[0].get("model_id"))
+        render_selected_model_simple(
+            st,
+            model_id=model_for_detail,
+            registry=registry,
+            signals=signals,
+            orders=orders,
+            fills=fills,
+            positions=positions,
+            trades=trades_all,
+            selected_symbols=selected_symbols,
+            selected_accounts=selected_accounts,
+        )
 
     with tabs[3]:
-        st.subheader("Independent model trade proposals")
-        proposals = data.read_table("trade_proposals", 500, "created_at_utc")
-        prop_cols = [c for c in [
-            "created_at_utc", "proposal_id", "prediction_id", "model_id", "symbol", "side",
-            "confidence", "expected_return_pct", "expected_adverse_move_pct",
-            "requested_notional_usdt", "proposal_score", "status", "rejection_reason",
-        ] if c in proposals.columns]
-        show_df(st, proposals[prop_cols] if prop_cols and not proposals.empty else proposals, height=330, empty="No trade proposals persisted yet.")
-
-        c1, c2 = st.columns([1, 1])
+        st.subheader("Sistema y relaciones")
+        c1, c2 = st.columns(2)
         with c1:
-            st.subheader("Allocator decisions")
-            allocations = data.read_table("allocations", 500, "created_at_utc")
-            alloc_cols = [c for c in [
-                "created_at_utc", "allocation_id", "proposal_id", "model_id", "symbol",
-                "decision", "requested_notional_usdt", "approved_notional_usdt",
-                "allocator_score", "rejection_reason", "shadow_trade_id",
-            ] if c in allocations.columns]
-            show_df(st, allocations[alloc_cols] if alloc_cols and not allocations.empty else allocations, height=320, empty="No allocator decisions.")
+            st.markdown("#### Datos")
+            show_simple_df(st, coverage_f, height=220, empty="No coverage rows.")
+            show_simple_df(st, gaps_f, height=220, empty="No open gaps.")
         with c2:
-            st.subheader("Open trades and exits")
-            trades = data.read_table("trades", 500, "created_at_utc")
-            trade_cols = [c for c in [
-                "status", "trade_id", "model_id", "symbol", "side", "approved_notional_usdt",
-                "qty", "avg_entry_price", "tp_price", "sl_price", "emergency_sl_price",
-                "unrealized_pnl_usdt", "realized_pnl_usdt", "exit_reason", "account_mode",
-                "opened_at_utc", "updated_at_utc",
-            ] if c in trades.columns]
-            show_df(st, trades[trade_cols] if trade_cols and not trades.empty else trades, height=320, empty="No trades.")
-
-        c3, c4 = st.columns([1, 1])
-        with c3:
-            st.subheader("Orders with model/trade attribution")
-            order_cols = [c for c in [
-                "created_at_utc", "order_id", "trade_id", "model_id", "symbol", "side",
-                "type", "quantity", "price_filled", "status", "account_mode",
-                "fees_usdt", "slippage_usdt", "reason",
-            ] if c in orders_f.columns]
-            show_df(st, orders_f[order_cols].head(200) if order_cols and not orders_f.empty else orders_f.head(200), height=300, empty="No orders.")
-        with c4:
-            st.subheader("Fills with full attribution")
-            fill_cols = [c for c in [
-                "timestamp_utc", "fill_id", "order_id", "trade_id", "model_id", "symbol",
-                "quantity", "price", "fee_usdt", "slippage_usdt", "account_mode",
-            ] if c in fills_f.columns]
-            show_df(st, fills_f[fill_cols].head(200) if fill_cols and not fills_f.empty else fills_f.head(200), height=300, empty="No fills.")
-
-        st.subheader("Shadow trade analytics")
-        shadows = data.read_table("shadow_trades", 500, "created_at_utc")
-        shadow_cols = [c for c in [
-            "created_at_utc", "shadow_trade_id", "proposal_id", "model_id", "symbol",
-            "status", "requested_notional_usdt", "entry_reference_price", "tp_price",
-            "sl_price", "reason", "outcome_pnl_usdt",
-        ] if c in shadows.columns]
-        show_df(st, shadows[shadow_cols] if shadow_cols and not shadows.empty else shadows, height=260, empty="No shadow trades.")
+            st.markdown("#### Seguridad")
+            risk_events = apply_selection_filters(
+                data.read_table("risk_events", 300, "created_at_utc"),
+                model_ids=selected_models,
+                symbols=selected_symbols,
+                account_modes=selected_accounts,
+            )
+            show_simple_df(st, risk_events, height=220, empty="No risk events.")
+            relationship_issues = apply_selection_filters(data.load_relationship_issues(500), model_ids=selected_models, symbols=selected_symbols)
+            if relationship_issues.empty:
+                st.success("Relaciones OK: no hay errores model/order/proposal/trade en la vista actual.")
+            else:
+                st.warning(f"{len(relationship_issues)} relaciones rotas detectadas.")
+                show_simple_df(st, relationship_issues, height=220)
+        with st.expander("Sincronizaci?n Binance / cuenta", expanded=False):
+            account_snapshots = apply_selection_filters(data.read_table("account_snapshots", 100, "created_at_utc"), account_modes=selected_accounts)
+            balance_snapshots = apply_selection_filters(data.read_table("balance_snapshots", 200, "timestamp_utc"), account_modes=selected_accounts)
+            reconciliation_events = apply_selection_filters(data.read_table("reconciliation_events", 200, "created_at_utc"), account_modes=selected_accounts)
+            show_simple_df(st, account_snapshots, height=180, empty="No account snapshots.")
+            show_simple_df(st, balance_snapshots, height=180, empty="No balance snapshots.")
+            show_simple_df(st, reconciliation_events, height=180, empty="No reconciliation events.")
 
     with tabs[4]:
-        c1, c2 = st.columns([1, 1])
-        with c1:
-            st.subheader("Binance/account synchronization")
-            show_df(st, data.read_table("account_snapshots", 100, "created_at_utc"), height=280, empty="No account snapshots.")
-            st.subheader("Balance snapshots")
-            show_df(st, data.read_table("balance_snapshots", 200, "timestamp_utc"), height=280, empty="No balance snapshots.")
-        with c2:
-            st.subheader("Reconciliation events")
-            show_df(st, data.read_table("reconciliation_events", 200, "created_at_utc"), height=280, empty="No reconciliation events.")
-            st.subheader("System status")
-            show_df(st, data.read_table("system_status", 100, "updated_at_utc"), height=280, empty="No system status rows.")
-        st.subheader("Safety and risk events")
-        show_df(st, data.read_table("risk_events", 300, "created_at_utc"), height=300, empty="No risk events.")
-
-    with tabs[5]:
-        c1, c2 = st.columns([1, 1])
-        with c1:
-            st.subheader("Data quality")
-            show_df(st, coverage, height=260, empty="No coverage rows.")
-            st.subheader("Open gaps")
-            show_df(st, gaps, height=260, empty="No open gaps.")
-            st.subheader("Ingestion log")
-            show_df(st, data.read_table("ingestion_log", 200, "loaded_at_utc"), height=240, empty="No ingestion log.")
-        with c2:
-            st.subheader("Risk events")
-            show_df(st, data.read_table("risk_events", 200, "created_at_utc"), height=260, empty="No risk events.")
-            st.subheader("Critical logs")
-            show_df(st, data.load_recent_logs(120), height=520, empty="No warning/error/rejection logs found.")
-        st.subheader("Runtime configuration")
-        render_configuration_tab(st, requested_by)
+        render_compact_kpis(st, view_summary, status, registry_f, positions_f, gaps_f)
+        render_simple_control_panel(st, status, requested_by)
 
 
 if __name__ == "__main__":

@@ -93,6 +93,16 @@ def evaluate_model_acceptance(
     if criteria.require_oos_for_acceptance and not oos_available:
         rejection_reasons.append("missing_oos_evidence")
 
+    lifecycle = (
+        _nested_get(backtest_oos, ["trade_lifecycle", "metrics"])
+        or _nested_get(walk_forward, ["trade_lifecycle", "metrics"])
+        or _nested_get(holdout, ["trade_lifecycle", "metrics"])
+        or {}
+    )
+    lifecycle_available = isinstance(lifecycle, dict) and bool(lifecycle)
+    if not lifecycle_available:
+        rejection_reasons.append("missing_trade_lifecycle_evaluation")
+
     # Classification scope preference: walk-forward > holdout.
     cls_accuracy = _to_float(
         _nested_get(walk_forward, ["classification", "overall_accuracy"])
@@ -103,53 +113,25 @@ def evaluate_model_acceptance(
         or _nested_get(holdout, ["classification", "f1_macro"])
     )
 
-    # Economic scope preference: OOS backtest > walk-forward > holdout.
-    econ_strategy_return = _to_float(
-        _nested_get(backtest_oos, ["economic", "strategy_return"])
-        or _nested_get(walk_forward, ["economic", "overall_strategy_return"])
-        or _nested_get(holdout, ["economic", "strategy_return"])
-    )
-    econ_buy_hold = _to_float(
-        _nested_get(backtest_oos, ["economic", "buy_hold_return"])
-        or _nested_get(walk_forward, ["economic", "overall_buy_hold_return"])
-        or _nested_get(holdout, ["economic", "buy_hold_return"])
-    )
-    econ_sharpe = _to_float(
-        _nested_get(backtest_oos, ["economic", "sharpe"])
-        or _nested_get(walk_forward, ["economic", "overall_sharpe"])
-        or _nested_get(holdout, ["economic", "sharpe"])
-    )
-    econ_drawdown = _to_float(
-        _nested_get(backtest_oos, ["economic", "max_drawdown"])
-        or _nested_get(walk_forward, ["economic", "overall_max_drawdown"])
-        or _nested_get(holdout, ["economic", "max_drawdown"])
-    )
-    econ_pf = _to_float(
-        _nested_get(backtest_oos, ["economic", "profit_factor"])
-        or _nested_get(walk_forward, ["economic", "overall_profit_factor"])
-        or _nested_get(holdout, ["economic", "profit_factor"])
-    )
-    econ_trades = _to_int(
-        _nested_get(backtest_oos, ["economic", "trade_count"])
-        or _nested_get(walk_forward, ["economic", "overall_trade_count"])
-        or _nested_get(holdout, ["economic", "trade_count"])
-    )
+    # Acceptance economics must come from the full trade lifecycle simulator:
+    # prediction -> proposal -> allocator -> risk -> trade_builder ->
+    # historical fills -> virtual exits -> ledger PnL. Legacy one-bar
+    # fwd_return_1 metrics are no longer valid acceptance evidence.
+    lifecycle_return = lifecycle.get("total_return") if lifecycle.get("total_return") is not None else lifecycle.get("strategy_return")
+    econ_strategy_return = _to_float(lifecycle_return)
+    econ_buy_hold = _to_float(lifecycle.get("buy_hold_return"))
+    econ_sharpe = _to_float(lifecycle.get("sharpe"))
+    econ_drawdown = _to_float(lifecycle.get("max_drawdown"))
+    econ_pf = _to_float(lifecycle.get("profit_factor"))
+    econ_trades = _to_int(lifecycle.get("trade_count"))
 
-    if cls_accuracy is None:
-        rejection_reasons.append("missing_accuracy_metric")
-    else:
+    if cls_accuracy is not None:
         passed = cls_accuracy >= criteria.min_acceptable_accuracy
-        _record_check(checks, "accuracy", "classification", cls_accuracy, criteria.min_acceptable_accuracy, passed, ">=")
-        if not passed:
-            rejection_reasons.append("accuracy_below_threshold")
+        _record_check(checks, "accuracy_diagnostic_only", "classification", cls_accuracy, criteria.min_acceptable_accuracy, passed, ">=")
 
-    if cls_f1 is None:
-        rejection_reasons.append("missing_f1_metric")
-    else:
+    if cls_f1 is not None:
         passed = cls_f1 >= criteria.min_acceptable_f1_macro
-        _record_check(checks, "f1_macro", "classification", cls_f1, criteria.min_acceptable_f1_macro, passed, ">=")
-        if not passed:
-            rejection_reasons.append("f1_macro_below_threshold")
+        _record_check(checks, "f1_macro_diagnostic_only", "classification", cls_f1, criteria.min_acceptable_f1_macro, passed, ">=")
 
     if econ_strategy_return is None:
         rejection_reasons.append("missing_strategy_return_metric")
@@ -158,7 +140,7 @@ def evaluate_model_acceptance(
         _record_check(
             checks,
             "strategy_return",
-            "economic",
+            "trade_lifecycle",
             econ_strategy_return,
             criteria.min_acceptable_strategy_return,
             passed,
@@ -171,7 +153,7 @@ def evaluate_model_acceptance(
         rejection_reasons.append("missing_sharpe_metric")
     else:
         passed = econ_sharpe >= criteria.min_acceptable_sharpe
-        _record_check(checks, "sharpe", "economic", econ_sharpe, criteria.min_acceptable_sharpe, passed, ">=")
+        _record_check(checks, "sharpe", "trade_lifecycle", econ_sharpe, criteria.min_acceptable_sharpe, passed, ">=")
         if not passed:
             rejection_reasons.append("sharpe_below_threshold")
 
@@ -182,7 +164,7 @@ def evaluate_model_acceptance(
         _record_check(
             checks,
             "profit_factor",
-            "economic",
+            "trade_lifecycle",
             econ_pf,
             criteria.min_acceptable_profit_factor,
             passed,
@@ -199,7 +181,7 @@ def evaluate_model_acceptance(
         _record_check(
             checks,
             "max_drawdown_abs",
-            "economic",
+            "trade_lifecycle",
             drawdown_abs,
             criteria.max_acceptable_drawdown,
             passed,
@@ -212,7 +194,7 @@ def evaluate_model_acceptance(
         rejection_reasons.append("missing_trade_count_metric")
     else:
         passed = econ_trades >= criteria.min_acceptable_trades
-        _record_check(checks, "trade_count", "economic", econ_trades, criteria.min_acceptable_trades, passed, ">=")
+        _record_check(checks, "trade_count", "trade_lifecycle", econ_trades, criteria.min_acceptable_trades, passed, ">=")
         if not passed:
             rejection_reasons.append("trade_count_below_threshold")
 
@@ -224,7 +206,7 @@ def evaluate_model_acceptance(
             _record_check(
                 checks,
                 "outperform_baseline",
-                "economic",
+                "trade_lifecycle",
                 econ_strategy_return - econ_buy_hold,
                 0.0,
                 passed,
@@ -233,10 +215,11 @@ def evaluate_model_acceptance(
             if not passed:
                 rejection_reasons.append("underperform_baseline")
 
-    holdout_return = _to_float(_nested_get(holdout, ["economic", "strategy_return"]))
+    holdout_return = _to_float(_nested_get(holdout, ["trade_lifecycle", "metrics", "total_return"]))
+    backtest_lifecycle_return = _nested_get(backtest_oos, ["trade_lifecycle", "metrics", "total_return"])
+    walk_forward_lifecycle_return = _nested_get(walk_forward, ["trade_lifecycle", "metrics", "total_return"])
     oos_return = _to_float(
-        _nested_get(backtest_oos, ["economic", "strategy_return"])
-        or _nested_get(walk_forward, ["economic", "overall_strategy_return"])
+        backtest_lifecycle_return if backtest_lifecycle_return is not None else walk_forward_lifecycle_return
     )
     if holdout_return is not None and oos_return is not None:
         drift = abs(holdout_return - oos_return)
@@ -285,6 +268,7 @@ def evaluate_model_acceptance(
                 ("holdout", bool(holdout)),
                 ("walk_forward", bool(walk_forward)),
                 ("backtest_oos", bool(backtest_oos)),
+                ("trade_lifecycle", lifecycle_available),
             ]
             if present
         ),

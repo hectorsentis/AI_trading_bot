@@ -77,8 +77,19 @@ class CapitalAllocator:
             "counts_by_symbol": counts_by_symbol,
         }
 
-    def allocate(self, proposal: TradeProposal) -> dict:
-        now = pd.Timestamp.now(tz="UTC")
+    def allocate(self, proposal: TradeProposal, evaluation_timestamp_utc: str | None = None) -> dict:
+        """Evaluate one model-owned proposal against the shared capital pool.
+
+        ``evaluation_timestamp_utc`` is optional and defaults to wall-clock time
+        for paper/live operation. Historical simulation passes the candle time so
+        signal-validity checks use the same semantics without rejecting old OOS
+        predictions merely because they are in the past today.
+        """
+        now = pd.Timestamp(evaluation_timestamp_utc) if evaluation_timestamp_utc else pd.Timestamp.now(tz="UTC")
+        if now.tzinfo is None:
+            now = now.tz_localize("UTC")
+        else:
+            now = now.tz_convert("UTC")
         reasons: list[str] = []
         decision = "ACCEPT"
         approved_notional = min(float(proposal.requested_notional_usdt), float(MAX_ORDER_NOTIONAL_USDT))

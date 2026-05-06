@@ -75,6 +75,17 @@ ALLOWED_TABLES = {
     "positions",
     "portfolio_snapshots",
     "paper_model_metrics",
+    "model_predictions",
+    "model_performance",
+    "trade_proposals",
+    "allocations",
+    "trades",
+    "shadow_trades",
+    "shadow_trade_events",
+    "account_snapshots",
+    "balance_snapshots",
+    "reconciliation_events",
+    "system_status",
     "model_lifecycle_events",
     "bot_events",
     "bot_status",
@@ -83,8 +94,12 @@ ALLOWED_TABLES = {
     "validation_predictions",
     "bot_control_actions",
     "model_control",
+    "model_aliases",
     "runtime_config",
     "runtime_config_audit",
+    "dashboard_model_activity",
+    "dashboard_trade_lineage",
+    "dashboard_relationship_issues",
 }
 
 DB_PATH = Path(DB_FILE).expanduser()
@@ -143,7 +158,7 @@ def list_tables() -> list[str]:
         return []
     try:
         with get_db_connection() as conn:
-            rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall()
+            rows = conn.execute("SELECT name FROM sqlite_master WHERE type IN ('table','view') ORDER BY name").fetchall()
         return [str(r[0]) for r in rows]
     except Exception:
         return []
@@ -485,12 +500,20 @@ def load_model_control() -> pd.DataFrame:
     return _num(read_table("model_control", 5000, "updated_at_utc"), ["signal_enabled", "paper_enabled", "live_enabled"])
 
 
+def load_model_aliases() -> pd.DataFrame:
+    return read_table("model_aliases", 5000, "alias_model_id", descending=False)
+
+
 def load_runtime_config() -> pd.DataFrame:
     return read_table("runtime_config", 5000, "key", descending=False)
 
 
 def load_control_actions(limit: int = 500) -> pd.DataFrame:
     return read_table("bot_control_actions", limit, "requested_at_utc")
+
+
+def load_relationship_issues(limit: int = 500) -> pd.DataFrame:
+    return read_table("dashboard_relationship_issues", limit)
 
 
 def load_portfolio_summary() -> dict[str, Any]:

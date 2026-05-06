@@ -37,6 +37,7 @@ from modeling_utils import (
 )
 from strategy_evaluator import evaluate_model_acceptance
 from temporal_utils import apply_label_embargo_cutoff
+from historical_trade_simulator import load_market_ohlc, run_historical_trade_lifecycle
 
 
 def parse_args():
@@ -99,6 +100,7 @@ def load_dataset(symbols: list[str], timeframe: str) -> pd.DataFrame:
                 symbol,
                 timeframe,
                 datetime_utc,
+                close,
                 fwd_return_1,
                 label_class,
                 {", ".join(FEATURE_COLUMNS)}
@@ -118,10 +120,11 @@ def load_dataset(symbols: list[str], timeframe: str) -> pd.DataFrame:
     df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True, errors="coerce")
     df["label_class"] = pd.to_numeric(df["label_class"], errors="coerce")
     df["fwd_return_1"] = pd.to_numeric(df["fwd_return_1"], errors="coerce")
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
     for col in FEATURE_COLUMNS:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df = df.dropna(subset=["datetime_utc", "label_class", "fwd_return_1"] + FEATURE_COLUMNS).copy()
+    df = df.dropna(subset=["datetime_utc", "label_class", "fwd_return_1", "close"] + FEATURE_COLUMNS).copy()
     df["label_class"] = df["label_class"].astype(int)
     df = df.sort_values(["datetime_utc", "symbol"]).reset_index(drop=True)
     return df
@@ -301,7 +304,7 @@ def main():
             }
         )
 
-        pred_frame = test_df[["symbol", "timeframe", "datetime_utc", "fwd_return_1", "label_class"]].copy()
+        pred_frame = test_df[["symbol", "timeframe", "datetime_utc", "close", "fwd_return_1", "label_class"]].copy()
         pred_frame["fold_id"] = fold_id
         pred_frame["pred_class"] = y_pred
         pred_frame["signal_position"] = signal_position
@@ -386,7 +389,9 @@ def main():
             "fold_f1_mean": float(folds_df["f1_macro"].mean()),
             "fold_f1_median": float(folds_df["f1_macro"].median()),
         },
-        "economic": {
+        "diagnostic_fwd_return_1_economic": {
+            "diagnostic_only": True,
+            "note": "One-bar fwd_return_1 signal metrics are retained for diagnostics only; acceptance uses trade_lifecycle metrics.",
             "overall_strategy_return": overall_econ.strategy_return,
             "overall_buy_hold_return": overall_econ.buy_hold_return,
             "overall_sharpe": overall_econ.sharpe,
@@ -414,6 +419,48 @@ def main():
     summary["db_persistence"] = {
         "validation_predictions_rows_written": persisted_count,
     }
+
+    market_df = load_market_ohlc(
+        timeframe=args.timeframe,
+        symbols=sorted(predictions_df["symbol"].unique().tolist()),
+        start_datetime_utc=predictions_df["datetime_utc"].min().isoformat(),
+        end_datetime_utc=None,
+    )
+    if market_df.empty:
+        summary["trade_lifecycle"] = {
+            "available": False,
+            "error": "missing_ohlc_market_data_for_historical_trade_lifecycle",
+            "metrics": {
+                "trade_count": 0,
+                "profit_factor": 0.0,
+                "max_drawdown": 0.0,
+                "win_rate": 0.0,
+                "expectancy_usdt": 0.0,
+                "realized_pnl_usdt": 0.0,
+                "total_return": 0.0,
+            },
+        }
+    else:
+        lifecycle_result = run_historical_trade_lifecycle(
+            predictions_df=predictions_df[
+                [
+                    "symbol",
+                    "timeframe",
+                    "datetime_utc",
+                    "prob_short",
+                    "prob_flat",
+                    "prob_long",
+                    "signal_position",
+                    "fold_id",
+                ]
+            ].assign(model_id=model_id, validation_run_id=validation_run_id),
+            market_df=market_df,
+            model_id=model_id,
+            timeframe=args.timeframe,
+            simulation_run_id=f"{validation_run_id}_trade_lifecycle_{stamp}",
+            persist_artifacts=True,
+        )
+        summary["trade_lifecycle"] = lifecycle_result.to_summary()
 
     holdout_metrics = {}
     if model_entry and isinstance(model_entry.get("metrics_json"), dict):

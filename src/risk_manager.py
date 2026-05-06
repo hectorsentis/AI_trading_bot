@@ -26,6 +26,7 @@ from config import (
     MAX_SYMBOL_EXPOSURE_USDT,
     MAX_MODEL_OPEN_EXPOSURE_USDT,
     MAX_TRADE_LOSS_USDT,
+    MAX_TRADES_PER_DAY_PER_MODEL,
     MIN_CASH_RESERVE_USDT,
     STALE_DATA_MAX_SECONDS,
     RECONCILIATION_REQUIRED,
@@ -78,8 +79,19 @@ class RiskManager:
         unsigned_qty = quote_size / float(price)
         return self.round_quantity(unsigned_qty)
 
-    def _trades_today(self, symbol: str | None = None, model_id: str | None = None, account_mode: str | None = None) -> int:
-        today_start = pd.Timestamp.now(tz="UTC").floor("D").isoformat()
+    def _trades_today(
+        self,
+        symbol: str | None = None,
+        model_id: str | None = None,
+        account_mode: str | None = None,
+        now_utc: str | pd.Timestamp | None = None,
+    ) -> int:
+        now = pd.Timestamp(now_utc) if now_utc is not None else pd.Timestamp.now(tz="UTC")
+        if now.tzinfo is None:
+            now = now.tz_localize("UTC")
+        else:
+            now = now.tz_convert("UTC")
+        today_start = now.floor("D").isoformat()
         conn = sqlite3.connect(DB_FILE)
         try:
             where = ["created_at_utc >= ?", "status = 'FILLED'"]
@@ -220,7 +232,13 @@ class RiskManager:
         self._log_risk_event(symbol=symbol, approved=approved, reasons=reasons, details=result)
         return result
 
-    def validate_trade_plan(self, built_trade, portfolio_state, latest_market_timestamp_utc: str | None = None) -> dict:
+    def validate_trade_plan(
+        self,
+        built_trade,
+        portfolio_state,
+        latest_market_timestamp_utc: str | None = None,
+        evaluation_timestamp_utc: str | pd.Timestamp | None = None,
+    ) -> dict:
         """Hard gate for accepted proposal trade plans.
 
         This complements legacy signal-order validation by checking model-owned
@@ -266,6 +284,15 @@ class RiskManager:
                 reasons.append("stale_market_data_blocks_live_entry")
         elif self.account_mode == ACCOUNT_MODE_REAL:
             reasons.append("missing_market_timestamp_blocks_live_entry")
+
+        trades_today = self._trades_today(
+            symbol=symbol,
+            model_id=built_trade.model_id,
+            account_mode=self.account_mode,
+            now_utc=evaluation_timestamp_utc,
+        )
+        if trades_today >= int(MAX_TRADES_PER_DAY_PER_MODEL):
+            reasons.append("max_trades_per_day_per_model_reached")
 
         conn = sqlite3.connect(DB_FILE)
         try:

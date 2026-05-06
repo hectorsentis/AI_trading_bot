@@ -89,7 +89,12 @@ def _eligible_existing_accepted(timeframe: str, training_scope: str | None = Non
     models = []
     for model in list_accepted_models(timeframe=timeframe, training_scope=training_scope, symbols=symbols):
         path = Path(str(model.get("model_path", "")))
-        if path.exists():
+        metrics = model.get("metrics_json") if isinstance(model.get("metrics_json"), dict) else {}
+        has_lifecycle = bool(
+            metrics.get("backtest_oos", {}).get("trade_lifecycle", {}).get("metrics")
+            or metrics.get("walk_forward", {}).get("trade_lifecycle", {}).get("metrics")
+        )
+        if path.exists() and has_lifecycle:
             models.append(model)
     return models
 

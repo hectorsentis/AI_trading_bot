@@ -28,6 +28,7 @@ from model_registry import (
 )
 from modeling_utils import POSITION_TO_NAME, compute_economic_metrics, probabilities_to_signal
 from strategy_evaluator import evaluate_model_acceptance
+from historical_trade_simulator import load_market_ohlc, run_historical_trade_lifecycle
 
 
 def parse_args():
@@ -288,7 +289,9 @@ def _run_in_sample(args) -> dict:
         "start_datetime_utc": merged_result["datetime_utc"].min().isoformat(),
         "end_datetime_utc": merged_result["datetime_utc"].max().isoformat(),
         "rows": int(len(merged_result)),
-        "economic": {
+        "diagnostic_fwd_return_1_economic": {
+            "diagnostic_only": True,
+            "note": "One-bar fwd_return_1 signal metrics are diagnostics only; model acceptance uses trade_lifecycle metrics.",
             "strategy_return": econ.strategy_return,
             "buy_hold_return": econ.buy_hold_return,
             "sharpe": econ.sharpe,
@@ -304,8 +307,33 @@ def _run_in_sample(args) -> dict:
             "equity_csv": str(curve_path),
         },
     }
-    summary_path.write_text(json.dumps(summary, ensure_ascii=True, indent=2), encoding="utf-8")
+    market_df = load_market_ohlc(
+        timeframe=args.timeframe,
+        symbols=sorted(merged_result["symbol"].unique().tolist()),
+        start_datetime_utc=merged_result["datetime_utc"].min().isoformat(),
+        end_datetime_utc=None,
+    )
+    if market_df.empty:
+        summary["trade_lifecycle"] = {
+            "available": False,
+            "error": "missing_ohlc_market_data_for_historical_trade_lifecycle",
+            "metrics": {"trade_count": 0, "profit_factor": 0.0, "max_drawdown": 0.0, "total_return": 0.0},
+        }
+    else:
+        lifecycle_result = run_historical_trade_lifecycle(
+            predictions_df=merged_result[
+                ["symbol", "timeframe", "datetime_utc", "prob_short", "prob_flat", "prob_long", "signal_position"]
+            ].assign(model_id=model_id, validation_run_id=None, fold_id=0),
+            market_df=market_df,
+            model_id=model_id,
+            timeframe=args.timeframe,
+            simulation_run_id=f"insample_{model_id}_{stamp}",
+            persist_artifacts=True,
+        )
+        summary["trade_lifecycle"] = lifecycle_result.to_summary()
+
     summary["summary_path"] = str(summary_path)
+    summary_path.write_text(json.dumps(summary, ensure_ascii=True, indent=2), encoding="utf-8")
     return summary
 
 
@@ -411,7 +439,9 @@ def _run_oos(args) -> dict:
         "classification": {
             "accuracy": accuracy,
         },
-        "economic": {
+        "diagnostic_fwd_return_1_economic": {
+            "diagnostic_only": True,
+            "note": "One-bar fwd_return_1 signal metrics are diagnostics only; model acceptance uses trade_lifecycle metrics.",
             "strategy_return": econ.strategy_return,
             "buy_hold_return": econ.buy_hold_return,
             "sharpe": econ.sharpe,
@@ -427,8 +457,34 @@ def _run_oos(args) -> dict:
             "equity_csv": str(curve_path),
         },
     }
-    summary_path.write_text(json.dumps(summary, ensure_ascii=True, indent=2), encoding="utf-8")
+
+    market_df = load_market_ohlc(
+        timeframe=args.timeframe,
+        symbols=sorted(result["symbol"].unique().tolist()),
+        start_datetime_utc=result["datetime_utc"].min().isoformat(),
+        end_datetime_utc=None,
+    )
+    if market_df.empty:
+        summary["trade_lifecycle"] = {
+            "available": False,
+            "error": "missing_ohlc_market_data_for_historical_trade_lifecycle",
+            "metrics": {"trade_count": 0, "profit_factor": 0.0, "max_drawdown": 0.0, "total_return": 0.0},
+        }
+    else:
+        lifecycle_result = run_historical_trade_lifecycle(
+            predictions_df=result[
+                ["model_id", "validation_run_id", "symbol", "timeframe", "datetime_utc", "prob_short", "prob_flat", "prob_long", "signal_position", "fold_id"]
+            ],
+            market_df=market_df,
+            model_id=model_id,
+            timeframe=args.timeframe,
+            simulation_run_id=f"oos_{model_id}_{selected_run_id}_{stamp}",
+            persist_artifacts=True,
+        )
+        summary["trade_lifecycle"] = lifecycle_result.to_summary()
+
     summary["summary_path"] = str(summary_path)
+    summary_path.write_text(json.dumps(summary, ensure_ascii=True, indent=2), encoding="utf-8")
 
     model_entry = get_model_by_id(model_id)
     if model_entry:
