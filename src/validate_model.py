@@ -38,6 +38,7 @@ from modeling_utils import (
 from strategy_evaluator import evaluate_model_acceptance
 from temporal_utils import apply_label_embargo_cutoff
 from historical_trade_simulator import load_market_ohlc, run_historical_trade_lifecycle
+from validation_funnel_report import ValidationFunnelRecorder, write_funnel_report
 
 
 def parse_args():
@@ -427,6 +428,21 @@ def main():
         end_datetime_utc=None,
     )
     if market_df.empty:
+        funnel = ValidationFunnelRecorder(
+            model_id=model_id,
+            validation_run_id=validation_run_id,
+            simulation_run_id=f"{validation_run_id}_trade_lifecycle_{stamp}",
+            timeframe=args.timeframe,
+        )
+        funnel.observe_validation_predictions(predictions_df)
+        funnel_report = funnel.final_report(lifecycle_metrics={"trade_count": 0})
+        funnel_report["diagnosis"] = {
+            "status": "missing_market_data",
+            "message": "No OHLC market data was available for historical trade-lifecycle simulation.",
+        }
+        funnel_path = write_funnel_report(funnel_report, prefix="trade_lifecycle_funnel")
+        funnel_report["artifact_path"] = str(funnel_path)
+        funnel_path.write_text(json.dumps(funnel_report, ensure_ascii=True, indent=2), encoding="utf-8")
         summary["trade_lifecycle"] = {
             "available": False,
             "error": "missing_ohlc_market_data_for_historical_trade_lifecycle",
@@ -439,7 +455,9 @@ def main():
                 "realized_pnl_usdt": 0.0,
                 "total_return": 0.0,
             },
+            "funnel_report": funnel_report,
         }
+        summary["validation_funnel"] = funnel_report
     else:
         lifecycle_result = run_historical_trade_lifecycle(
             predictions_df=predictions_df[
@@ -461,6 +479,9 @@ def main():
             persist_artifacts=True,
         )
         summary["trade_lifecycle"] = lifecycle_result.to_summary()
+        summary["validation_funnel"] = lifecycle_result.funnel_report
+        if lifecycle_result.artifacts.get("funnel_json"):
+            summary["artifacts"]["funnel_json"] = lifecycle_result.artifacts["funnel_json"]
 
     holdout_metrics = {}
     if model_entry and isinstance(model_entry.get("metrics_json"), dict):

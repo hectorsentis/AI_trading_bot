@@ -1,0 +1,7 @@
+# Development / test tooling (not required to run the platform).
+-r requirements.txt
+pytest
+pytest-cov
+# Phase F security tooling (used by .skills/security-audit)
+bandit
+pip-audit

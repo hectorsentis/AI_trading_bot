@@ -295,6 +295,92 @@ def _read_latest_json(pattern: str) -> dict[str, Any]:
         return {"_source_file": str(path), "_error": "Could not parse JSON report"}
 
 
+def load_trade_lifecycle_funnel_reports(limit: int = 20) -> pd.DataFrame:
+    """Load recent persisted validation/backtest funnel reports from reports/."""
+    if not REPORTS_PATH.exists():
+        return _empty("Reports directory not found. Run validate_model.py or backtest.py first.")
+    rows: list[dict[str, Any]] = []
+    files = sorted(REPORTS_PATH.glob("trade_lifecycle_funnel_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[: int(limit)]
+    for path in files:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            rows.append({"source_file": str(path), "error": "Could not parse funnel JSON"})
+            continue
+        val = payload.get("validation_predictions", {}) if isinstance(payload.get("validation_predictions"), dict) else {}
+        mp = payload.get("model_predictions", {}) if isinstance(payload.get("model_predictions"), dict) else {}
+        prop = payload.get("trade_proposals", {}) if isinstance(payload.get("trade_proposals"), dict) else {}
+        alloc = payload.get("allocations", {}) if isinstance(payload.get("allocations"), dict) else {}
+        builder = payload.get("trade_builder", {}) if isinstance(payload.get("trade_builder"), dict) else {}
+        risk = payload.get("risk_manager", {}) if isinstance(payload.get("risk_manager"), dict) else {}
+        sim = payload.get("historical_simulator", {}) if isinstance(payload.get("historical_simulator"), dict) else {}
+        metrics = payload.get("final_trade_lifecycle_metrics", {}) if isinstance(payload.get("final_trade_lifecycle_metrics"), dict) else {}
+        diagnosis = payload.get("diagnosis", {}) if isinstance(payload.get("diagnosis"), dict) else {}
+        rows.append(
+            {
+                "generated_at_utc": payload.get("generated_at_utc"),
+                "model_id": payload.get("model_id"),
+                "validation_run_id": payload.get("validation_run_id"),
+                "simulation_run_id": payload.get("simulation_run_id"),
+                "timeframe": payload.get("timeframe"),
+                "validation_prediction_rows": val.get("total_prediction_rows"),
+                "signal_position_counts": json.dumps(val.get("signal_position_counts", {}), ensure_ascii=True),
+                "direction_counts": json.dumps(mp.get("direction_counts", {}), ensure_ascii=True),
+                "long_prediction_count": mp.get("long_prediction_count"),
+                "proposal_count": prop.get("proposal_count"),
+                "proposal_by_side_status": json.dumps(prop.get("proposal_count_by_side_status", {}), ensure_ascii=True),
+                "allocation_count": alloc.get("allocation_count"),
+                "allocation_by_decision_rejection_reason": json.dumps(alloc.get("allocation_count_by_decision_rejection_reason", {}), ensure_ascii=True),
+                "trade_builder_success": builder.get("success_count"),
+                "trade_builder_failure": builder.get("failure_count"),
+                "trade_builder_failure_reasons": json.dumps(builder.get("failure_reasons", {}), ensure_ascii=True),
+                "risk_approved": risk.get("approval_count"),
+                "risk_rejected": risk.get("rejection_count"),
+                "risk_rejection_reasons": json.dumps(risk.get("rejection_reasons", {}), ensure_ascii=True),
+                "entries_scheduled": sim.get("historical_entries_scheduled"),
+                "entries_filled": sim.get("historical_entries_filled"),
+                "trades_opened": sim.get("trades_opened"),
+                "trades_closed": sim.get("trades_closed"),
+                "exit_reasons": json.dumps(sim.get("exit_reasons", {}), ensure_ascii=True),
+                "orders_count": sim.get("orders_count"),
+                "fills_count": sim.get("fills_count"),
+                "lifecycle_trade_count": metrics.get("trade_count"),
+                "lifecycle_profit_factor": metrics.get("profit_factor"),
+                "lifecycle_total_return": metrics.get("total_return") if "total_return" in metrics else metrics.get("strategy_return"),
+                "diagnosis_status": diagnosis.get("status"),
+                "diagnosis_message": diagnosis.get("message"),
+                "source_file": str(path),
+            }
+        )
+    if not rows:
+        return _empty("No trade_lifecycle_funnel_*.json reports found. Run validate_model.py or backtest.py first.")
+    out = pd.DataFrame(rows)
+    if "generated_at_utc" in out.columns:
+        out["generated_at_utc"] = _dt(out["generated_at_utc"])
+    for col in [
+        "validation_prediction_rows",
+        "long_prediction_count",
+        "proposal_count",
+        "allocation_count",
+        "trade_builder_success",
+        "trade_builder_failure",
+        "risk_approved",
+        "risk_rejected",
+        "entries_scheduled",
+        "entries_filled",
+        "trades_opened",
+        "trades_closed",
+        "orders_count",
+        "fills_count",
+        "lifecycle_trade_count",
+        "lifecycle_profit_factor",
+        "lifecycle_total_return",
+    ]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    return out.sort_values("generated_at_utc", ascending=False, na_position="last")
+
+
 def real_order_possible() -> bool:
     return bool(ENABLE_LIVE_TRADING and ENABLE_REAL_ORDER_EXECUTION and ENABLE_REAL_BINANCE_ACCOUNT and not DRY_RUN)
 

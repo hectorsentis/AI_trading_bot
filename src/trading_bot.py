@@ -65,7 +65,8 @@ from prediction_engine import build_prediction_from_probabilities, persist_predi
 from trade_proposal_engine import build_trade_proposal, persist_trade_proposal
 from capital_allocator import CapitalAllocator
 from trade_builder import build_trade_from_allocation
-from ledger import refresh_model_performance
+from ledger import refresh_model_performance, update_open_trade_unrealized
+from exit_manager import evaluate_virtual_exits
 from reconciliation_engine import run_reconciliation
 
 
@@ -682,6 +683,31 @@ def run_once(args) -> dict:
                 }
             )
 
+        # Central exit pass: flatten open trades whose virtual TP/SL/emergency/horizon exit has
+        # triggered, booking realized PnL through the single execution path. Locally-simulated
+        # only: testnet exits are protected exchange-side by the OCO bracket and reconciled
+        # separately, so we must not double-sell them here.
+        exit_results: list[dict] = []
+        if account_mode == ACCOUNT_MODE_LOCAL_PAPER:
+            exit_engine = ExecutionEngine(
+                portfolio_manager=shared_portfolio_manager,
+                risk_manager=RiskManager(model_id="shared_capital_pool", account_mode=account_mode),
+                account_mode=account_mode,
+                broker_client=broker,
+            )
+            for action in evaluate_virtual_exits(total_price_map, account_mode=account_mode):
+                price = total_price_map.get(action["symbol"])
+                if price is None:
+                    continue
+                try:
+                    exit_results.append(exit_engine.close_trade(action=action, market_price=price))
+                except Exception as exc:  # pragma: no cover - defensive; close failures must not crash loop
+                    LOGGER.exception("exit close failed for trade %s", action.get("trade_id"))
+                    exit_results.append({"trade_id": action.get("trade_id"), "status": "ERROR", "reason": str(exc)})
+            # Mark-to-market remaining open trades, then snapshot so equity/PnL reflect exits.
+            update_open_trade_unrealized(account_mode, total_price_map)
+            shared_portfolio_manager.snapshot(price_by_symbol=total_price_map)
+
         run_report = {
             "mode": "paper",
             "paper_mode": "per-model",
@@ -694,6 +720,7 @@ def run_once(args) -> dict:
             "reconciliation_summary": reconciliation_summary,
             "maintenance_summary": maintenance_summary,
             "models": model_reports,
+            "exit_results": exit_results,
             "created_at_utc": pd.Timestamp.now(tz="UTC").isoformat(),
         }
         refresh_model_performance(account_mode=account_mode)

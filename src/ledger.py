@@ -62,6 +62,64 @@ def mark_trade_open(
         conn.commit()
 
 
+def mark_trade_closed(
+    *,
+    trade_id: str,
+    exit_price: float,
+    qty: float,
+    realized_pnl_usdt: float,
+    exit_reason: str,
+    fees_usdt: float = 0.0,
+    slippage_usdt: float = 0.0,
+    status: str = "CLOSED",
+    raw_update: dict | None = None,
+) -> None:
+    """Book a trade close with realized PnL and full exit attribution.
+
+    Used by the exit pass once a virtual TP/SL/horizon/emergency exit has been executed
+    through the central execution path. This is what makes paper PnL real and persistent.
+    """
+    now = pd.Timestamp.now(tz="UTC").isoformat()
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute(
+            f"""
+            UPDATE {TRADES_TABLE}
+            SET status=?, exit_price=?, avg_exit_price=?, exit_reason=?,
+                realized_pnl_usdt=?, unrealized_pnl_usdt=0,
+                fees_usdt=COALESCE(fees_usdt,0)+?, slippage_usdt=COALESCE(slippage_usdt,0)+?,
+                closed_at_utc=COALESCE(closed_at_utc, ?), updated_at_utc=?, raw_json=?
+            WHERE trade_id=?
+            """,
+            (
+                status, float(exit_price), float(exit_price), exit_reason,
+                float(realized_pnl_usdt), float(fees_usdt), float(slippage_usdt),
+                now, now, json.dumps(raw_update or {}, ensure_ascii=True, sort_keys=True), trade_id,
+            ),
+        )
+        conn.commit()
+
+
+def update_open_trade_unrealized(account_mode: str, price_by_symbol: dict[str, float]) -> None:
+    """Mark-to-market unrealized PnL for OPEN trades so dashboards/evaluators read true values."""
+    init_research_tables()
+    now = pd.Timestamp.now(tz="UTC").isoformat()
+    with sqlite3.connect(DB_FILE) as conn:
+        rows = conn.execute(
+            f"SELECT trade_id, symbol, qty, avg_entry_price FROM {TRADES_TABLE} WHERE status='OPEN' AND account_mode=?",
+            (account_mode,),
+        ).fetchall()
+        for trade_id, symbol, qty, avg_entry in rows:
+            price = price_by_symbol.get(symbol)
+            if price is None or not qty or not avg_entry:
+                continue
+            unrealized = float(qty) * (float(price) - float(avg_entry))
+            conn.execute(
+                f"UPDATE {TRADES_TABLE} SET unrealized_pnl_usdt=?, updated_at_utc=? WHERE trade_id=?",
+                (unrealized, now, trade_id),
+            )
+        conn.commit()
+
+
 def mark_trade_failed(trade_id: str, reason: str, raw: dict | None = None) -> None:
     now = pd.Timestamp.now(tz="UTC").isoformat()
     with sqlite3.connect(DB_FILE) as conn:

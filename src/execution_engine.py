@@ -23,7 +23,7 @@ from broker_client import BinanceCredentialsError, BinanceSpotClient, LiveTradin
 from db_utils import init_research_tables
 from trade_protection import build_long_protection, validate_long_protection
 from trade_builder import BuiltTrade
-from ledger import create_trade_record, mark_trade_failed, mark_trade_open
+from ledger import create_trade_record, mark_trade_closed, mark_trade_failed, mark_trade_open
 
 
 class ExecutionEngine:
@@ -691,6 +691,134 @@ class ExecutionEngine:
             "sl_price": built_trade.sl_price,
             "emergency_sl_price": built_trade.emergency_sl_price,
         }
+
+    def close_trade(self, *, action: dict, market_price: float) -> dict:
+        """Flatten an open trade through the central path and book realized PnL.
+
+        ``action`` is an exit row from ``exit_manager.evaluate_virtual_exits`` carrying the
+        full attribution chain. This path executes a locally-simulated SELL fill: it is used
+        for ``local_paper``. Testnet exits are handled exchange-side by the protective OCO
+        bracket and reconciled separately, so callers must not route testnet trades here
+        (that would double-sell). The model never closes its own trade; this is central
+        execution acting on a recorded exit decision.
+        """
+        trade_id = action["trade_id"]
+        symbol = action["symbol"]
+        qty = float(action.get("qty") or 0.0)
+        reason = action.get("reason", "virtual_exit")
+        avg_entry = float(action.get("avg_entry_price") or 0.0)
+
+        if qty <= 0:
+            mark_trade_closed(
+                trade_id=trade_id,
+                exit_price=float(market_price),
+                qty=0.0,
+                realized_pnl_usdt=0.0,
+                exit_reason=f"{reason}:no_quantity",
+            )
+            return {"trade_id": trade_id, "status": "CLOSED", "reason": f"{reason}:no_quantity"}
+
+        fill_price = self._simulated_fill_price(side="SELL", market_price=market_price)
+        fill = self.portfolio_manager.apply_fill(
+            symbol=symbol,
+            side="SELL",
+            quantity=qty,
+            fill_price=fill_price,
+            fee_rate=PAPER_FEE_RATE,
+        )
+        exit_fee = float(fill.get("fee", 0.0))
+        # Trade-level realized PnL is attributed against the trade's own entry, independent of
+        # the aggregate pool average, so multiple trades on one symbol keep clean attribution.
+        if avg_entry > 0:
+            realized = qty * (fill_price - avg_entry) - exit_fee
+        else:
+            realized = float(fill.get("realized_delta", 0.0))
+        slippage_usdt = abs(fill_price - float(market_price)) * qty
+
+        order_id = self._insert_close_order(action=action, fill_price=fill_price, reason=f"local_close:{reason}")
+        fill_id = self._insert_close_fill(action=action, order_id=order_id, price=fill_price, commission=exit_fee)
+        mark_trade_closed(
+            trade_id=trade_id,
+            exit_price=fill_price,
+            qty=qty,
+            realized_pnl_usdt=realized,
+            exit_reason=reason,
+            fees_usdt=exit_fee,
+            slippage_usdt=slippage_usdt,
+            raw_update={"order_id": order_id, "fill_id": fill_id, "exit_reason": reason},
+        )
+        return {
+            "trade_id": trade_id,
+            "order_id": order_id,
+            "fill_id": fill_id,
+            "status": "CLOSED",
+            "reason": reason,
+            "exit_fill_price": fill_price,
+            "realized_pnl_usdt": realized,
+            "fill": fill,
+        }
+
+    def _insert_close_order(self, *, action: dict, fill_price: float, reason: str) -> str:
+        order_id = self._order_id()
+        qty = float(action.get("qty") or 0.0)
+        notional = qty * float(fill_price)
+        now = pd.Timestamp.now(tz="UTC").isoformat()
+        conn = self._connect()
+        try:
+            conn.execute(
+                f"""
+                INSERT OR REPLACE INTO {ORDERS_TABLE} (
+                    order_id, client_order_id, exchange_order_id, model_id, prediction_id, proposal_id,
+                    allocation_id, trade_id, symbol, timeframe, timestamp_utc, signal_datetime_utc,
+                    account_mode, side, executable_action, order_type, type, quantity, requested_price,
+                    price_requested, fill_price, price_filled, notional, status, reason,
+                    take_profit_price, stop_loss_price, protection_required, protection_status,
+                    decision_json, dry_run, created_at_utc, updated_at_utc, filled_at_utc,
+                    raw_exchange_response_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    order_id, action.get("trade_id"), None, action.get("model_id"), action.get("prediction_id"),
+                    action.get("proposal_id"), action.get("allocation_id"), action.get("trade_id"),
+                    action.get("symbol"), action.get("timeframe"), now, None,
+                    self.account_mode, "SELL", "SELL", DEFAULT_ORDER_TYPE, DEFAULT_ORDER_TYPE, qty,
+                    float(fill_price), float(fill_price), float(fill_price), float(fill_price), float(notional),
+                    "FILLED", reason, None, None, 0, "VIRTUAL_EXIT_CLOSE",
+                    json.dumps({"exit_reason": action.get("reason")}, ensure_ascii=True, sort_keys=True),
+                    1 if self.dry_run else 0, now, now, now,
+                    json.dumps({}, ensure_ascii=True, sort_keys=True),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return order_id
+
+    def _insert_close_fill(self, *, action: dict, order_id: str, price: float, commission: float = 0.0) -> str:
+        fill_id = f"fill_{uuid.uuid4().hex}"
+        now = pd.Timestamp.now(tz="UTC").isoformat()
+        qty = float(action.get("qty") or 0.0)
+        conn = self._connect()
+        try:
+            conn.execute(
+                f"""
+                INSERT OR REPLACE INTO {FILLS_TABLE} (
+                    fill_id, order_id, model_id, prediction_id, proposal_id, allocation_id, trade_id,
+                    symbol, timeframe, account_mode, quantity, price, commission, fee_usdt,
+                    commission_asset, slippage_usdt, timestamp_utc, raw_exchange_response_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    fill_id, order_id, action.get("model_id"), action.get("prediction_id"), action.get("proposal_id"),
+                    action.get("allocation_id"), action.get("trade_id"), action.get("symbol"), action.get("timeframe"),
+                    self.account_mode, qty, float(price), float(commission), float(commission), "USDT",
+                    0.0, now, json.dumps({}, ensure_ascii=True, sort_keys=True),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return fill_id
 
     def _insert_trade_order(
         self,

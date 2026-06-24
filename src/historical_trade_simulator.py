@@ -36,6 +36,7 @@ from prediction_engine import build_prediction_from_probabilities, persist_predi
 from risk_manager import RiskManager
 from trade_builder import BuiltTrade, build_trade_from_allocation
 from trade_proposal_engine import build_trade_proposal, persist_trade_proposal
+from validation_funnel_report import ValidationFunnelRecorder, write_funnel_report
 
 
 HISTORICAL_ACCOUNT_MODE_PREFIX = "historical_sim"
@@ -68,6 +69,7 @@ class HistoricalSimulationResult:
     equity_curve: pd.DataFrame
     trades: pd.DataFrame
     artifacts: dict = field(default_factory=dict)
+    funnel_report: dict = field(default_factory=dict)
 
     def to_summary(self) -> dict:
         return {
@@ -78,6 +80,7 @@ class HistoricalSimulationResult:
             "start_datetime_utc": self.start_datetime_utc,
             "end_datetime_utc": self.end_datetime_utc,
             "metrics": self.metrics,
+            "funnel_report": self.funnel_report,
             "artifacts": self.artifacts,
         }
 
@@ -384,6 +387,12 @@ class HistoricalTradeSimulator:
         self.open_trades: list[SimulatedOpenTrade] = []
         self.closed_rows: list[dict] = []
         self.equity_rows: list[dict] = []
+        self.funnel = ValidationFunnelRecorder(
+            model_id=self.model_id,
+            validation_run_id=None,
+            simulation_run_id=self.simulation_run_id,
+            timeframe=self.timeframe,
+        )
         save_portfolio_snapshot(
             cash=self.portfolio_manager.cash,
             equity=self.portfolio_manager.equity,
@@ -404,6 +413,7 @@ class HistoricalTradeSimulator:
             latest_market_timestamp_utc=_to_utc(timestamp_utc).isoformat(),
             evaluation_timestamp_utc=timestamp_utc,
         )
+        self.funnel.observe_risk(risk)
         if not risk["approved"]:
             reason = ";".join(risk["reasons"])
             mark_trade_failed(built_trade.trade_id, reason, raw={"risk": risk, "source": "historical_trade_simulator"})
@@ -419,6 +429,8 @@ class HistoricalTradeSimulator:
                 timestamp_utc=timestamp_utc,
                 raw={"risk": risk},
             )
+            self.funnel.observe_order(side="BUY", status="REJECTED")
+            self.funnel.observe_entry_unfilled("risk_manager_rejected_entry")
             return None
 
         fill_price = _simulated_fill_price("BUY", entry_reference_price)
@@ -443,6 +455,7 @@ class HistoricalTradeSimulator:
             timestamp_utc=timestamp_utc,
             raw={"simulation_run_id": self.simulation_run_id},
         )
+        self.funnel.observe_order(side="BUY", status="FILLED")
         fill_id = _insert_historical_fill(
             built_trade=built_trade,
             order_id=order_id,
@@ -454,6 +467,7 @@ class HistoricalTradeSimulator:
             timestamp_utc=timestamp_utc,
             raw={"simulation_run_id": self.simulation_run_id},
         )
+        self.funnel.observe_fill()
         mark_trade_open(
             trade_id=built_trade.trade_id,
             avg_entry_price=fill_price,
@@ -468,6 +482,7 @@ class HistoricalTradeSimulator:
                 (_to_utc(timestamp_utc).isoformat(), _to_utc(timestamp_utc).isoformat(), built_trade.trade_id),
             )
             conn.commit()
+        self.funnel.observe_entry_filled()
         return SimulatedOpenTrade(
             built_trade=built_trade,
             entry_time_utc=_to_utc(timestamp_utc),
@@ -509,6 +524,7 @@ class HistoricalTradeSimulator:
             timestamp_utc=timestamp_utc,
             raw={"simulation_run_id": self.simulation_run_id, "exit_reason": exit_reason},
         )
+        self.funnel.observe_order(side="SELL", status="FILLED")
         fill_id = _insert_historical_fill(
             built_trade=bt,
             order_id=order_id,
@@ -520,6 +536,7 @@ class HistoricalTradeSimulator:
             timestamp_utc=timestamp_utc,
             raw={"simulation_run_id": self.simulation_run_id, "exit_reason": exit_reason},
         )
+        self.funnel.observe_fill()
         realized = float(bt.quantity) * (exit_fill - open_trade.entry_fill_price) - open_trade.entry_fee_usdt - exit_fee
         _close_trade_record(
             open_trade=open_trade,
@@ -562,6 +579,7 @@ class HistoricalTradeSimulator:
                 "trade_max_drawdown_usdt": open_trade.max_drawdown_usdt,
             }
         )
+        self.funnel.observe_trade_closed(exit_reason)
 
     def _update_open_trades(self, candle: pd.Series, deterioration_by_symbol: dict[str, dict]) -> None:
         remaining: list[SimulatedOpenTrade] = []
@@ -687,9 +705,14 @@ class HistoricalTradeSimulator:
 
         predictions = predictions_df.copy()
         market = market_df.copy()
+        validation_run_id = None
+        if "validation_run_id" in predictions.columns and not predictions["validation_run_id"].dropna().empty:
+            validation_run_id = str(predictions["validation_run_id"].dropna().astype(str).iloc[0])
+        self.funnel.validation_run_id = validation_run_id
         predictions["datetime_utc"] = pd.to_datetime(predictions["datetime_utc"], utc=True, errors="coerce")
         market["datetime_utc"] = pd.to_datetime(market["datetime_utc"], utc=True, errors="coerce")
         predictions = predictions.dropna(subset=["datetime_utc", "symbol"]).sort_values(["datetime_utc", "symbol"])
+        self.funnel.observe_validation_predictions(predictions)
         market = market.dropna(subset=["datetime_utc", "symbol", "open", "high", "low", "close"]).sort_values(["datetime_utc", "symbol"])
         close_by_key = {
             (str(r.symbol), _to_utc(r.datetime_utc)): float(r.close)
@@ -742,6 +765,7 @@ class HistoricalTradeSimulator:
                     continue
                 prediction = self._prediction_from_row(row, close)
                 persist_prediction(prediction)
+                self.funnel.observe_model_prediction(prediction)
                 deterioration_by_symbol[symbol] = self._deterioration_from_prediction(prediction)
                 proposal = build_trade_proposal(
                     prediction=prediction,
@@ -749,7 +773,9 @@ class HistoricalTradeSimulator:
                     requested_notional_usdt=self.requested_notional_usdt,
                 )
                 persist_trade_proposal(proposal)
+                self.funnel.observe_proposal_initial(proposal)
                 allocation = self.allocator.allocate(proposal, evaluation_timestamp_utc=ts.isoformat())
+                self.funnel.observe_allocation(proposal, allocation)
                 if allocation.get("decision") not in {"ACCEPT", "RESIZE"}:
                     continue
                 built_trade, build_reasons = build_trade_from_allocation(
@@ -757,6 +783,7 @@ class HistoricalTradeSimulator:
                     allocation,
                     step_size=float(PAPER_POSITION_STEP_SIZE),
                 )
+                self.funnel.observe_trade_builder(built_trade, build_reasons)
                 if built_trade is None:
                     # Persist a failed trade shell so proposal/allocation rejection
                     # remains attributable in the operational ledger.
@@ -792,12 +819,18 @@ class HistoricalTradeSimulator:
                         conn.commit()
                     continue
                 pending_entries.append({"symbol": symbol, "built_trade": built_trade})
+                self.funnel.observe_entry_scheduled()
 
             self._apply_deterioration_exits_at_close(current_candles, deterioration_by_symbol)
             self._record_equity(ts, latest_prices)
 
         # Force-close anything still open at the last available close. This is a
         # risk-managed end-of-simulation horizon exit, not a model sell signal.
+        if pending_entries:
+            for _pending in pending_entries:
+                self.funnel.observe_entry_unfilled("no_next_bar_available_for_scheduled_entry")
+            pending_entries = []
+
         if not market.empty and self.open_trades:
             last_ts = _to_utc(market["datetime_utc"].max())
             for ot in list(self.open_trades):
@@ -821,6 +854,7 @@ class HistoricalTradeSimulator:
             initial_cash_usdt=self.initial_cash_usdt,
             market_df=market,
         )
+        funnel_report = self.funnel.final_report(lifecycle_metrics=metrics)
         refresh_model_performance(account_mode=self.account_mode)
         result = HistoricalSimulationResult(
             simulation_run_id=self.simulation_run_id,
@@ -832,9 +866,15 @@ class HistoricalTradeSimulator:
             metrics=metrics,
             equity_curve=equity_curve,
             trades=trades_df,
+            funnel_report=funnel_report,
         )
         if persist_artifacts:
             result.artifacts.update(write_simulation_artifacts(result))
+            funnel_path = write_funnel_report(funnel_report, prefix="trade_lifecycle_funnel")
+            funnel_report["artifact_path"] = str(funnel_path)
+            funnel_path.write_text(json.dumps(funnel_report, ensure_ascii=True, indent=2), encoding="utf-8")
+            result.funnel_report = funnel_report
+            result.artifacts["funnel_json"] = str(funnel_path)
         return result
 
 

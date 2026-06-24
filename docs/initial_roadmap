@@ -1,0 +1,2645 @@
+# Roadmap final del bot de trading autónomo
+
+**Repositorio objetivo:** `AI_trading_bot`  
+**Mercado objetivo:** Binance Spot  
+**Modo operativo final seguro:** paper/testnet/shadow primero; live bloqueado por defecto  
+**Objetivo:** plataforma autónoma multi-modelo, auditable, server-ready, con capital común, ejecución centralizada, gestión de riesgo estricta y PnL atribuible por modelo/trade.
+
+---
+
+## 1. Definición final del producto
+
+El proyecto final no es un script de señales ni un clasificador `LONG/FLAT`.  
+El producto final debe ser una **plataforma autónoma de trading cuantitativo para Binance Spot**.
+
+El sistema debe permitir que múltiples modelos independientes analicen el mercado, generen propuestas de trade, compitan por capital común, sean evaluados de forma continua y puedan ser activados, pausados, degradados, cuarentenados o archivados según su rendimiento real.
+
+La idea central:
+
+```text
+Ningún modelo opera directamente.
+Todos los modelos proponen.
+El sistema decide.
+El ledger demuestra.
+```
+
+---
+
+## 2. Principio rector
+
+El sistema no debe validar predicciones aisladas.  
+El sistema debe validar operaciones completas.
+
+Un modelo solo puede considerarse útil si sus propuestas de trade, ejecutadas con la misma lógica que usará el sistema real, mantienen esperanza positiva neta de costes, slippage, restricciones de exchange, riesgo y capital.
+
+La lógica debe ser la misma en:
+
+```text
+entrenamiento
+validación
+backtest histórico
+shadow trading
+paper trading
+testnet trading
+live trading futuro
+```
+
+La única diferencia aceptable debe ser la fuente de ejecución:
+
+```text
+histórico       -> simulación sobre OHLCV con fees/slippage
+local paper     -> fills simulados localmente
+Binance testnet -> órdenes testnet/demo
+shadow real     -> mercado real sin órdenes reales
+live futuro     -> órdenes reales solo con flags explícitos
+```
+
+---
+
+## 3. Arquitectura final obligatoria
+
+```text
+Market Data Engine
+    -> Data Quality Engine
+    -> Feature Store
+    -> Label Store
+    -> Training Dataset Builder
+    -> Model Factory
+    -> Model Registry
+    -> Model Evaluator
+    -> Prediction Engine
+    -> Trade Proposal Engine
+    -> Capital Allocator
+    -> Risk Manager
+    -> Trade Builder
+    -> Execution Engine
+    -> Broker Client
+    -> Stop Manager
+    -> Exit Manager
+    -> Reconciliation Engine
+    -> Ledger
+    -> Portfolio Manager
+    -> Model Performance Engine
+    -> Model Lifecycle Manager
+    -> Dashboard / Control Panel
+```
+
+Ningún modelo puede saltarse este flujo.
+
+---
+
+## 4. Decisión arquitectónica principal
+
+El sistema **no debe combinar señales en una señal media**.
+
+Diseño incorrecto:
+
+```text
+modelo A -> LONG
+modelo B -> FLAT
+modelo C -> SHORT
+resultado -> señal promedio global
+```
+
+Diseño correcto:
+
+```text
+modelo A -> propuesta de trade A
+modelo B -> propuesta de trade B
+modelo C -> propuesta de trade C
+
+allocator -> acepta / rechaza / redimensiona / shadow / difiere
+risk manager -> valida o bloquea
+execution engine -> ejecuta solo lo aprobado
+ledger -> atribuye PnL a cada modelo/trade
+```
+
+Los modelos compiten por un capital común.  
+No tienen carteras fijas independientes.  
+Cada trade conserva identidad contable completa.
+
+---
+
+## 5. Scope final de mercado
+
+La versión final debe estar diseñada para:
+
+```text
+Binance Spot
+sin futures
+sin margin
+sin leverage
+sin borrowing
+sin short real
+```
+
+Interpretación en Spot:
+
+```text
+LONG -> comprar o mantener activo
+FLAT -> no abrir exposición
+EXIT -> cerrar o reducir exposición existente
+SHORT -> evitar activo o salir, no abrir corto real
+```
+
+Un modelo puede detectar expectativa negativa, pero eso debe traducirse en `EXIT`, `REDUCE`, `REJECT` o `NO_TRADE`, no en un corto de futuros.
+
+---
+
+## 6. Identidad contable obligatoria
+
+Todo objeto relevante debe conservar, cuando aplique:
+
+```text
+model_id
+prediction_id
+proposal_id
+allocation_id
+trade_id
+order_id
+fill_id
+symbol
+timeframe
+account_mode
+timestamp_utc
+```
+
+El sistema debe poder responder siempre:
+
+```text
+qué modelo ganó dinero
+qué modelo perdió dinero
+qué propuesta fue aceptada
+qué propuesta fue rechazada
+qué propuesta rechazada habría ganado
+qué operación generó cada PnL
+qué fill corresponde a cada trade
+qué comisiones pagó cada modelo
+qué slippage sufrió cada trade
+qué allocator decision generó cada resultado
+qué modelo debe pausarse o cuarentenarse
+```
+
+---
+
+## 7. Módulos finales del repositorio
+
+La estructura exacta puede variar, pero estas responsabilidades deben existir.
+
+### 7.1 Datos
+
+```text
+src/download_data.py
+src/realtime_ingestor.py
+src/data_loader.py
+src/data_check.py
+src/data_gap_fill.py
+src/data_quality_service.py
+```
+
+Responsabilidades:
+
+```text
+descarga histórica
+actualización incremental
+ingesta realtime/websocket
+persistencia idempotente
+detección de gaps
+detección de duplicados
+validación UTC
+control de cobertura
+control de stale data
+marcado de velas corruptas
+```
+
+### 7.2 Features y labels
+
+```text
+src/features.py
+src/technical_patterns.py
+src/feature_store.py
+src/labels.py
+src/training_dataset_builder.py
+```
+
+Responsabilidades:
+
+```text
+features de mercado
+features técnicas
+features de volatilidad
+features de liquidez
+features multi-timeframe
+features cross-asset
+features de régimen
+labels de retorno
+labels de MFE/MAE
+labels de cuantiles
+labels de salida
+labels netas de costes
+integración de ejecución paper/live/shadow sin sesgo de selección
+```
+
+### 7.3 Modelos
+
+```text
+src/train.py
+src/validate_model.py
+src/backtest.py
+src/historical_trade_simulator.py
+src/model_registry.py
+src/model_pool_manager.py
+src/model_maintenance.py
+src/model_evaluator.py
+src/prediction_engine.py
+```
+
+Responsabilidades:
+
+```text
+entrenamiento temporal
+walk-forward
+validación OOS
+backtest trade-lifecycle
+registro de modelos
+calibración
+scoring de modelos
+monitorización de degradación
+mantenimiento del pool de modelos
+```
+
+### 7.4 Propuestas y asignación de capital
+
+```text
+src/trade_proposal_engine.py
+src/capital_allocator.py
+src/trade_builder.py
+```
+
+Responsabilidades:
+
+```text
+convertir predicciones en propuestas
+persistir propuestas
+preservar rechazadas
+crear shadow trades
+puntuar propuestas
+asignar capital común
+dimensionar operaciones
+derivar TP/SL/horizonte
+```
+
+### 7.5 Riesgo y seguridad
+
+```text
+src/risk_manager.py
+src/kill_switch.py
+src/live_safety.py
+src/reconciliation_engine.py
+```
+
+Responsabilidades:
+
+```text
+límites duros de riesgo
+stale data blocking
+control de drawdown
+control de pérdida diaria
+kill switch
+validación de flags live
+bloqueo por reconciliación
+bloqueo por exchange connectivity
+```
+
+### 7.6 Ejecución y broker
+
+```text
+src/broker_client.py
+src/execution_engine.py
+src/paper_trading_engine.py
+src/live_trading_engine.py
+```
+
+Responsabilidades:
+
+```text
+único camino hacia órdenes
+routing dry-run/testnet/live
+validación exchange filters
+órdenes
+fills
+fees
+slippage
+timeouts
+idempotencia
+client_order_id
+emergency stops
+```
+
+### 7.7 Portfolio, ledger y salidas
+
+```text
+src/portfolio_manager.py
+src/ledger.py
+src/exit_manager.py
+src/stop_manager.py
+```
+
+Responsabilidades:
+
+```text
+balance snapshots
+portfolio snapshots
+positions
+PnL realizado/no realizado
+atribución por modelo/trade
+TP virtual
+SL virtual
+emergency SL
+salida por deterioro de señal
+salida por expiración
+salida por riesgo
+```
+
+### 7.8 Orquestación y dashboard
+
+```text
+src/trading_bot.py
+src/scheduler.py
+src/dashboard.py
+```
+
+Responsabilidades:
+
+```text
+loop principal
+gestión de procesos
+coordinación ingestion/modelos/trades/reconciliación
+shutdown limpio
+restart-safe behavior
+panel operativo profesional
+controles seguros
+```
+
+---
+
+## 8. Modos finales de operación
+
+El sistema debe soportar estos modos desde la arquitectura final:
+
+```text
+research
+local_dry_run
+binance_spot_testnet_paper
+shadow_real
+live
+```
+
+### 8.1 Research
+
+```text
+descarga histórica
+generación de features
+generación de labels
+entrenamiento
+validación
+backtesting
+actualización del model registry
+```
+
+No envía órdenes.
+
+### 8.2 Local dry-run
+
+```text
+misma arquitectura completa
+fills simulados localmente
+sin Binance privado
+ledger operativo
+PnL simulado
+```
+
+### 8.3 Binance Spot Testnet / demo paper
+
+```text
+usa credenciales testnet/demo
+envía órdenes testnet
+sin riesgo real
+sincroniza balances/fills testnet
+calcula PnL por modelo/trade
+```
+
+### 8.4 Shadow real
+
+```text
+usa mercado real
+no envía órdenes reales
+puede leer cuenta real si está explícitamente permitido
+valida filtros, latencia, propuestas y reconciliación
+```
+
+### 8.5 Live futuro
+
+```text
+deshabilitado por defecto
+solo con flags explícitos
+sin bypass de risk manager
+sin bypass de kill switch
+sin bypass de reconciliación
+```
+
+---
+
+## 9. Datos base finales
+
+Cada vela debe conservar:
+
+```text
+symbol
+timeframe
+datetime_utc
+open
+high
+low
+close
+volume
+quote_asset_volume
+number_of_trades
+taker_buy_base_volume
+taker_buy_quote_volume
+provider
+ingestion_ts_utc
+source_latency_ms
+quality_status
+is_closed_candle
+```
+
+Reglas obligatorias:
+
+```text
+no duplicados por symbol/timeframe/datetime_utc
+timestamps UTC correctos
+orden temporal monotónico
+gaps detectados y registrados
+velas corruptas marcadas o excluidas
+cobertura actualizada por símbolo/timeframe
+datos recientes separados de train si forman parte de validación/OOS
+stale data bloquea nuevas entradas
+```
+
+---
+
+# 10. Lista completa de features de entrenamiento
+
+Esta sección define el set completo de features que debería soportar el sistema final.  
+No todas las familias tienen por qué aplicarse a todos los modelos, pero el **Feature Store final** debe poder generarlas, versionarlas y servirlas sin leakage.
+
+Regla absoluta:
+
+```text
+Toda feature en t solo puede usar información disponible hasta t.
+Ninguna feature puede mirar al futuro.
+Ninguna feature puede incorporar el resultado de la operación que intenta predecir.
+```
+
+---
+
+## 10.1 Features base de vela
+
+```text
+open
+high
+low
+close
+volume
+quote_asset_volume
+number_of_trades
+taker_buy_base_volume
+taker_buy_quote_volume
+close_time_utc
+is_closed_candle
+```
+
+Derivadas directas:
+
+```text
+hl_range
+hl_range_pct
+oc_range
+oc_range_pct
+candle_body
+candle_body_pct
+upper_wick
+upper_wick_pct
+lower_wick
+lower_wick_pct
+total_wick
+wick_body_ratio
+body_range_ratio
+close_position_in_range
+open_position_in_range
+high_close_distance_pct
+close_low_distance_pct
+```
+
+---
+
+## 10.2 Features de retornos
+
+Retornos simples:
+
+```text
+ret_1
+ret_2
+ret_3
+ret_4
+ret_5
+ret_6
+ret_8
+ret_10
+ret_12
+ret_16
+ret_20
+ret_24
+ret_36
+ret_48
+ret_72
+ret_96
+ret_120
+ret_168
+```
+
+Log-retornos:
+
+```text
+log_ret_1
+log_ret_2
+log_ret_3
+log_ret_4
+log_ret_5
+log_ret_6
+log_ret_8
+log_ret_10
+log_ret_12
+log_ret_16
+log_ret_20
+log_ret_24
+log_ret_36
+log_ret_48
+log_ret_72
+log_ret_96
+log_ret_120
+log_ret_168
+```
+
+Retornos acumulados:
+
+```text
+cum_ret_3
+cum_ret_6
+cum_ret_12
+cum_ret_24
+cum_ret_48
+cum_ret_72
+cum_ret_168
+```
+
+Retornos normalizados:
+
+```text
+ret_1_zscore_20
+ret_1_zscore_50
+ret_1_zscore_100
+ret_3_zscore_20
+ret_6_zscore_20
+ret_12_zscore_50
+ret_24_zscore_100
+ret_over_atr_14
+ret_over_volatility_20
+```
+
+Momentum puro:
+
+```text
+momentum_3
+momentum_6
+momentum_12
+momentum_24
+momentum_48
+momentum_72
+momentum_168
+momentum_ratio_6_24
+momentum_ratio_12_48
+momentum_acceleration_3_12
+momentum_acceleration_6_24
+```
+
+---
+
+## 10.3 Features de volatilidad y riesgo de precio
+
+Volatilidad rolling:
+
+```text
+volatility_5
+volatility_10
+volatility_14
+volatility_20
+volatility_30
+volatility_50
+volatility_100
+volatility_168
+```
+
+Volatilidad anualizada/equivalente:
+
+```text
+volatility_20_annualized_proxy
+volatility_50_annualized_proxy
+```
+
+Ratios de volatilidad:
+
+```text
+volatility_ratio_5_20
+volatility_ratio_10_20
+volatility_ratio_20_50
+volatility_ratio_50_100
+volatility_change_1
+volatility_change_3
+volatility_change_6
+volatility_change_12
+```
+
+ATR:
+
+```text
+true_range
+atr_7
+atr_14
+atr_20
+atr_50
+atr_pct_7
+atr_pct_14
+atr_pct_20
+atr_pct_50
+atr_ratio_7_20
+atr_ratio_14_50
+```
+
+Rangos rolling:
+
+```text
+rolling_high_5
+rolling_high_10
+rolling_high_20
+rolling_high_50
+rolling_high_100
+rolling_low_5
+rolling_low_10
+rolling_low_20
+rolling_low_50
+rolling_low_100
+rolling_range_5
+rolling_range_10
+rolling_range_20
+rolling_range_50
+rolling_range_100
+rolling_range_pct_5
+rolling_range_pct_10
+rolling_range_pct_20
+rolling_range_pct_50
+rolling_range_pct_100
+```
+
+Compresión/expansión:
+
+```text
+range_zscore_20
+range_zscore_50
+range_expansion_1
+range_expansion_3
+range_compression_20
+volatility_squeeze_20
+volatility_breakout_20
+```
+
+Downside/upside volatility:
+
+```text
+downside_volatility_10
+downside_volatility_20
+downside_volatility_50
+upside_volatility_10
+upside_volatility_20
+upside_volatility_50
+up_down_vol_ratio_20
+```
+
+Drawdown local:
+
+```text
+rolling_max_close_20
+rolling_max_close_50
+rolling_max_close_100
+rolling_drawdown_20
+rolling_drawdown_50
+rolling_drawdown_100
+distance_from_rolling_high_20
+distance_from_rolling_high_50
+distance_from_rolling_high_100
+distance_from_rolling_low_20
+distance_from_rolling_low_50
+distance_from_rolling_low_100
+```
+
+---
+
+## 10.4 Features de volumen
+
+Volumen rolling:
+
+```text
+volume_ma_5
+volume_ma_10
+volume_ma_20
+volume_ma_50
+volume_ma_100
+volume_ma_168
+```
+
+Volumen relativo:
+
+```text
+vol_ratio_5
+vol_ratio_10
+vol_ratio_20
+vol_ratio_50
+vol_ratio_100
+```
+
+Volumen normalizado:
+
+```text
+vol_zscore_10
+vol_zscore_20
+vol_zscore_50
+vol_zscore_100
+volume_percentile_20
+volume_percentile_50
+volume_percentile_100
+```
+
+Cambios de volumen:
+
+```text
+volume_change_1
+volume_change_3
+volume_change_6
+volume_change_12
+volume_change_24
+volume_trend_5
+volume_trend_10
+volume_trend_20
+volume_acceleration_5_20
+```
+
+Volumen en quote asset:
+
+```text
+quote_volume_ma_5
+quote_volume_ma_10
+quote_volume_ma_20
+quote_volume_ma_50
+quote_volume_ratio_10
+quote_volume_ratio_20
+quote_volume_zscore_20
+```
+
+Número de trades:
+
+```text
+trades_ma_5
+trades_ma_10
+trades_ma_20
+trades_ma_50
+trades_ratio_10
+trades_ratio_20
+trades_zscore_20
+avg_trade_size_base
+avg_trade_size_quote
+avg_trade_size_quote_ma_20
+avg_trade_size_quote_zscore_20
+```
+
+---
+
+## 10.5 Features de presión compradora/vendedora
+
+A partir de Binance taker data:
+
+```text
+taker_buy_base_volume
+taker_buy_quote_volume
+taker_sell_base_volume
+taker_sell_quote_volume
+taker_buy_ratio_base
+taker_buy_ratio_quote
+taker_sell_ratio_base
+taker_sell_ratio_quote
+taker_imbalance_base
+taker_imbalance_quote
+taker_imbalance_ma_5
+taker_imbalance_ma_10
+taker_imbalance_ma_20
+taker_imbalance_zscore_20
+taker_buy_volume_ratio_20
+taker_sell_volume_ratio_20
+```
+
+Divergencias precio/volumen:
+
+```text
+price_up_volume_up
+price_up_volume_down
+price_down_volume_up
+price_down_volume_down
+volume_price_divergence_5
+volume_price_divergence_20
+taker_pressure_price_divergence_5
+taker_pressure_price_divergence_20
+```
+
+---
+
+## 10.6 Features de medias móviles y tendencia
+
+SMA:
+
+```text
+sma_5
+sma_10
+sma_20
+sma_30
+sma_50
+sma_100
+sma_200
+```
+
+EMA:
+
+```text
+ema_5
+ema_8
+ema_10
+ema_12
+ema_20
+ema_21
+ema_26
+ema_30
+ema_50
+ema_100
+ema_200
+```
+
+Distancias a medias:
+
+```text
+dist_sma_5
+dist_sma_10
+dist_sma_20
+dist_sma_50
+dist_sma_100
+dist_sma_200
+dist_ema_5
+dist_ema_8
+dist_ema_12
+dist_ema_20
+dist_ema_26
+dist_ema_50
+dist_ema_100
+dist_ema_200
+```
+
+Pendientes:
+
+```text
+slope_sma_5
+slope_sma_10
+slope_sma_20
+slope_sma_50
+slope_sma_100
+slope_sma_200
+slope_ema_5
+slope_ema_12
+slope_ema_20
+slope_ema_50
+slope_ema_100
+slope_ema_200
+```
+
+Cruces:
+
+```text
+sma_cross_5_20
+sma_cross_10_50
+sma_cross_20_50
+sma_cross_50_200
+ema_cross_5_20
+ema_cross_12_26
+ema_cross_20_50
+ema_cross_50_200
+bars_since_sma_cross_5_20
+bars_since_ema_cross_12_26
+bars_since_sma_cross_50_200
+```
+
+Fuerza de tendencia:
+
+```text
+trend_strength_10
+trend_strength_20
+trend_strength_50
+trend_strength_100
+trend_consistency_10
+trend_consistency_20
+trend_consistency_50
+price_above_sma_20
+price_above_sma_50
+price_above_sma_200
+price_above_ema_20
+price_above_ema_50
+price_above_ema_200
+ma_stack_bullish
+ma_stack_bearish
+ma_stack_score
+```
+
+Regresión de tendencia:
+
+```text
+linear_regression_slope_10
+linear_regression_slope_20
+linear_regression_slope_50
+linear_regression_r2_10
+linear_regression_r2_20
+linear_regression_r2_50
+linear_regression_residual_20
+linear_regression_residual_zscore_20
+```
+
+---
+
+## 10.7 Indicadores técnicos de momentum/osciladores
+
+RSI:
+
+```text
+rsi_7
+rsi_14
+rsi_21
+rsi_50
+rsi_slope_14
+rsi_zscore_14_100
+rsi_overbought_70
+rsi_oversold_30
+rsi_cross_50
+bars_since_rsi_cross_50
+```
+
+MACD:
+
+```text
+macd_12_26
+macd_signal_12_26_9
+macd_hist_12_26_9
+macd_hist_slope
+macd_cross_signal
+macd_cross_zero
+bars_since_macd_cross_signal
+bars_since_macd_cross_zero
+```
+
+Stochastic:
+
+```text
+stoch_k_14
+stoch_d_3
+stoch_cross
+stoch_overbought_80
+stoch_oversold_20
+stoch_k_slope
+```
+
+Williams / CCI / ROC:
+
+```text
+williams_r_14
+cci_20
+roc_5
+roc_10
+roc_20
+roc_50
+```
+
+ADX / DMI:
+
+```text
+adx_14
+plus_di_14
+minus_di_14
+di_spread_14
+di_cross
+trend_direction_adx
+```
+
+Otros momentum:
+
+```text
+awesome_oscillator
+tsi
+ultimate_oscillator
+momentum_score_composite
+```
+
+---
+
+## 10.8 Bandas, canales y mean reversion
+
+Bollinger Bands:
+
+```text
+bb_mid_20
+bb_upper_20
+bb_lower_20
+bb_width_20
+bb_percent_b_20
+bb_zscore_20
+bb_squeeze_20
+bb_break_upper_20
+bb_break_lower_20
+bb_reentry_from_upper_20
+bb_reentry_from_lower_20
+```
+
+Keltner Channels:
+
+```text
+keltner_mid_20
+keltner_upper_20
+keltner_lower_20
+keltner_width_20
+keltner_percent_position_20
+```
+
+Donchian Channels:
+
+```text
+donchian_high_20
+donchian_low_20
+donchian_mid_20
+donchian_width_20
+donchian_breakout_20
+donchian_breakdown_20
+donchian_position_20
+```
+
+Mean reversion:
+
+```text
+price_zscore_20
+price_zscore_50
+price_zscore_100
+deviation_from_vwap_proxy
+deviation_from_sma_20_zscore
+deviation_from_ema_20_zscore
+mean_reversion_score_20
+mean_reversion_score_50
+```
+
+---
+
+## 10.9 VWAP y precio medio
+
+Si existe dato intradía suficiente:
+
+```text
+vwap_session
+vwap_rolling_12
+vwap_rolling_24
+vwap_rolling_48
+dist_vwap_session
+dist_vwap_rolling_24
+vwap_slope_session
+vwap_cross
+bars_since_vwap_cross
+```
+
+Precio típico:
+
+```text
+typical_price
+median_price
+weighted_close
+hlc3
+ohlc4
+```
+
+---
+
+## 10.10 Patrones de vela
+
+Estructura:
+
+```text
+body_ratio
+upper_wick_ratio
+lower_wick_ratio
+wick_asymmetry
+range_body_ratio
+body_direction
+close_near_high
+close_near_low
+```
+
+Patrones individuales:
+
+```text
+is_doji
+is_long_legged_doji
+is_dragonfly_doji
+is_gravestone_doji
+is_hammer
+is_inverted_hammer
+is_shooting_star
+is_hanging_man
+is_marubozu_bullish
+is_marubozu_bearish
+is_spinning_top
+```
+
+Patrones de varias velas:
+
+```text
+bullish_engulfing
+bearish_engulfing
+inside_bar
+outside_bar
+morning_star_proxy
+evening_star_proxy
+three_white_soldiers_proxy
+three_black_crows_proxy
+tweezer_top_proxy
+tweezer_bottom_proxy
+```
+
+Secuencias:
+
+```text
+consecutive_up_2
+consecutive_up_3
+consecutive_up_4
+consecutive_up_5
+consecutive_down_2
+consecutive_down_3
+consecutive_down_4
+consecutive_down_5
+bars_since_green_candle
+bars_since_red_candle
+up_down_sequence_score_5
+up_down_sequence_score_10
+```
+
+---
+
+## 10.11 Breakouts, soportes y resistencias
+
+Breakouts:
+
+```text
+breakout_5
+breakout_10
+breakout_20
+breakout_50
+breakout_100
+breakdown_5
+breakdown_10
+breakdown_20
+breakdown_50
+breakdown_100
+```
+
+Distancia a máximos/mínimos:
+
+```text
+distance_to_high_5
+distance_to_high_10
+distance_to_high_20
+distance_to_high_50
+distance_to_high_100
+distance_to_low_5
+distance_to_low_10
+distance_to_low_20
+distance_to_low_50
+distance_to_low_100
+```
+
+Canales:
+
+```text
+channel_position_20
+channel_position_50
+channel_position_100
+channel_width_20
+channel_width_50
+channel_width_100
+```
+
+Patrones proxy:
+
+```text
+double_top_proxy
+double_bottom_proxy
+higher_high
+lower_high
+higher_low
+lower_low
+market_structure_score_20
+swing_high_5
+swing_low_5
+swing_high_10
+swing_low_10
+bars_since_swing_high
+bars_since_swing_low
+```
+
+---
+
+## 10.12 Features de liquidez y microestructura aproximada
+
+Con datos OHLCV/taker:
+
+```text
+estimated_spread_proxy
+high_low_spread_proxy
+close_to_close_spread_proxy
+amihud_illiquidity_20
+amihud_illiquidity_50
+turnover_proxy
+volume_per_trade
+quote_volume_per_trade
+liquidity_score_20
+liquidity_score_50
+slippage_proxy_20
+slippage_proxy_50
+market_impact_proxy
+```
+
+Con datos de order book si se integran en el sistema final:
+
+```text
+best_bid
+best_ask
+bid_ask_spread
+bid_ask_spread_pct
+mid_price
+order_book_imbalance_l1
+order_book_imbalance_l5
+order_book_imbalance_l10
+bid_depth_l5
+ask_depth_l5
+bid_depth_l10
+ask_depth_l10
+depth_ratio_l5
+depth_ratio_l10
+wall_bid_distance
+wall_ask_distance
+microprice
+microprice_deviation
+```
+
+---
+
+## 10.13 Features temporales
+
+Hora:
+
+```text
+hour_utc
+hour_sin
+hour_cos
+```
+
+Día:
+
+```text
+day_of_week
+day_of_week_sin
+day_of_week_cos
+is_weekend
+is_monday
+is_friday
+```
+
+Mes/calendario:
+
+```text
+day_of_month
+week_of_month
+month
+month_sin
+month_cos
+quarter
+```
+
+Sesiones:
+
+```text
+is_asia_session
+is_europe_session
+is_us_session
+is_session_overlap_europe_us
+bars_since_session_open
+bars_until_session_close
+```
+
+Efectos temporales crypto:
+
+```text
+is_daily_candle_open_zone
+is_daily_candle_close_zone
+is_weekly_open_zone
+is_weekly_close_zone
+hourly_volume_seasonality_ratio
+hourly_volatility_seasonality_ratio
+```
+
+---
+
+## 10.14 Features multi-timeframe
+
+Para cada símbolo, agregar features de timeframes superiores e inferiores si existen:
+
+```text
+ret_1_from_15m
+ret_4_from_15m
+ret_1_from_1h
+ret_4_from_1h
+ret_1_from_4h
+ret_6_from_4h
+ret_1_from_1d
+
+rsi_14_15m
+rsi_14_1h
+rsi_14_4h
+rsi_14_1d
+
+ema_20_dist_15m
+ema_20_dist_1h
+ema_20_dist_4h
+ema_20_dist_1d
+
+trend_strength_15m
+trend_strength_1h
+trend_strength_4h
+trend_strength_1d
+
+volatility_20_15m
+volatility_20_1h
+volatility_20_4h
+volatility_20_1d
+
+bb_percent_b_20_15m
+bb_percent_b_20_1h
+bb_percent_b_20_4h
+bb_percent_b_20_1d
+
+multi_tf_trend_alignment
+multi_tf_momentum_alignment
+multi_tf_volatility_alignment
+multi_tf_risk_conflict_score
+```
+
+Regla: una vela de timeframe superior solo puede usarse si ya está cerrada.
+
+---
+
+## 10.15 Features cross-asset
+
+Contexto BTC/ETH/SOL:
+
+```text
+btc_ret_1
+btc_ret_6
+btc_ret_12
+btc_ret_24
+eth_ret_1
+eth_ret_6
+eth_ret_12
+eth_ret_24
+sol_ret_1
+sol_ret_6
+sol_ret_12
+sol_ret_24
+```
+
+Correlaciones:
+
+```text
+corr_symbol_btc_20
+corr_symbol_btc_50
+corr_symbol_eth_20
+corr_symbol_eth_50
+corr_btc_eth_20
+corr_btc_sol_20
+corr_eth_sol_20
+rolling_beta_to_btc_20
+rolling_beta_to_btc_50
+rolling_beta_to_eth_20
+rolling_beta_to_eth_50
+```
+
+Relative strength:
+
+```text
+relative_strength_vs_btc_6
+relative_strength_vs_btc_24
+relative_strength_vs_btc_72
+relative_strength_vs_eth_6
+relative_strength_vs_eth_24
+relative_strength_vs_eth_72
+symbol_outperformance_btc_24
+symbol_outperformance_eth_24
+```
+
+Mercado global crypto:
+
+```text
+market_breadth_proxy
+avg_return_universe_1
+avg_return_universe_6
+avg_return_universe_24
+median_return_universe_24
+cross_asset_dispersion_24
+risk_on_score_crypto
+risk_off_score_crypto
+```
+
+---
+
+## 10.16 Features de régimen de mercado
+
+Régimen de tendencia:
+
+```text
+regime_trending_up
+regime_trending_down
+regime_sideways
+trend_regime_score
+```
+
+Régimen de volatilidad:
+
+```text
+regime_low_volatility
+regime_medium_volatility
+regime_high_volatility
+volatility_regime_score
+volatility_percentile_100
+volatility_percentile_252
+```
+
+Régimen de liquidez:
+
+```text
+regime_low_liquidity
+regime_normal_liquidity
+regime_high_liquidity
+liquidity_regime_score
+```
+
+Régimen de ruptura/mean reversion:
+
+```text
+regime_breakout
+regime_breakdown
+regime_mean_reversion
+regime_compression
+regime_expansion
+```
+
+Régimen de riesgo:
+
+```text
+market_stress_score
+drawdown_regime
+correlation_spike_regime
+volume_shock_regime
+volatility_shock_regime
+```
+
+---
+
+## 10.17 Features de costes, ejecución y exchange
+
+Estas features son necesarias para modelos que predicen retorno neto, calidad de trade, sizing o salida.
+
+```text
+estimated_fee_rate
+estimated_roundtrip_fee_pct
+estimated_slippage_pct
+estimated_spread_pct
+expected_cost_pct
+min_notional_usdt
+step_size
+tick_size
+lot_size_precision
+price_precision
+notional_precision
+order_size_vs_volume_20
+order_size_vs_quote_volume_20
+order_size_market_impact_proxy
+cost_adjusted_expected_return
+cost_adjusted_risk_reward
+```
+
+Comprobación dimensional obligatoria:
+
+```text
+price * return_pct = price_delta
+notional * return_pct = PnL
+qty = notional / price
+fee = notional * fee_rate
+slippage = notional * slippage_pct
+```
+
+---
+
+## 10.18 Features de estado de portfolio para allocator/risk models
+
+Estas no deben contaminar modelos de predicción pura de mercado, pero sí pueden alimentar modelos del allocator, risk manager o sizing.
+
+```text
+available_cash_usdt
+locked_cash_usdt
+total_equity_usdt
+current_total_exposure_usdt
+current_symbol_exposure_usdt
+current_model_exposure_usdt
+open_trades_total
+open_trades_by_symbol
+open_trades_by_model
+unrealized_pnl_total
+unrealized_pnl_by_symbol
+unrealized_pnl_by_model
+realized_pnl_today
+daily_drawdown_pct
+total_drawdown_pct
+risk_limit_usage_total
+risk_limit_usage_symbol
+risk_limit_usage_model
+cash_reserve_ratio
+```
+
+---
+
+## 10.19 Features históricas de calidad del modelo
+
+Para allocator, lifecycle y model selection:
+
+```text
+model_total_return
+model_realized_pnl_usdt
+model_unrealized_pnl_usdt
+model_profit_factor
+model_win_rate
+model_avg_win
+model_avg_loss
+model_expectancy
+model_max_drawdown
+model_recent_drawdown
+model_sharpe
+model_sortino
+model_trade_count
+model_recent_trade_count
+model_consecutive_losses
+model_consecutive_wins
+model_tp_hit_rate
+model_sl_hit_rate
+model_expiry_rate
+model_deterioration_exit_rate
+model_avg_holding_bars
+model_fee_drag_pct
+model_slippage_drag_pct
+model_calibration_error_direction
+model_calibration_error_return
+model_expected_vs_realized_error
+model_mfe_prediction_error
+model_mae_prediction_error
+model_quantile_coverage_error
+model_degradation_score
+model_lifecycle_status_encoded
+```
+
+---
+
+## 10.20 Features de propuestas y calidad esperada del trade
+
+Para entrenar/evaluar allocator y trade quality models:
+
+```text
+proposal_confidence
+proposal_expected_return_pct
+proposal_expected_move_pct
+proposal_expected_adverse_move_pct
+proposal_expected_value_usdt
+proposal_q05_return_pct
+proposal_q25_return_pct
+proposal_q50_return_pct
+proposal_q75_return_pct
+proposal_q95_return_pct
+proposal_expected_mfe_pct
+proposal_expected_mae_pct
+proposal_horizon_bars
+proposal_requested_notional_usdt
+proposal_score
+proposal_risk_reward_ratio
+proposal_expected_return_after_costs
+proposal_expected_loss_if_sl
+proposal_expected_gain_if_tp
+proposal_probability_weighted_ev
+proposal_validity_remaining_seconds
+proposal_overlap_with_open_trades
+proposal_correlation_with_open_trades
+```
+
+---
+
+## 10.21 Features de salidas y gestión de posición
+
+Para exit models / stop manager:
+
+```text
+trade_age_bars
+trade_age_seconds
+holding_period_progress
+horizon_remaining_bars
+horizon_remaining_pct
+entry_to_current_return_pct
+entry_to_current_pnl_usdt
+current_distance_to_tp_pct
+current_distance_to_sl_pct
+current_distance_to_emergency_sl_pct
+current_mfe_since_entry
+current_mae_since_entry
+mfe_mae_ratio_since_entry
+expected_return_now_pct
+expected_return_change_since_entry
+confidence_now
+confidence_change_since_entry
+prob_down_now
+prob_down_change_since_entry
+signal_expired
+signal_deterioration_score
+risk_reward_now
+exit_pressure_score
+```
+
+---
+
+## 10.22 Features de eventos externos si se integran fuentes externas
+
+Estas features solo deben usarse si la fuente está disponible, versionada, timestamped y sin leakage.
+
+Mercado macro/crypto externo:
+
+```text
+btc_dominance
+stablecoin_dominance
+crypto_total_market_cap_return
+crypto_total_volume_change
+fear_greed_index
+fear_greed_change
+```
+
+Derivados como contexto, aunque la ejecución sea Spot:
+
+```text
+funding_rate_btc
+funding_rate_eth
+funding_rate_sol
+open_interest_change_btc
+open_interest_change_eth
+open_interest_change_sol
+long_short_ratio_btc
+long_short_ratio_eth
+long_short_ratio_sol
+liquidations_long_usdt
+liquidations_short_usdt
+```
+
+Sentiment/news si existe pipeline fiable:
+
+```text
+news_sentiment_score
+news_sentiment_change
+social_volume_score
+social_sentiment_score
+event_risk_score
+```
+
+---
+
+## 10.23 Features que NO deben usarse
+
+Prohibidas por leakage o mala práctica:
+
+```text
+future_return usado como feature
+MFE futuro usado como feature
+MAE futuro usado como feature
+hit_tp_before_sl futuro usado como feature
+resultado de la operación actual
+exit_price futuro
+realized_pnl futuro
+labels mezcladas como inputs
+normalización calculada con datos posteriores a t
+features de una vela superior no cerrada
+selección de parámetros usando OOS final
+```
+
+---
+
+## 11. Labels finales
+
+El sistema debe generar labels para entrenar varios objetivos.
+
+### 11.1 Labels de retorno
+
+```text
+future_return_1h
+future_return_2h
+future_return_4h
+future_return_6h
+future_return_8h
+future_return_12h
+future_return_24h
+future_return_48h
+future_return_72h
+future_return_168h
+```
+
+### 11.2 Labels de MFE/MAE
+
+```text
+MFE_1h
+MFE_2h
+MFE_4h
+MFE_6h
+MFE_8h
+MFE_12h
+MFE_24h
+MFE_48h
+MAE_1h
+MAE_2h
+MAE_4h
+MAE_6h
+MAE_8h
+MAE_12h
+MAE_24h
+MAE_48h
+time_to_MFE
+time_to_MAE
+```
+
+### 11.3 Labels de cuantiles
+
+```text
+q01_return_horizon
+q05_return_horizon
+q10_return_horizon
+q25_return_horizon
+q50_return_horizon
+q75_return_horizon
+q90_return_horizon
+q95_return_horizon
+q99_return_horizon
+```
+
+### 11.4 Labels de trade lifecycle
+
+```text
+hit_tp_before_sl
+hit_sl_before_tp
+expired_without_tp_sl
+best_exit_return_after_costs
+trade_return_after_costs
+exit_reason_label
+optimal_holding_bars
+```
+
+### 11.5 Labels de ejecución paper/live/shadow
+
+```text
+actual_entry_price
+actual_exit_price
+actual_qty
+actual_fees
+actual_slippage
+actual_holding_bars
+actual_exit_reason
+actual_realized_pnl_usdt
+actual_return_pct
+actual_MFE
+actual_MAE
+allocator_decision
+risk_rejection_reason
+shadow_trade_return
+shadow_exit_reason
+```
+
+---
+
+## 12. Tipos de modelos finales
+
+La plataforma debe soportar varios objetivos:
+
+```text
+direction_model
+expected_return_model
+expected_move_model
+expected_adverse_move_model
+MFE_model
+MAE_model
+quantile_model
+regime_model
+calibration_model
+trade_quality_model
+allocator_quality_model
+exit_model
+risk_model
+```
+
+Familias posibles:
+
+```text
+LightGBM
+XGBoost
+CatBoost
+RandomForest
+ExtraTrees
+LogisticRegression calibrada
+Regresión robusta
+Quantile regression
+Redes neuronales si aportan valor real
+Ensembles de investigación sin convertirlos en señal media operativa
+```
+
+Cada mini-bot puede ser una combinación de:
+
+```text
+símbolo
+timeframe
+familia de features
+familia de labels
+horizonte
+régimen de mercado
+modelo
+configuración de trade_builder
+```
+
+---
+
+## 13. Predicción estructurada final
+
+Cada modelo activo debe devolver:
+
+```json
+{
+  "model_id": "...",
+  "symbol": "BTCUSDT",
+  "timeframe": "1h",
+  "timestamp_utc": "...",
+  "direction": "LONG | FLAT | EXIT",
+  "confidence": 0.0,
+  "prob_up": 0.0,
+  "prob_down": 0.0,
+  "prob_flat": 0.0,
+  "expected_return_pct": 0.0,
+  "expected_move_pct": 0.0,
+  "expected_adverse_move_pct": 0.0,
+  "q05_return_pct": 0.0,
+  "q25_return_pct": 0.0,
+  "q50_return_pct": 0.0,
+  "q75_return_pct": 0.0,
+  "q95_return_pct": 0.0,
+  "expected_max_favorable_excursion_pct": 0.0,
+  "expected_max_adverse_excursion_pct": 0.0,
+  "horizon_bars": 0,
+  "signal_valid_until_utc": "...",
+  "raw_prediction_json": {}
+}
+```
+
+---
+
+## 14. Trade proposal final
+
+Una predicción puede generar una propuesta.  
+Una propuesta nunca es una orden directa.
+
+```json
+{
+  "proposal_id": "...",
+  "prediction_id": "...",
+  "model_id": "...",
+  "symbol": "BTCUSDT",
+  "side": "LONG | EXIT | REDUCE",
+  "entry_reference_price": 0.0,
+  "confidence": 0.0,
+  "expected_return_pct": 0.0,
+  "expected_move_pct": 0.0,
+  "expected_adverse_move_pct": 0.0,
+  "expected_value_usdt": 0.0,
+  "q05_return_pct": 0.0,
+  "q50_return_pct": 0.0,
+  "q95_return_pct": 0.0,
+  "expected_max_favorable_excursion_pct": 0.0,
+  "expected_max_adverse_excursion_pct": 0.0,
+  "horizon_bars": 0,
+  "valid_until_utc": "...",
+  "requested_notional_usdt": 0.0,
+  "proposal_score": 0.0,
+  "raw_json": {}
+}
+```
+
+Todas las propuestas se persisten, incluso las rechazadas.
+
+---
+
+## 15. Capital allocator final
+
+El allocator recibe propuestas independientes y decide:
+
+```text
+ACCEPT
+REJECT
+RESIZE
+SHADOW
+DEFER
+FORCE_REDUCE
+FORCE_CLOSE
+```
+
+Inputs:
+
+```text
+available_cash
+locked_cash
+total_equity
+current_total_exposure
+current_symbol_exposure
+current_model_exposure
+model_quality_score
+model_recent_drawdown
+model_calibration_quality
+model_degradation_status
+proposal_confidence
+expected_return_after_costs
+expected_adverse_move
+expected_value
+TP/SL ratio
+correlation_with_open_trades
+liquidity_score
+stale_data_status
+reconciliation_status
+risk_limits
+kill_switch_status
+```
+
+Outputs:
+
+```text
+allocation_id
+decision
+approved_notional_usdt
+rejection_reason
+shadow_trade_id
+allocator_score
+risk_json
+decision_json
+```
+
+El allocator favorece:
+
+```text
+modelos con esperanza positiva reciente
+modelos calibrados
+modelos con drawdown controlado
+propuestas con EV neto positivo
+menor movimiento adverso esperado
+mejor liquidez
+menor correlación con exposición abierta
+```
+
+Bloquea o reduce:
+
+```text
+modelos degradados
+modelos descorrelacionados de su promesa histórica
+propuestas con baja confianza
+expected return insuficiente tras costes
+SL demasiado ancho
+riesgo de concentración
+reconciliation failure
+stale data
+kill switch activo
+```
+
+---
+
+## 16. Risk manager final
+
+Variables mínimas:
+
+```env
+MAX_TOTAL_EXPOSURE_USDT=500
+MAX_SYMBOL_EXPOSURE_USDT=250
+MAX_MODEL_OPEN_EXPOSURE_USDT=250
+MAX_OPEN_TRADES_TOTAL=10
+MAX_OPEN_TRADES_PER_MODEL=3
+MAX_OPEN_TRADES_PER_SYMBOL=5
+MAX_DAILY_LOSS_USDT=50
+MAX_TOTAL_DRAWDOWN_PCT=0.08
+MAX_TRADE_LOSS_USDT=25
+MAX_ORDER_NOTIONAL_USDT=100
+MIN_ORDER_NOTIONAL_USDT=10
+MIN_CASH_RESERVE_USDT=50
+MAX_TRADES_PER_DAY_TOTAL=50
+MAX_TRADES_PER_DAY_PER_MODEL=10
+STALE_DATA_MAX_SECONDS=120
+RECONCILIATION_REQUIRED=true
+```
+
+Comprueba:
+
+```text
+balance disponible
+fondos libres/bloqueados
+min notional
+lot size
+step size
+tick size
+exposición total
+concentración por símbolo
+exposición por modelo
+pérdida máxima por trade
+pérdida diaria
+drawdown total
+máximo de trades por día
+órdenes abiertas
+entradas duplicadas
+datos stale
+conectividad exchange
+estado lifecycle del modelo
+kill switch
+reconciliación
+```
+
+---
+
+## 17. Trade builder final
+
+Debe construir trades con:
+
+```text
+trade_id
+proposal_id
+allocation_id
+prediction_id
+model_id
+symbol
+side
+requested_notional_usdt
+approved_notional_usdt
+qty
+entry_reference_price
+tp_price
+sl_price
+emergency_sl_price
+horizon_bars
+valid_until_utc
+max_loss_usdt
+estimated_fees_usdt
+estimated_slippage_usdt
+risk_reward_ratio
+```
+
+TP/SL se derivan de:
+
+```text
+expected_return_pct
+expected_move_pct
+expected_adverse_move_pct
+MFE esperado
+MAE esperado
+q05/q25/q50/q75/q95
+volatilidad actual
+fees
+slippage
+confidence
+horizon
+max_trade_loss_usdt
+```
+
+Para LONG:
+
+```text
+tp_price = entry_price * (1 + model_derived_tp_return)
+sl_price = entry_price * (1 - model_derived_sl_return)
+```
+
+Comprobación dimensional:
+
+```text
+precio * retorno adimensional = precio
+USDT * retorno adimensional = USDT de PnL
+cantidad = notional / precio
+```
+
+---
+
+## 18. Execution engine final
+
+Único módulo autorizado para colocar órdenes.
+
+Debe gestionar:
+
+```text
+market orders
+limit orders
+order status
+partial fills
+fills
+fees
+slippage
+exchange filters
+client_order_id
+idempotencia
+timeouts
+reintentos seguros
+emergency stops
+cancelaciones defensivas
+```
+
+Prohibido:
+
+```text
+modelo llamando a Binance
+modelo cancelando órdenes
+modelo cerrando trade de otro modelo
+bypass del risk manager
+bypass del kill switch
+bypass de reconciliation
+```
+
+---
+
+## 19. Stop manager / Exit manager final
+
+Cada trade puede cerrar por:
+
+```text
+TP
+SL
+emergency SL
+expected_return_after_costs <= 0
+confidence bajo mínimo
+prob_down/adverse demasiado alta
+signal_valid_until expirado
+max_holding_bars alcanzado
+risk forced reduction
+manual close confirmado
+kill switch
+reconciliation failure
+```
+
+Un modelo no puede dejar una posición abierta indefinidamente por no emitir señal de salida.
+
+---
+
+## 20. Shadow trades finales
+
+Cada propuesta rechazada o redimensionada puede generar shadow trade.
+
+Sirven para medir:
+
+```text
+propuestas rechazadas que habrían ganado
+propuestas aceptadas que perdieron
+coste de oportunidad del allocator
+calidad independiente del modelo
+calidad independiente del risk manager
+si el allocator está aportando valor real
+```
+
+Shadow trade usa:
+
+```text
+mismo TP
+mismo SL
+mismo horizonte
+misma lógica de salida
+mismos costes estimados
+```
+
+No envía órdenes.
+
+---
+
+## 21. Ledger final
+
+Debe registrar:
+
+```text
+realized_pnl
+unrealized_pnl
+fees
+slippage
+average_entry_price
+average_exit_price
+quantity
+notional
+market_value
+cash_usage
+locked_funds
+free_funds
+equity_curve
+drawdown
+returns_by_model
+returns_by_symbol
+returns_by_trade
+returns_by_strategy_family
+rejected_shadow_opportunity_pnl
+```
+
+Cada evento debe estar ligado a los IDs correspondientes.
+
+---
+
+## 22. Base de datos final
+
+Tablas objetivo:
+
+```text
+prices
+data_coverage
+data_gaps
+features
+labels
+
+model_registry
+model_lifecycle_events
+model_training_runs
+model_validation_runs
+model_backtest_runs
+model_predictions
+model_performance
+
+trade_proposals
+allocations
+trades
+trade_events
+orders
+fills
+
+positions
+account_snapshots
+balance_snapshots
+portfolio_snapshots
+
+shadow_trades
+shadow_trade_events
+
+risk_events
+reconciliation_events
+bot_events
+system_status
+dashboard_control_events
+```
+
+Regla crítica:
+
+```text
+No se sobrescribe historia silenciosamente.
+No se borran modelos malos.
+No se borran propuestas rechazadas.
+No se borran risk events.
+```
+
+---
+
+## 23. Model lifecycle final
+
+Estados:
+
+```text
+candidate
+validation_rejected
+validation_accepted
+backtest_rejected
+backtest_accepted
+paper_active
+paper_degraded
+paper_rejected
+paper_validated
+real_ready
+real_active
+real_paused
+real_rejected
+quarantined
+archived
+```
+
+Un modelo puede pausarse/cuarentenarse por:
+
+```text
+drawdown excesivo
+profit factor bajo
+pérdida diaria excesiva
+mala calibración
+desviación expected vs realized
+SL consecutivos
+errores operativos
+datos stale
+fallo de reconciliación
+acción manual del usuario
+```
+
+Un modelo no se elimina. Se conserva para auditoría.
+
+---
+
+## 24. Reconciliación Binance/DB
+
+Binance es fuente operativa de:
+
+```text
+balances
+órdenes
+fills
+estado real de cuenta
+```
+
+SQLite es fuente histórica/auditable de:
+
+```text
+decisiones
+predicciones
+propuestas
+asignaciones
+trades
+ledger
+PnL
+risk events
+```
+
+Si se pierde conexión:
+
+```text
+1. bloquear nuevas entradas
+2. marcar PAUSED_NO_CONNECTION
+3. preservar estado local
+4. al volver, sincronizar balances, órdenes y fills
+5. recalcular posiciones y PnL
+6. comparar Binance vs ledger
+7. reanudar solo si pasa reconciliación
+8. si falla, PAUSED_RECONCILIATION_ERROR
+```
+
+---
+
+## 25. Seguridad live final
+
+Defaults seguros:
+
+```env
+ENABLE_LIVE_TRADING=false
+ENABLE_REAL_ORDER_EXECUTION=false
+ENABLE_REAL_BINANCE_ACCOUNT=false
+ENABLE_BINANCE_TESTNET_PAPER_TRADING=true
+DRY_RUN=true
+ALLOW_AUTO_PROMOTE_TO_REAL=false
+KILL_SWITCH_ENABLED=true
+```
+
+Para live real deben estar todos:
+
+```env
+ENABLE_LIVE_TRADING=true
+ENABLE_REAL_ORDER_EXECUTION=true
+ENABLE_REAL_BINANCE_ACCOUNT=true
+DRY_RUN=false
+```
+
+Aun así:
+
+```text
+risk manager obligatorio
+kill switch obligatorio
+reconciliation obligatorio
+stale data bloquea
+max loss bloquea
+drawdown bloquea
+exchange mismatch bloquea
+```
+
+---
+
+## 26. Dashboard final
+
+Debe ser un panel operativo profesional.
+
+Secciones obligatorias:
+
+```text
+Global Status
+Capital & Risk
+Binance Synchronization
+Active Models
+Model Lifecycle
+Trade Proposals
+Allocator Decisions
+Open Trades
+Orders & Fills
+Ledger / PnL
+Shadow Analytics
+Data Quality
+Risk Events
+Reconciliation
+Server Health
+Controls
+```
+
+Debe responder inmediatamente:
+
+```text
+¿está corriendo el bot?
+¿está seguro?
+¿está conectado Binance?
+¿cuánto capital hay?
+¿qué modelos ganan?
+¿qué modelos pierden?
+qué trades están abiertos?
+qué riesgo hay?
+qué ha fallado?
+qué requiere acción?
+```
+
+Controles seguros:
+
+```text
+pause model
+resume model
+quarantine model
+archive model
+disable new entries
+shadow-only mode
+activate kill switch
+manual close con confirmación fuerte
+show recommended CLI commands
+```
+
+No debe activar live trading con un botón casual.
+
+---
+
+## 27. Despliegue final en servidor
+
+Requisitos:
+
+```text
+Linux ready
+pathlib
+.env.example completo
+requirements.txt actualizado
+logs persistentes
+DB configurable
+graceful shutdown
+restart-safe
+idempotent ingestion
+no secretos en repo
+no DB en repo
+no modelos pesados en repo
+healthchecks
+```
+
+Procesos finales:
+
+```text
+market-data-ingestor
+model-maintenance
+trading-bot
+reconciliation-worker
+dashboard
+```
+
+Opcional pero recomendable:
+
+```text
+systemd units
+Dockerfile
+docker-compose.yml
+healthcheck script
+```
+
+---
+
+## 28. Comandos finales esperados
+
+```bash
+python src/db_utils.py --init
+python src/db_utils.py --check-schema
+
+python src/download_data.py --symbols BTCUSDT ETHUSDT SOLUSDT --timeframe 1h --mode full
+python src/realtime_ingestor.py --symbols BTCUSDT ETHUSDT SOLUSDT --timeframe 1h
+
+python src/model_maintenance.py --target-active-models 10 --max-attempts 100
+python src/backtest.py --mode full-system --walk-forward
+python src/validate_model.py --model-id <MODEL_ID>
+
+python src/trading_bot.py --mode paper
+python src/trading_bot.py --mode shadow-real
+
+python src/reconciliation_engine.py --check
+streamlit run src/dashboard.py
+```
+
+---
+
+## 29. Criterios finales de aceptación
+
+El bot final está completo cuando:
+
+```text
+hay múltiples modelos activos en paper/shadow
+cada modelo genera predicciones estructuradas
+cada predicción puede generar propuestas persistidas
+el allocator decide sobre propuestas independientes
+el risk manager bloquea operaciones peligrosas
+el trade builder deriva TP/SL/horizonte del modelo
+la ejecución está centralizada
+ningún modelo llama a Binance
+cada trade tiene PnL atribuible
+las propuestas rechazadas se evalúan como shadow trades
+los modelos malos se degradan/pausan/cuarentenan
+los modelos buenos reciben más capital
+la reconciliación Binance/DB bloquea si falla
+el dashboard permite supervisar y controlar el sistema
+el sistema puede correr en servidor de forma estable
+live trading está bloqueado por defecto
+no hay claims de rentabilidad garantizada
+```
+
+---
+
+## 30. Red lines
+
+No hacer nunca:
+
+```text
+claim de rentabilidad garantizada
+activar live por defecto
+hardcodear secretos
+commitear .env
+commitear DB
+commitear modelos pesados
+commitear logs/reports privados
+random split temporal
+training con leakage
+usar OOS para tuning
+borrar modelos fallidos
+borrar propuestas rechazadas
+promediar señales en una posición global
+dar capital fijo a modelos como diseño central
+permitir que modelos manden órdenes
+permitir que modelos cancelen órdenes
+permitir que un modelo cierre trade de otro
+bypassear risk manager
+bypassear kill switch
+bypassear reconciliation
+usar TP/SL fijos arbitrarios como núcleo
+ignorar disconnections
+ignorar Binance/DB mismatch
+hacer dashboard decorativo sin valor operativo
+```
+
+---
+
+## 31. Frase final del proyecto
+
+```text
+Un modelo no es rentable porque predice bien una vela.
+Es rentable si sus operaciones completas, ejecutadas con la misma lógica que usará en producción, mantienen esperanza positiva dentro de un sistema global controlado por riesgo.
+```

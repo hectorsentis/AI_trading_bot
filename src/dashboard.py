@@ -864,17 +864,49 @@ def _latest_by_group_dashboard(df: pd.DataFrame, group_cols: list[str], ts_col: 
 
 
 def render_portfolio_position_header(st, summary: dict[str, Any], account_label: str) -> None:
+    """Hero KPI strip: 4 mission-critical metrics. Everything else lives in
+    collapsible sections below so the Overview tab stays scannable."""
     st.subheader(f"Posición actual de cartera · {account_label}")
-    cols = st.columns(7)
+
     total_pnl = numeric_or_none(summary.get("total_pnl"))
     daily_pnl = numeric_or_none(summary.get("daily_pnl"))
-    cols[0].metric("Equity total", fmt_money(summary.get("total_equity")))
-    cols[1].metric("USDT libre", fmt_money(summary.get("cash_usdt")))
-    cols[2].metric("Invertido", fmt_money(summary.get("invested_value")))
-    cols[3].metric("PnL total", fmt_money(total_pnl), delta=fmt_pct(summary.get("total_return")))
-    cols[4].metric("PnL diario", fmt_money(daily_pnl), delta=fmt_pct(summary.get("daily_return")))
-    cols[5].metric("Exposición", fmt_pct(summary.get("exposure_pct")))
-    cols[6].metric("Drawdown", fmt_pct(summary.get("max_drawdown")))
+
+    # --- Hero strip: 4 metrics that drive operator decisions -------------
+    hero = st.columns(4)
+    hero[0].metric("Equity total", fmt_money(summary.get("total_equity")))
+    hero[1].metric(
+        "PnL diario",
+        fmt_money(daily_pnl),
+        delta=fmt_pct(summary.get("daily_return")),
+    )
+    hero[2].metric("Exposición", fmt_pct(summary.get("exposure_pct")))
+    hero[3].metric(
+        "PnL total",
+        fmt_money(total_pnl),
+        delta=fmt_pct(summary.get("total_return")),
+    )
+
+    # --- Secondary: cash & capital allocation ----------------------------
+    with st.expander("Capital y asignación", expanded=False):
+        sec = st.columns(3)
+        sec[0].metric("USDT libre", fmt_money(summary.get("cash_usdt")))
+        sec[1].metric("Invertido", fmt_money(summary.get("invested_value")))
+        sec[2].metric(
+            "PnL no realizado",
+            fmt_money(summary.get("unrealized_pnl")),
+        )
+
+    # --- Risk & performance -----------------------------------------------
+    with st.expander("Rendimiento y riesgo", expanded=False):
+        perf = st.columns(4)
+        perf[0].metric("Max drawdown", fmt_pct(summary.get("max_drawdown")))
+        perf[1].metric("Win rate", fmt_pct(summary.get("win_rate")))
+        perf[2].metric("Sharpe", fmt_num(summary.get("sharpe")))
+        perf[3].metric("Profit factor", fmt_num(summary.get("profit_factor")))
+        n_trades = summary.get("number_of_trades")
+        st.caption(
+            f"Trades totales: {'N/A' if n_trades is None else int(n_trades)}"
+        )
 
 
 def build_compact_model_view(registry: pd.DataFrame, model_control: pd.DataFrame, selected_models: list[str] | None = None) -> pd.DataFrame:
@@ -1038,7 +1070,7 @@ def render_selected_model_context(
     c0, c1, c2 = st.columns([1.2, 1, 1])
     apply_filter = c0.toggle(
         "Usar este modelo como filtro global",
-        value=bool(st.session_state.get("dashboard_apply_selected_model_filter", True)),
+        value=bool(st.session_state.get("dashboard_apply_selected_model_filter", False)),
         key="selected_model_filter_toggle",
     )
     st.session_state["dashboard_apply_selected_model_filter"] = bool(apply_filter)
@@ -1062,6 +1094,7 @@ def render_selected_model_context(
     pred_m = filter_model_context_df(data.read_table("model_predictions", 500, "created_at_utc"), model_id, selected_symbols, selected_accounts)
     perf_m = filter_model_context_df(data.read_table("model_performance", 500, "timestamp_utc"), model_id, selected_symbols, selected_accounts)
     metrics_m = filter_model_context_df(data.load_paper_model_metrics(2000), model_id, selected_symbols, selected_accounts)
+    funnel_m = apply_selection_filters(data.load_trade_lifecycle_funnel_reports(50), model_ids=[model_id])
 
     realized = pd.to_numeric(pos_m.get("realized_pnl"), errors="coerce").sum() if not pos_m.empty and "realized_pnl" in pos_m.columns else None
     unrealized = pd.to_numeric(pos_m.get("unrealized_pnl"), errors="coerce").sum() if not pos_m.empty and "unrealized_pnl" in pos_m.columns else None
@@ -1076,7 +1109,7 @@ def render_selected_model_context(
     k[5].metric("PnL abierto", fmt_money(unrealized))
     k[6].metric("Return paper", fmt_pct(latest_metric.iloc[0].get("total_return") if not latest_metric.empty else None))
 
-    sub = st.tabs(["Resumen", "Predicciones/señales", "Propuestas/allocator", "Trades/posiciones", "Órdenes/fills", "Métricas"])
+    sub = st.tabs(["Resumen", "Predicciones/señales", "Propuestas/allocator", "Trades/posiciones", "Órdenes/fills", "Métricas", "Funnel validacion"])
     with sub[0]:
         cols = [c for c in [
             "model_id", "status", "acceptance_status", "symbol_scope", "timeframe", "training_scope",
@@ -1108,6 +1141,25 @@ def render_selected_model_context(
         show_colored_df(st, metrics_m.head(80), height=260, money_cols=["realized_pnl", "unrealized_pnl", "total_pnl", "equity", "current_exposure"], pct_cols=["total_return", "max_drawdown", "win_rate"], pnl_cols=["realized_pnl", "unrealized_pnl", "total_pnl", "total_return"], status_cols=["validation_status"], empty="No hay paper_model_metrics para este modelo.")
         perf_cols = [c for c in ["timestamp_utc", "symbol", "timeframe", "account_mode", "predictions", "proposals", "accepted_proposals", "rejected_proposals", "open_trades", "closed_trades", "realized_pnl_usdt", "unrealized_pnl_usdt", "total_return_pct", "max_drawdown_pct", "win_rate", "profit_factor", "degradation_status"] if c in perf_m.columns]
         show_colored_df(st, perf_m[perf_cols].head(120) if perf_cols and not perf_m.empty else perf_m.head(120), height=260, money_cols=["realized_pnl_usdt", "unrealized_pnl_usdt"], pct_cols=["total_return_pct", "max_drawdown_pct", "win_rate"], pnl_cols=["realized_pnl_usdt", "unrealized_pnl_usdt", "total_return_pct"], status_cols=["degradation_status"], empty="No hay model_performance para este modelo.")
+    with sub[6]:
+        funnel_cols = [c for c in [
+            "generated_at_utc", "validation_run_id", "validation_prediction_rows",
+            "signal_position_counts", "direction_counts", "long_prediction_count",
+            "proposal_count", "proposal_by_side_status", "allocation_count",
+            "allocation_by_decision_rejection_reason", "trade_builder_success",
+            "trade_builder_failure", "trade_builder_failure_reasons", "risk_approved",
+            "risk_rejected", "risk_rejection_reasons", "entries_scheduled",
+            "entries_filled", "trades_opened", "trades_closed", "exit_reasons",
+            "lifecycle_trade_count", "diagnosis_status", "diagnosis_message", "source_file",
+        ] if c in funnel_m.columns]
+        show_colored_df(
+            st,
+            funnel_m[funnel_cols].head(20) if funnel_cols and not funnel_m.empty else funnel_m,
+            height=380,
+            pct_cols=["lifecycle_total_return"],
+            status_cols=["diagnosis_status"],
+            empty="No hay reportes funnel para este modelo. Ejecuta validate_model.py o backtest.py.",
+        )
 
 
 def render_selected_model_simple(
@@ -1130,7 +1182,7 @@ def render_selected_model_simple(
     st.subheader(f"Modelo seleccionado: {model_id}")
     apply_filter = st.toggle(
         "Aplicar este modelo como filtro global",
-        value=bool(st.session_state.get("dashboard_apply_selected_model_filter", True)),
+        value=bool(st.session_state.get("dashboard_apply_selected_model_filter", False)),
         key="simple_selected_model_global_filter",
     )
     st.session_state["dashboard_apply_selected_model_filter"] = bool(apply_filter)
@@ -1375,6 +1427,25 @@ def render_models_tab(st, registry: pd.DataFrame, model_control: pd.DataFrame, r
     st.markdown("#### Latest report summaries")
     show_df(st, pd.DataFrame(report_rows), height=220, empty="No report summaries available.")
 
+    st.markdown("#### Trade-lifecycle validation funnel reports")
+    funnel_reports = data.load_trade_lifecycle_funnel_reports(20)
+    funnel_cols = [
+        "generated_at_utc", "model_id", "validation_run_id", "validation_prediction_rows",
+        "signal_position_counts", "direction_counts", "long_prediction_count",
+        "proposal_count", "proposal_by_side_status", "allocation_count",
+        "trade_builder_success", "trade_builder_failure", "risk_approved", "risk_rejected",
+        "entries_scheduled", "entries_filled", "trades_opened", "trades_closed",
+        "lifecycle_trade_count", "diagnosis_status", "diagnosis_message", "source_file",
+    ]
+    show_colored_df(
+        st,
+        funnel_reports[[c for c in funnel_cols if c in funnel_reports.columns]] if not funnel_reports.empty else funnel_reports,
+        height=320,
+        pct_cols=["lifecycle_total_return"],
+        status_cols=["diagnosis_status"],
+        empty="No funnel reports found. Run validate_model.py or backtest.py to generate trade_lifecycle_funnel_*.json.",
+    )
+
 
 def render_bot_control_tab(st, status: dict[str, Any], requested_by: str) -> None:
     st.subheader("Bot Control - audited operator intents")
@@ -1569,6 +1640,7 @@ def main() -> None:
 
     st.set_page_config(page_title="AI Trading Bot - Operations", page_icon=None, layout="wide")
     inject_css(st)
+    st.session_state.setdefault("dashboard_apply_selected_model_filter", False)
     requested_by = auth.require_login(st)
     if requested_by is None:
         return
@@ -1645,31 +1717,51 @@ def main() -> None:
     with st.sidebar:
         st.divider()
         st.subheader("Filtros")
+        if st.button("Reset filtros / ver todo", use_container_width=True):
+            for key in [
+                "filter_view_real",
+                "filter_symbols",
+                "filter_chart_symbol",
+                "filter_timeframe",
+                "filter_price_limit",
+                "filter_models",
+                "filter_accounts_override",
+                "filter_order_statuses",
+                "filter_signal_labels",
+                "main_model_selectbox",
+                "dashboard_selected_model_id",
+                "simple_selected_model_global_filter",
+            ]:
+                st.session_state.pop(key, None)
+            st.session_state["dashboard_apply_selected_model_filter"] = False
+            st.rerun()
         selected_symbols: list[str] = []
         selected_models: list[str] = []
         selected_accounts: list[str] = []
         selected_order_statuses: list[str] = []
         selected_signal_labels: list[str] = []
         symbol_options = all_symbols or ["BTCUSDT"]
-        view_real_portfolio = st.toggle("Ver cartera real", value=False, help="OFF = demo/paper/testnet/local. ON = real/live si existen datos en SQLite.")
+        view_real_portfolio = st.toggle("Ver cartera real", value=False, key="filter_view_real", help="OFF = demo/paper/testnet/local. ON = real/live si existen datos en SQLite.")
         selected_accounts = choose_account_modes(all_accounts, view_real_portfolio)
         account_label = "REAL" if view_real_portfolio else "DEMO / PAPER"
         if view_real_portfolio and selected_accounts == ["__NO_REAL_ACCOUNT_MODE__"]:
             st.warning("No hay datos de cartera real en SQLite para los filtros actuales.")
         else:
             st.caption(f"Vista cartera: {account_label}")
-        selected_symbols = st.multiselect("Símbolos", symbol_options, default=[], help="Vacío = todos los símbolos en tablas/KPIs.")
+        selected_symbols = st.multiselect("Símbolos", symbol_options, default=[], key="filter_symbols", help="Vacío = todos los símbolos en tablas/KPIs.")
         chart_symbol_options = selected_symbols or symbol_options
-        symbol = st.selectbox("Símbolo del gráfico", chart_symbol_options, index=0)
-        timeframe = st.text_input("Timeframe", value=str(status.get("timeframe") or "1h"))
-        price_limit = st.slider("Velas", 100, 3000, 800, 100)
+        if st.session_state.get("filter_chart_symbol") not in chart_symbol_options:
+            st.session_state["filter_chart_symbol"] = chart_symbol_options[0]
+        symbol = st.selectbox("Símbolo del gráfico", chart_symbol_options, index=chart_symbol_options.index(st.session_state["filter_chart_symbol"]), key="filter_chart_symbol")
+        timeframe = st.text_input("Timeframe", value=str(status.get("timeframe") or "1h"), key="filter_timeframe")
+        price_limit = st.slider("Velas", 100, 3000, 800, 100, key="filter_price_limit")
         with st.expander("Advanced filters", expanded=False):
-            selected_models = st.multiselect("Models", all_models, default=[], help="Empty = all models")
-            override_accounts = st.multiselect("Account modes override", all_accounts, default=[], help="Vacío = usa el switch real/demo")
+            selected_models = st.multiselect("Models", all_models, default=[], key="filter_models", help="Vacío = todos los modelos")
+            override_accounts = st.multiselect("Account modes override", all_accounts, default=[], key="filter_accounts_override", help="Vacío = usa el switch real/demo")
             if override_accounts:
                 selected_accounts = override_accounts
-            selected_order_statuses = st.multiselect("Order statuses", all_statuses, default=[], help="Affects order charts/tables")
-            selected_signal_labels = st.multiselect("Signal labels", all_signal_labels, default=[], help="Affects signal charts/tables")
+            selected_order_statuses = st.multiselect("Order statuses", all_statuses, default=[], key="filter_order_statuses", help="Affects order charts/tables")
+            selected_signal_labels = st.multiselect("Signal labels", all_signal_labels, default=[], key="filter_signal_labels", help="Affects signal charts/tables")
             if selected_symbols and symbol not in selected_symbols:
                 st.caption("The chart symbol is independent from table filters.")
 
@@ -1681,7 +1773,7 @@ def main() -> None:
             st.code(str(context_model_id), language=None)
             st.checkbox(
                 "Aplicar modelo clicado a todo",
-                value=bool(st.session_state.get("dashboard_apply_selected_model_filter", True)),
+                value=bool(st.session_state.get("dashboard_apply_selected_model_filter", False)),
                 key="dashboard_apply_selected_model_filter",
                 help="Cuando está activo, todas las tablas con model_id se filtran por el modelo seleccionado.",
             )
@@ -1689,7 +1781,7 @@ def main() -> None:
                 st.session_state.pop("dashboard_selected_model_id", None)
                 st.session_state["dashboard_apply_selected_model_filter"] = False
                 st.rerun()
-    if context_model_id and st.session_state.get("dashboard_apply_selected_model_filter", True):
+    if context_model_id and st.session_state.get("dashboard_apply_selected_model_filter", False):
         selected_models = [str(context_model_id)]
 
     signals_f = apply_selection_filters(signals, model_ids=selected_models, symbols=selected_symbols, account_modes=selected_accounts, signal_labels=selected_signal_labels)
@@ -1714,7 +1806,74 @@ def main() -> None:
     if filtered_equity.empty and not selected_models and not view_real_portfolio:
         filtered_equity = data.load_equity_curve()
 
-    tabs = st.tabs(["Principal", "Posiciones", "Modelo", "Sistema", "Control"])
+    # ------------------------------------------------------------------
+    # Admin drawer (sidebar): System diagnostics + Control panel.
+    # Previously top-level "Sistema" and "Control" tabs — moved here so the
+    # main tab bar stays focused on day-to-day operator workflows.
+    # ------------------------------------------------------------------
+    with st.sidebar:
+        st.divider()
+        with st.expander("⚙️ Admin", expanded=False):
+            admin_section = st.radio(
+                "Admin section",
+                ["Control panel", "System & data", "Binance sync"],
+                key="admin_drawer_section",
+                label_visibility="collapsed",
+            )
+
+            if admin_section == "Control panel":
+                render_compact_kpis(st, view_summary, status, registry_f, positions_f, gaps_f)
+                render_simple_control_panel(st, status, requested_by)
+
+            elif admin_section == "System & data":
+                st.markdown("**Data coverage**")
+                show_simple_df(st, coverage_f, height=200, empty="No coverage rows.")
+                st.markdown("**Open gaps**")
+                show_simple_df(st, gaps_f, height=180, empty="No open gaps.")
+                st.markdown("**Risk events**")
+                risk_events = apply_selection_filters(
+                    data.read_table("risk_events", 300, "created_at_utc"),
+                    model_ids=selected_models,
+                    symbols=selected_symbols,
+                    account_modes=selected_accounts,
+                )
+                show_simple_df(st, risk_events, height=200, empty="No risk events.")
+                st.markdown("**Relationship integrity**")
+                relationship_issues = apply_selection_filters(
+                    data.load_relationship_issues(500),
+                    model_ids=selected_models,
+                    symbols=selected_symbols,
+                )
+                if relationship_issues.empty:
+                    st.success("Relaciones OK: no hay errores model/order/proposal/trade.")
+                else:
+                    st.warning(f"{len(relationship_issues)} relaciones rotas detectadas.")
+                    show_simple_df(st, relationship_issues, height=200)
+
+            else:  # Binance sync
+                account_snapshots = apply_selection_filters(
+                    data.read_table("account_snapshots", 100, "created_at_utc"),
+                    account_modes=selected_accounts,
+                )
+                balance_snapshots = apply_selection_filters(
+                    data.read_table("balance_snapshots", 200, "timestamp_utc"),
+                    account_modes=selected_accounts,
+                )
+                reconciliation_events = apply_selection_filters(
+                    data.read_table("reconciliation_events", 200, "created_at_utc"),
+                    account_modes=selected_accounts,
+                )
+                st.markdown("**Account snapshots**")
+                show_simple_df(st, account_snapshots, height=170, empty="No account snapshots.")
+                st.markdown("**Balance snapshots**")
+                show_simple_df(st, balance_snapshots, height=170, empty="No balance snapshots.")
+                st.markdown("**Reconciliation events**")
+                show_simple_df(st, reconciliation_events, height=170, empty="No reconciliation events.")
+
+    # ------------------------------------------------------------------
+    # Top-level tabs: simplified to three operator-first views.
+    # ------------------------------------------------------------------
+    tabs = st.tabs(["Overview", "Positions & Trades", "Models"])
 
     with tabs[0]:
         render_portfolio_position_header(st, view_summary, account_label)
@@ -1726,27 +1885,39 @@ def main() -> None:
             signals_f,
             orders_f,
             positions_f,
-            key_prefix="principal",
+            key_prefix="overview",
         )
-        selected_model_id = render_main_models_table(st, registry_f, model_control, requested_by, selected_models)
-        st.caption("Vista simplificada: cartera, gr?fico y modelos. Usa las pesta?as para detalle.")
+        selected_model_id = render_main_models_table(
+            st, registry_f, model_control, requested_by, selected_models
+        )
+        st.caption(
+            "Overview: portfolio, price chart and active models. "
+            "Use the sidebar Admin drawer for system diagnostics and the control panel."
+        )
 
     with tabs[1]:
-        st.subheader("Posiciones abiertas")
+        st.subheader("Open positions")
         positions_view = build_open_positions_view(positions_f, trades_f)
         show_simple_df(
             st,
             positions_view,
             height=420,
             pct_cols=["pnl_pct", "exposure_pct", "dist_tp_pct", "dist_sl_pct"],
-            money_cols=["avg_entry_price", "current_price", "market_value", "realized_pnl", "tp_price", "sl_price"],
-            empty="No hay posiciones abiertas para la vista seleccionada.",
+            money_cols=[
+                "avg_entry_price", "current_price", "market_value",
+                "realized_pnl", "tp_price", "sl_price",
+            ],
+            empty="No open positions for the current view.",
         )
         c_pos1, c_pos2 = st.columns([1.4, 1])
         with c_pos1:
             render_equity(st, filtered_equity, key_prefix="positions_simple")
         with c_pos2:
-            render_exposure(st, build_filtered_exposure_breakdown(positions_f, view_summary), key_prefix="positions_simple")
+            render_exposure(
+                st,
+                build_filtered_exposure_breakdown(positions_f, view_summary),
+                key_prefix="positions_simple",
+            )
 
     with tabs[2]:
         model_for_detail = st.session_state.get("dashboard_selected_model_id")
@@ -1764,40 +1935,6 @@ def main() -> None:
             selected_symbols=selected_symbols,
             selected_accounts=selected_accounts,
         )
-
-    with tabs[3]:
-        st.subheader("Sistema y relaciones")
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("#### Datos")
-            show_simple_df(st, coverage_f, height=220, empty="No coverage rows.")
-            show_simple_df(st, gaps_f, height=220, empty="No open gaps.")
-        with c2:
-            st.markdown("#### Seguridad")
-            risk_events = apply_selection_filters(
-                data.read_table("risk_events", 300, "created_at_utc"),
-                model_ids=selected_models,
-                symbols=selected_symbols,
-                account_modes=selected_accounts,
-            )
-            show_simple_df(st, risk_events, height=220, empty="No risk events.")
-            relationship_issues = apply_selection_filters(data.load_relationship_issues(500), model_ids=selected_models, symbols=selected_symbols)
-            if relationship_issues.empty:
-                st.success("Relaciones OK: no hay errores model/order/proposal/trade en la vista actual.")
-            else:
-                st.warning(f"{len(relationship_issues)} relaciones rotas detectadas.")
-                show_simple_df(st, relationship_issues, height=220)
-        with st.expander("Sincronizaci?n Binance / cuenta", expanded=False):
-            account_snapshots = apply_selection_filters(data.read_table("account_snapshots", 100, "created_at_utc"), account_modes=selected_accounts)
-            balance_snapshots = apply_selection_filters(data.read_table("balance_snapshots", 200, "timestamp_utc"), account_modes=selected_accounts)
-            reconciliation_events = apply_selection_filters(data.read_table("reconciliation_events", 200, "created_at_utc"), account_modes=selected_accounts)
-            show_simple_df(st, account_snapshots, height=180, empty="No account snapshots.")
-            show_simple_df(st, balance_snapshots, height=180, empty="No balance snapshots.")
-            show_simple_df(st, reconciliation_events, height=180, empty="No reconciliation events.")
-
-    with tabs[4]:
-        render_compact_kpis(st, view_summary, status, registry_f, positions_f, gaps_f)
-        render_simple_control_panel(st, status, requested_by)
 
 
 if __name__ == "__main__":
