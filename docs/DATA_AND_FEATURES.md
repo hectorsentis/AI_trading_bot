@@ -12,17 +12,30 @@
   provider, ingestion_ts_utc`. (Taker buy volumes and trade count are kept — good, they enable
   buyer/seller-pressure features.)
 - **History:** `INITIAL_BACKFILL_DAYS = 365` by default; full mode backfills from `2017-01-01`.
-- **External data:** **none today** — no funding, open interest, fear/greed, order book or news.
+- **External data:** a leakage-safe layer exists (`src/external_data.py`) for funding rate, open
+  interest and fear/greed (stored in the `external_data` table, joined via backward as-of). It is
+  **opt-in and off by default** (`ENABLE_EXTERNAL_DATA=false`; ingestion needs network) and is not
+  yet folded into the training `FEATURE_COLUMNS` contract. No order book or news.
 
-## Current features
+## Current features (v4 — Phase C)
 
-~46–56 features across ~14 families (`config.py:190-246`, computed in `features.py` and
-`technical_patterns.py`): returns, range/spread, volatility/ATR, volume, moving-average distance
-& slope, MACD, Bollinger, stochastic, price-action/breakouts, candlestick patterns, simple
-statistics/z-scores, reversal proxies, short sequences, and cyclical time encodings.
+**76 features** (`FEATURE_VERSION = v4_regime_microstructure_crossasset`, `config.py`), computed
+in `features.py`:
 
-The [`initial_roadmap`](initial_roadmap) sections 10.1–10.23 enumerate ~1000 features across
-20+ families. Today's set is a useful core but a small fraction of that target.
+- **Core (v3):** returns, range/spread, volatility/ATR, volume, moving-average distance & slope,
+  MACD, Bollinger, stochastic, price-action/breakouts, candlestick patterns, statistics/z-scores,
+  reversal proxies, short sequences, cyclical time encodings.
+- **v4 volatility/regime/momentum:** `volatility_50`, `volatility_ratio_20_50`,
+  `downside_volatility_20`, `volatility_regime_score`, `dist_ma_50/200`, `price_above_sma_50`,
+  `trend_strength_50`, `rolling_drawdown_50`, `dist_from_high_50`, `ret_24`, `roc_10`, `rsi_7`.
+- **v4 microstructure (taker data):** `taker_buy_ratio`, `taker_imbalance`,
+  `taker_imbalance_zscore_20`, `avg_trade_size_zscore_20` (neutral fallback if taker columns absent).
+- **v4 cross-asset BTC context:** `btc_ret_24`, `rel_strength_vs_btc_24`, `corr_btc_50`,
+  `beta_btc_50` (leakage-safe backward as-of merge of the reference close; neutral if absent).
+
+v4 is additive over v3, so existing v3 models keep working; run `feature_store --full-rebuild` to
+populate the new columns before training v4 models. The [`initial_roadmap`](initial_roadmap)
+sections 10.1–10.23 remain the longer-term target (multi-timeframe is the next family — deferred).
 
 ## Target feature expansion (Phase C)
 

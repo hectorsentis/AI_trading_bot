@@ -64,12 +64,28 @@ no model mixing). Cost knobs: `ENABLE_NATIVE_PREDICTION_MODELS`, `ENABLE_PROBABI
 ## Phase C — Features & external data
 Goal: broaden the feature store with leakage discipline.
 
-- [ ] Expand feature families toward the roadmap: multi-timeframe (only closed higher-TF
-  candles), cross-asset BTC/ETH context, regime, volatility, microstructure proxies from taker
-  data.
-- [ ] Add optional **leakage-safe external ingestion** (funding rate, open interest,
-  fear/greed) as separate timestamped tables joined as-of. New `src/external_data.py`.
-- [ ] Version every feature set; never normalize using future data.
+- [x] **Single-symbol expansion** (`features.py`, +21 features → `FEATURE_VERSION=v4`): volatility
+  (`volatility_50`, `volatility_ratio_20_50`, `downside_volatility_20`, `volatility_regime_score`),
+  regime/trend (`dist_ma_50/200`, `price_above_sma_50`, `trend_strength_50`, `rolling_drawdown_50`,
+  `dist_from_high_50`), momentum (`ret_24`, `roc_10`, `rsi_7`).
+- [x] **Microstructure from taker data** (`taker_buy_ratio`, `taker_imbalance`,
+  `taker_imbalance_zscore_20`, `avg_trade_size_zscore_20`); neutral fallback when taker columns
+  are absent. `feature_store`/`features` now load taker/quote/trades columns.
+- [x] **Cross-asset BTC context** (`btc_ret_24`, `rel_strength_vs_btc_24`, `corr_btc_50`,
+  `beta_btc_50`) via leakage-safe backward as-of merge of the reference close
+  (`CROSS_ASSET_REFERENCE_SYMBOL`); neutral when context absent. `feature_store.load_reference_close`.
+- [x] **Leakage-safe external ingestion** — new `src/external_data.py`: `external_data` table,
+  `attach_external_features_asof` (backward as-of join primitive), and flag-gated ingestion for
+  fear/greed, funding rate and open interest (`ENABLE_EXTERNAL_DATA`, off by default; network).
+- [x] Versioned (`v4_regime_microstructure_crossasset`); strict leakage discipline (tested:
+  `tests/test_features_phasec.py`, `tests/test_external_data.py`). New features are additive, so
+  existing `v3` models keep working; run `feature_store --full-rebuild` to populate v4 columns.
+- [ ] **Multi-timeframe features** (higher-TF closed-candle as-of into the base TF) — *remaining*;
+  the `attach_external_features_asof` backward as-of merge is the building block. Also wiring
+  external metrics into the training feature contract is opt-in/next.
+
+**Phase C core is deployed** (single-symbol, microstructure, cross-asset, external-data layer).
+Multi-timeframe + folding external metrics into `FEATURE_COLUMNS` remain.
 
 ## Phase D — Pool / lifecycle / allocator maturity + walk-forward + CI
 Goal: continuous, self-maintaining model pool.

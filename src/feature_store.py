@@ -20,6 +20,8 @@ from config import (
     SL_MULTIPLIER,
     FEATURE_STORE_RECALC_OVERLAP_BARS,
     FEATURE_STORE_WARMUP_BARS,
+    CROSS_ASSET_REFERENCE_SYMBOL,
+    ENABLE_CROSS_ASSET_FEATURES,
 )
 from db_utils import init_research_tables, refresh_coverage_from_table
 from features import compute_features
@@ -134,6 +136,9 @@ def get_latest_feature_datetime(symbol: str, timeframe: str) -> pd.Timestamp | N
     return ts
 
 
+_PRICE_OPTIONAL_COLUMNS = ["quote_asset_volume", "number_of_trades", "taker_buy_base_volume", "taker_buy_quote_volume"]
+
+
 def load_prices(symbol: str, timeframe: str, start_dt: pd.Timestamp | None = None) -> pd.DataFrame:
     conn = sqlite3.connect(DB_FILE)
     try:
@@ -145,7 +150,8 @@ def load_prices(symbol: str, timeframe: str, start_dt: pd.Timestamp | None = Non
 
         df = pd.read_sql_query(
             f"""
-            SELECT symbol, timeframe, datetime_utc, open, high, low, close, volume
+            SELECT symbol, timeframe, datetime_utc, open, high, low, close, volume,
+                   quote_asset_volume, number_of_trades, taker_buy_base_volume, taker_buy_quote_volume
             FROM {PRICES_TABLE}
             WHERE symbol = ? AND timeframe = ? {where_extra}
             ORDER BY datetime_utc
@@ -160,11 +166,37 @@ def load_prices(symbol: str, timeframe: str, start_dt: pd.Timestamp | None = Non
         return df
 
     df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True, errors="coerce")
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+    for col in ["open", "high", "low", "close", "volume", *_PRICE_OPTIONAL_COLUMNS]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
     df = df.dropna(subset=["datetime_utc", "open", "high", "low", "close", "volume"]).copy()
     df = df.sort_values("datetime_utc").reset_index(drop=True)
     return df
+
+
+def load_reference_close(timeframe: str) -> pd.DataFrame | None:
+    """Load the cross-asset reference (BTC) close series for leakage-safe context features."""
+    if not ENABLE_CROSS_ASSET_FEATURES:
+        return None
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        df = pd.read_sql_query(
+            f"""
+            SELECT datetime_utc, close AS ref_close
+            FROM {PRICES_TABLE}
+            WHERE symbol = ? AND timeframe = ?
+            ORDER BY datetime_utc
+            """,
+            conn,
+            params=(CROSS_ASSET_REFERENCE_SYMBOL, timeframe),
+        )
+    finally:
+        conn.close()
+    if df.empty:
+        return None
+    df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True, errors="coerce")
+    df["ref_close"] = pd.to_numeric(df["ref_close"], errors="coerce")
+    return df.dropna(subset=["datetime_utc", "ref_close"]).sort_values("datetime_utc").reset_index(drop=True)
 
 
 def _db_value(value):
@@ -244,8 +276,9 @@ def build_feature_frame(
     lookahead_bars: int,
     tp_multiplier: float,
     sl_multiplier: float,
+    context: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    feature_df = compute_features(prices_df)
+    feature_df = compute_features(prices_df, context=context)
     labeled_df = generate_triple_barrier_labels(
         feature_df,
         lookahead_bars=lookahead_bars,
@@ -261,6 +294,8 @@ def build_feature_frame(
 def run_feature_store(symbols: Iterable[str], timeframe: str, args) -> None:
     init_research_tables()
     timeframe_delta = timeframe_to_timedelta(timeframe)
+    # Cross-asset reference (BTC) context, loaded once and aligned per row via backward as-of.
+    reference_context = load_reference_close(timeframe)
 
     for symbol in symbols:
         latest_feature_dt = None if args.full_rebuild else get_latest_feature_datetime(symbol, timeframe)
@@ -284,6 +319,7 @@ def run_feature_store(symbols: Iterable[str], timeframe: str, args) -> None:
             lookahead_bars=args.lookahead_bars,
             tp_multiplier=args.tp_multiplier,
             sl_multiplier=args.sl_multiplier,
+            context=reference_context,
         )
 
         if write_start_dt is not None:

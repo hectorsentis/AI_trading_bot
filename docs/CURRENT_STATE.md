@@ -28,8 +28,11 @@ This is a code-grounded snapshot. It distinguishes what runs today from what the
 - **Model:** `LGBMClassifier`, `objective=multiclass`, 3 classes SHORT/FLAT/LONG. Labels are
   `triple_barrier_tp_sl_v2` (TP = 1.5x ATR, SL = 1.0x ATR, lookahead 6 bars).
   See `config.py:262-278` (MODEL_PARAMS) and `labels.py`.
-- **Features:** ~46–56 features across ~14 families (`config.py:190-246`), vs ~1000 across
-  20+ families in the roadmap. **OHLCV-only**; no funding/OI/fear-greed/order-book/news.
+- **Features (Phase C, v4):** **76 features** including volatility/regime/momentum,
+  microstructure from taker data, and leakage-safe cross-asset BTC context. A leakage-safe
+  external-data layer (`external_data.py`: funding/OI/fear-greed) exists but is opt-in
+  (`ENABLE_EXTERNAL_DATA=false`) and not yet in the training contract. Multi-timeframe features
+  remain. See [DATA_AND_FEATURES.md](DATA_AND_FEATURES.md).
 - **Prediction distribution (Phase B native models):** `train._train_native_models` now trains
   LightGBM expected-return regression, quantile (q05…q95) and MFE/MAE regressors, stored in the
   artifact under `native_models`. `prediction_engine.build_structured_prediction` prefers these

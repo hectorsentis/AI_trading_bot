@@ -243,10 +243,42 @@ FEATURE_COLUMNS = [
     "consecutive_down_3",
     "hour_sin",
     "hour_cos",
+    # --- Phase C (v4): volatility / regime / momentum ---
+    "ret_24",
+    "roc_10",
+    "rsi_7",
+    "volatility_50",
+    "volatility_ratio_20_50",
+    "downside_volatility_20",
+    "volatility_regime_score",
+    "dist_ma_50",
+    "dist_ma_200",
+    "price_above_sma_50",
+    "trend_strength_50",
+    "rolling_drawdown_50",
+    "dist_from_high_50",
+    # --- Phase C (v4): microstructure from taker data ---
+    "taker_buy_ratio",
+    "taker_imbalance",
+    "taker_imbalance_zscore_20",
+    "avg_trade_size_zscore_20",
+    # --- Phase C (v4): cross-asset BTC context (neutral when context absent) ---
+    "btc_ret_24",
+    "rel_strength_vs_btc_24",
+    "corr_btc_50",
+    "beta_btc_50",
 ]
 
-FEATURE_VERSION = "v3_symbol_pattern_regime"
+FEATURE_VERSION = "v4_regime_microstructure_crossasset"
 LABEL_VERSION = "triple_barrier_tp_sl_v2"
+
+# Phase C: cross-asset context + optional external data (funding/OI/fear-greed).
+CROSS_ASSET_REFERENCE_SYMBOL = os.getenv("CROSS_ASSET_REFERENCE_SYMBOL", "BTCUSDT")
+ENABLE_CROSS_ASSET_FEATURES = _env_bool("ENABLE_CROSS_ASSET_FEATURES", True)
+EXTERNAL_DATA_TABLE = "external_data"
+ENABLE_EXTERNAL_DATA = _env_bool("ENABLE_EXTERNAL_DATA", False)  # opt-in; requires network
+FEAR_GREED_API_URL = os.getenv("FEAR_GREED_API_URL", "https://api.alternative.me/fng/")
+BINANCE_FUTURES_BASE_URL = os.getenv("BINANCE_FUTURES_BASE_URL", "https://fapi.binance.com")
 
 LOOKAHEAD_BARS = 6
 TP_MULTIPLIER = 1.5

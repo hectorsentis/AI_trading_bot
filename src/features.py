@@ -16,12 +16,18 @@ def parse_args():
     return parser.parse_args()
 
 
+# Optional microstructure columns. Present in modern Binance ingests; absent in legacy/synthetic
+# data, in which case the microstructure features fall back to neutral values.
+TAKER_COLUMNS = ["quote_asset_volume", "number_of_trades", "taker_buy_base_volume", "taker_buy_quote_volume"]
+
+
 def _load_prices(symbol: str, timeframe: str) -> pd.DataFrame:
     conn = sqlite3.connect(DB_FILE)
     try:
         df = pd.read_sql_query(
             f"""
-            SELECT symbol, timeframe, datetime_utc, open, high, low, close, volume
+            SELECT symbol, timeframe, datetime_utc, open, high, low, close, volume,
+                   quote_asset_volume, number_of_trades, taker_buy_base_volume, taker_buy_quote_volume
             FROM {PRICES_TABLE}
             WHERE symbol = ? AND timeframe = ?
             ORDER BY datetime_utc
@@ -35,12 +41,52 @@ def _load_prices(symbol: str, timeframe: str) -> pd.DataFrame:
     if df.empty:
         return df
 
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+    for col in ["open", "high", "low", "close", "volume", *TAKER_COLUMNS]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True, errors="coerce")
     df = df.dropna(subset=["datetime_utc", "open", "high", "low", "close", "volume"]).copy()
     df = df.sort_values("datetime_utc").reset_index(drop=True)
+    return df
+
+
+def _attach_cross_asset_features(df: pd.DataFrame, context: pd.DataFrame | None) -> pd.DataFrame:
+    """Leakage-safe cross-asset (BTC) context, aligned by backward as-of merge.
+
+    ``context`` is a frame with ``datetime_utc`` and ``ref_close`` (reference-asset close, e.g.
+    BTCUSDT). Each row uses only the reference close known at or before its own timestamp. When
+    no context is supplied the features fall back to neutral constants (harmless to the model).
+    """
+    if context is not None and not getattr(context, "empty", True) and "ref_close" in context.columns:
+        ctx = context[["datetime_utc", "ref_close"]].dropna().sort_values("datetime_utc")
+    else:
+        ctx = None
+
+    if ctx is None or ctx.empty:
+        df["btc_ret_24"] = 0.0
+        df["rel_strength_vs_btc_24"] = 0.0
+        df["corr_btc_50"] = 0.0
+        df["beta_btc_50"] = 1.0
+        return df
+
+    merged = pd.merge_asof(
+        df[["datetime_utc"]].sort_values("datetime_utc"),
+        ctx,
+        on="datetime_utc",
+        direction="backward",
+    )
+    ref_close = pd.to_numeric(merged["ref_close"], errors="coerce").reset_index(drop=True)
+    sym_close = df["close"].reset_index(drop=True)
+    sym_ret = sym_close.pct_change()
+    ref_ret = ref_close.pct_change()
+
+    df["btc_ret_24"] = ref_close.pct_change(24).to_numpy()
+    df["rel_strength_vs_btc_24"] = (sym_close.pct_change(24) - ref_close.pct_change(24)).to_numpy()
+    df["corr_btc_50"] = sym_ret.rolling(50, min_periods=50).corr(ref_ret).to_numpy()
+    cov = sym_ret.rolling(50, min_periods=50).cov(ref_ret)
+    var = ref_ret.rolling(50, min_periods=50).var()
+    df["beta_btc_50"] = (cov / var.replace(0, np.nan)).fillna(1.0).to_numpy()
     return df
 
 
@@ -54,7 +100,7 @@ def _compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     return rsi
 
 
-def compute_features(prices_df: pd.DataFrame) -> pd.DataFrame:
+def compute_features(prices_df: pd.DataFrame, context: pd.DataFrame | None = None) -> pd.DataFrame:
     if prices_df.empty:
         return prices_df
 
@@ -228,6 +274,57 @@ def compute_features(prices_df: pd.DataFrame) -> pd.DataFrame:
     hour = df["datetime_utc"].dt.hour.astype(float)
     df["hour_sin"] = np.sin((2.0 * np.pi * hour) / 24.0)
     df["hour_cos"] = np.cos((2.0 * np.pi * hour) / 24.0)
+
+    # ===== Phase C (v4) expansion: volatility / regime / momentum =====
+    ma_50 = close.rolling(50, min_periods=50).mean()
+    ma_200 = close.rolling(200, min_periods=200).mean()
+
+    df["ret_24"] = close.pct_change(24)
+    df["roc_10"] = close.pct_change(10)
+    df["rsi_7"] = _compute_rsi(close, period=7)
+
+    df["volatility_50"] = returns_1.rolling(50, min_periods=50).std()
+    df["volatility_ratio_20_50"] = df["volatility_20"] / df["volatility_50"].replace(0, np.nan)
+    downside = returns_1.where(returns_1 < 0, 0.0)
+    df["downside_volatility_20"] = downside.rolling(20, min_periods=20).std()
+    vol20_mean_100 = df["volatility_20"].rolling(100, min_periods=100).mean()
+    vol20_std_100 = df["volatility_20"].rolling(100, min_periods=100).std()
+    df["volatility_regime_score"] = (df["volatility_20"] - vol20_mean_100) / vol20_std_100.replace(0, np.nan)
+
+    df["dist_ma_50"] = (close / ma_50) - 1.0
+    df["dist_ma_200"] = (close / ma_200) - 1.0
+    df["price_above_sma_50"] = (close > ma_50).astype(float)
+    df["trend_strength_50"] = (close - ma_50) / (50.0 * df["atr_14"].replace(0, np.nan))
+
+    rolling_max_close_50 = close.rolling(50, min_periods=50).max()
+    df["rolling_drawdown_50"] = (close / rolling_max_close_50.replace(0, np.nan)) - 1.0
+    rolling_high_50 = high.rolling(50, min_periods=50).max()
+    df["dist_from_high_50"] = (close / rolling_high_50.replace(0, np.nan)) - 1.0
+
+    # ===== Phase C (v4): microstructure from Binance taker data (current bar only) =====
+    if "taker_buy_base_volume" in df.columns:
+        taker_buy_base = pd.to_numeric(df["taker_buy_base_volume"], errors="coerce")
+        df["taker_buy_ratio"] = (taker_buy_base / volume.replace(0, np.nan)).clip(0.0, 1.0).fillna(0.5)
+        df["taker_imbalance"] = ((2.0 * taker_buy_base - volume) / volume.replace(0, np.nan)).fillna(0.0)
+        ti_mean_20 = df["taker_imbalance"].rolling(20, min_periods=20).mean()
+        ti_std_20 = df["taker_imbalance"].rolling(20, min_periods=20).std()
+        df["taker_imbalance_zscore_20"] = (df["taker_imbalance"] - ti_mean_20) / ti_std_20.replace(0, np.nan)
+    else:
+        df["taker_buy_ratio"] = 0.5
+        df["taker_imbalance"] = 0.0
+        df["taker_imbalance_zscore_20"] = 0.0
+
+    if "quote_asset_volume" in df.columns and "number_of_trades" in df.columns:
+        trades = pd.to_numeric(df["number_of_trades"], errors="coerce").replace(0, np.nan)
+        avg_trade_size = pd.to_numeric(df["quote_asset_volume"], errors="coerce") / trades
+        ats_mean_20 = avg_trade_size.rolling(20, min_periods=20).mean()
+        ats_std_20 = avg_trade_size.rolling(20, min_periods=20).std()
+        df["avg_trade_size_zscore_20"] = (avg_trade_size - ats_mean_20) / ats_std_20.replace(0, np.nan)
+    else:
+        df["avg_trade_size_zscore_20"] = 0.0
+
+    # ===== Phase C (v4): cross-asset BTC context (leakage-safe as-of) =====
+    df = _attach_cross_asset_features(df, context)
 
     df["fwd_return_1"] = close.shift(-1) / close - 1.0
     df["fwd_return_horizon"] = close.shift(-LOOKAHEAD_BARS) / close - 1.0
