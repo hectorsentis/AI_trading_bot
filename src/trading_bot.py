@@ -60,8 +60,9 @@ from model_registry import get_latest_model, get_model_by_id, list_accepted_mode
 from portfolio_manager import PortfolioManager
 from risk_manager import RiskManager
 from signal_engine import generate_signal_from_probabilities
+from modeling_utils import predict_class_probabilities
 from trade_protection import build_long_protection
-from prediction_engine import build_prediction_from_probabilities, persist_prediction
+from prediction_engine import build_structured_prediction, persist_prediction
 from trade_proposal_engine import build_trade_proposal, persist_trade_proposal
 from capital_allocator import CapitalAllocator
 from trade_builder import build_trade_from_allocation
@@ -585,7 +586,7 @@ def run_once(args) -> dict:
                     continue
                 latest = latest.copy()
                 latest["symbol_code"] = int(symbol_mapping[symbol])
-                probas = model.predict_proba(latest[feature_columns])
+                probas = predict_class_probabilities(artifact, latest[feature_columns])
                 dt = latest.iloc[0]["datetime_utc"]
                 close_price = float(latest.iloc[0]["close"])
                 price_map[symbol] = close_price
@@ -610,7 +611,7 @@ def run_once(args) -> dict:
                     risk_reward=signal.get("risk_reward"),
                     protection_required=bool(signal.get("protection_required")),
                 )
-                prediction = build_prediction_from_probabilities(
+                prediction = build_structured_prediction(
                     model_id=model_id,
                     symbol=symbol,
                     timeframe=args.timeframe,
@@ -620,6 +621,8 @@ def run_once(args) -> dict:
                     prob_flat=prob_flat,
                     prob_long=prob_long,
                     latest_features=latest.iloc[0].to_dict(),
+                    feature_frame=latest[feature_columns],
+                    native_models=artifact.get("native_models"),
                     raw={"model_path": str(model_path), "legacy_signal_id": signal.get("datetime_utc")},
                 )
                 persist_prediction(prediction)

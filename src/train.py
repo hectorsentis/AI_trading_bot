@@ -6,7 +6,8 @@ import sqlite3
 
 import joblib
 import pandas as pd
-from lightgbm import LGBMClassifier
+from lightgbm import LGBMClassifier, LGBMRegressor
+from sklearn.calibration import CalibratedClassifierCV
 
 from config import (
     DB_FILE,
@@ -31,7 +32,17 @@ from config import (
     TP_MULTIPLIER,
     SL_MULTIPLIER,
     REQUIRE_TP_SL_ON_ENTRY,
+    ENABLE_NATIVE_PREDICTION_MODELS,
+    NATIVE_PREDICTION_HORIZON_BARS,
+    NATIVE_PREDICTION_MIN_ROWS,
+    NATIVE_QUANTILE_LEVELS,
+    NATIVE_MODEL_PARAMS,
+    ENABLE_PROBABILITY_CALIBRATION,
+    PROBABILITY_CALIBRATION_METHOD,
+    PROBABILITY_CALIBRATION_CV,
+    PROBABILITY_CALIBRATION_MIN_ROWS,
 )
+from labels import compute_native_regression_targets
 from db_utils import init_research_tables, ensure_project_directories
 from model_registry import register_model
 from modeling_utils import (
@@ -287,6 +298,90 @@ def _per_symbol_economic_metrics(test_df: pd.DataFrame, signal_position, timefra
     return out
 
 
+def _train_native_models(
+    df: pd.DataFrame,
+    train_df: pd.DataFrame,
+    feature_cols: list[str],
+    horizon: int,
+    precomputed_targets: pd.DataFrame | None = None,
+) -> dict | None:
+    """Train native return-distribution models alongside the direction classifier.
+
+    Produces real (not synthetic) estimates the allocator/trade-builder consume:
+      - expected return regression
+      - quantile regressions (q05..q95)
+      - MFE / MAE excursion regressions
+
+    Targets are computed leakage-safe from the forward close path (see
+    ``labels.compute_native_regression_targets``). Returns ``None`` (and the system falls
+    back to the derived path) if there is not enough labeled training data.
+    """
+    targets = precomputed_targets if precomputed_targets is not None else compute_native_regression_targets(df, horizon_bars=horizon)
+    train_keyed = train_df.merge(targets, on=["symbol", "datetime_utc"], how="left")
+    labeled = train_keyed.dropna(subset=["native_ret", "native_mfe", "native_mae"]).copy()
+    if len(labeled) < int(NATIVE_PREDICTION_MIN_ROWS):
+        return None
+
+    X = labeled[feature_cols]
+    quantile_models: dict[str, object] = {}
+    for alpha in NATIVE_QUANTILE_LEVELS:
+        q_params = dict(NATIVE_MODEL_PARAMS)
+        q_params.update({"objective": "quantile", "alpha": float(alpha)})
+        q_model = LGBMRegressor(**q_params)
+        q_model.fit(X, labeled["native_ret"])
+        quantile_models[f"{alpha:.2f}"] = q_model
+
+    expected_return_model = LGBMRegressor(**NATIVE_MODEL_PARAMS)
+    expected_return_model.fit(X, labeled["native_ret"])
+    mfe_model = LGBMRegressor(**NATIVE_MODEL_PARAMS)
+    mfe_model.fit(X, labeled["native_mfe"])
+    mae_model = LGBMRegressor(**NATIVE_MODEL_PARAMS)
+    mae_model.fit(X, labeled["native_mae"])
+
+    return {
+        "horizon_bars": int(horizon),
+        "feature_columns": list(feature_cols),
+        "quantile_levels": [float(a) for a in NATIVE_QUANTILE_LEVELS],
+        "expected_return": expected_return_model,
+        "quantiles": quantile_models,
+        "mfe": mfe_model,
+        "mae": mae_model,
+        "trained_rows": int(len(labeled)),
+        "target_note": "native_ret/mfe/mae from forward close path; leakage-safe under embargo",
+    }
+
+
+def _fit_probability_calibrator(X_train, y_train, model_params: dict):
+    """Fit a calibrated multiclass classifier so reported probabilities are trustworthy.
+
+    Uses internal cross-validated calibration (no leakage). Returns ``None`` (and the system
+    uses raw model probabilities) when disabled, when there are too few rows, when not all three
+    classes are present, or if calibration fails. Handles both the modern (`estimator=`) and
+    legacy (`base_estimator=`) scikit-learn signatures.
+    """
+    if not ENABLE_PROBABILITY_CALIBRATION:
+        return None
+    if len(X_train) < int(PROBABILITY_CALIBRATION_MIN_ROWS) or not _has_all_classes(y_train):
+        return None
+    for kwargs in (
+        {"estimator": LGBMClassifier(**model_params)},
+        {"base_estimator": LGBMClassifier(**model_params)},
+    ):
+        try:
+            calibrator = CalibratedClassifierCV(
+                method=PROBABILITY_CALIBRATION_METHOD,
+                cv=int(PROBABILITY_CALIBRATION_CV),
+                **kwargs,
+            )
+            calibrator.fit(X_train, y_train)
+            return calibrator
+        except TypeError:
+            continue  # try the other signature
+        except Exception:
+            return None
+    return None
+
+
 def train_one_scope(args, symbols: list[str], model_id_override: str | None = None) -> dict:
     df = _load_dataset(symbols=symbols, timeframe=args.timeframe)
     if df.empty:
@@ -330,6 +425,17 @@ def train_one_scope(args, symbols: list[str], model_id_override: str | None = No
 
     model = LGBMClassifier(**model_params)
     model.fit(X_train, y_train)
+
+    native_models = None
+    if ENABLE_NATIVE_PREDICTION_MODELS:
+        native_models = _train_native_models(
+            df=df,
+            train_df=train_df,
+            feature_cols=feature_cols,
+            horizon=int(NATIVE_PREDICTION_HORIZON_BARS),
+        )
+
+    calibrator = _fit_probability_calibrator(X_train, y_train, model_params)
 
     y_pred = model.predict(X_test)
     probas = model.predict_proba(X_test)
@@ -382,6 +488,10 @@ def train_one_scope(args, symbols: list[str], model_id_override: str | None = No
             "require_tp_sl_on_entry": bool(REQUIRE_TP_SL_ON_ENTRY),
         },
         "model": model,
+        "native_models": native_models,
+        "has_native_models": native_models is not None,
+        "calibrator": calibrator,
+        "has_calibrator": calibrator is not None,
     }
     joblib.dump(artifact, model_path)
 

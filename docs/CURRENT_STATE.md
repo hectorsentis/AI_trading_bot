@@ -19,7 +19,7 @@ This is a code-grounded snapshot. It distinguishes what runs today from what the
 | Portfolio/equity persistence across runs | Yes | Yes | `PortfolioManager.snapshot`; reloaded on init; final snapshot after exits |
 | Reconciliation | Snapshot-only | Once/run | No Binance fill replay / order-id matching |
 | Live trading | Gated stub | No | Safety module; never executes (expected) |
-| Native return/quantile/MFE-MAE models | **No** | n/a | Derived synthetically from classifier probabilities |
+| Native return/quantile/MFE-MAE models | Yes (Phase B) | Yes (paper + acceptance gate) | Trained per artifact and per validation fold; used by live prediction and the OOS-backtest acceptance gate. Calibration included |
 | Tests / CI | **Minimal** | n/a | A few `tests/` (dashboard, training-safety, + Phase A smoke); no CI workflows yet |
 | Dashboard | Partial | Yes | Professional Streamlit, but read-mostly; not full control panel |
 
@@ -30,10 +30,18 @@ This is a code-grounded snapshot. It distinguishes what runs today from what the
   See `config.py:262-278` (MODEL_PARAMS) and `labels.py`.
 - **Features:** ~46–56 features across ~14 families (`config.py:190-246`), vs ~1000 across
   20+ families in the roadmap. **OHLCV-only**; no funding/OI/fear-greed/order-book/news.
-- **Synthetic prediction distribution:** `prediction_engine.build_prediction_from_probabilities()`
-  derives `expected_return_pct`, quantiles and MFE/MAE from classifier probabilities and
-  volatility (`prediction_engine.py:62-151`). The code self-documents this as temporary until
-  native regression/quantile models exist.
+- **Prediction distribution (Phase B native models):** `train._train_native_models` now trains
+  LightGBM expected-return regression, quantile (q05…q95) and MFE/MAE regressors, stored in the
+  artifact under `native_models`. `prediction_engine.build_structured_prediction` prefers these
+  real outputs (cost-adjusted, monotonic quantiles) and falls back to the synthetic
+  `build_prediction_from_probabilities` when a model has no native sub-models. Probability
+  calibration also landed: `train._fit_probability_calibrator` stores a `calibrator` in the
+  artifact and `modeling_utils.predict_class_probabilities` applies it in the live loop.
+  **Phase B is complete:** `validate_model` trains native + calibrated models **per fold** and
+  persists the calibrated probabilities + cost-adjusted, monotonic native distribution to
+  `validation_predictions`; `backtest --mode oos` and the historical simulator consume those
+  fields via `build_prediction_from_row_fields`, so the acceptance gate evaluates the same
+  native predictions as paper (no mixing of final-artifact models with per-fold probabilities).
 - **Orphaned exit loop (FIXED in Phase A):** as found, `exit_manager.evaluate_virtual_exits()`
   only set a trade to `CLOSING` and `trading_bot.py` never called it. Phase A wires an exit pass
   into the loop and adds `ExecutionEngine.close_trade` to flatten `CLOSING` trades and book

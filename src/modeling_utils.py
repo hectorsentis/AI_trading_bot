@@ -79,6 +79,32 @@ def probabilities_to_signal(
     return signal
 
 
+def predict_class_probabilities(artifact, X) -> np.ndarray:
+    """Return calibrated class probabilities as columns [P(SHORT), P(FLAT), P(LONG)].
+
+    Uses the artifact's `calibrator` when present (Phase B probability calibration), otherwise
+    the raw `model`. A bare estimator may also be passed. Columns are reordered to the canonical
+    [SHORT, FLAT, LONG] order regardless of the estimator's `classes_`, so downstream signal and
+    threshold logic is always correct even if a class was rare.
+    """
+    estimator = None
+    if isinstance(artifact, dict):
+        estimator = artifact.get("calibrator") or artifact.get("model")
+    if estimator is None:
+        estimator = artifact
+    probas = estimator.predict_proba(X)
+    classes = list(getattr(estimator, "classes_", [CLASS_SHORT, CLASS_FLAT, CLASS_LONG]))
+    canonical = [CLASS_SHORT, CLASS_FLAT, CLASS_LONG]
+    if classes != canonical:
+        idx = {int(c): i for i, c in enumerate(classes)}
+        cols = [
+            probas[:, idx[c]] if c in idx else np.zeros(len(probas))
+            for c in canonical
+        ]
+        probas = np.column_stack(cols)
+    return probas
+
+
 def classification_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Tuple[float, float]:
     return (
         float(accuracy_score(y_true, y_pred)),

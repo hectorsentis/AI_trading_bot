@@ -277,6 +277,39 @@ MODEL_PARAMS = {
     "verbosity": -1,
 }
 
+# Native return-distribution models (Phase B). These are trained alongside the direction
+# classifier and produce real expected-return / quantile / MFE / MAE estimates, replacing the
+# synthetic fields derived from classifier probabilities. Disable to fall back to the derived path.
+ENABLE_NATIVE_PREDICTION_MODELS = _env_bool("ENABLE_NATIVE_PREDICTION_MODELS", True)
+NATIVE_PREDICTION_HORIZON_BARS = int(os.getenv("NATIVE_PREDICTION_HORIZON_BARS", str(LOOKAHEAD_BARS)))
+NATIVE_PREDICTION_MIN_ROWS = int(os.getenv("NATIVE_PREDICTION_MIN_ROWS", "500"))
+NATIVE_QUANTILE_LEVELS = (0.05, 0.25, 0.5, 0.75, 0.95)
+# Lighter than the classifier params: 7 regressors are trained per candidate, so keep them cheap.
+NATIVE_MODEL_PARAMS = {
+    "objective": "regression",
+    "n_estimators": 300,
+    "learning_rate": 0.03,
+    "num_leaves": 31,
+    "max_depth": -1,
+    "min_child_samples": 40,
+    "subsample": 0.85,
+    "subsample_freq": 1,
+    "colsample_bytree": 0.85,
+    "reg_alpha": 0.05,
+    "reg_lambda": 0.25,
+    "random_state": 42,
+    "verbosity": -1,
+}
+
+# Probability calibration (Phase B). Calibrate the multiclass classifier so reported
+# confidence/probabilities are trustworthy (they gate signals, proposals and allocation).
+# Stored in the artifact as `calibrator` and used by the live prediction path; disable for
+# faster pool maintenance. Falls back to raw model probabilities when absent.
+ENABLE_PROBABILITY_CALIBRATION = _env_bool("ENABLE_PROBABILITY_CALIBRATION", True)
+PROBABILITY_CALIBRATION_METHOD = os.getenv("PROBABILITY_CALIBRATION_METHOD", "isotonic")
+PROBABILITY_CALIBRATION_CV = int(os.getenv("PROBABILITY_CALIBRATION_CV", "3"))
+PROBABILITY_CALIBRATION_MIN_ROWS = int(os.getenv("PROBABILITY_CALIBRATION_MIN_ROWS", "500"))
+
 LONG_THRESHOLD = 0.55
 SHORT_THRESHOLD = 0.55
 

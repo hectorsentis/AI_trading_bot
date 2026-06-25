@@ -22,6 +22,9 @@ from config import (
     REPORTS_DIR,
     MIN_TRAIN_ROWS,
     LOOKAHEAD_BARS,
+    ENABLE_NATIVE_PREDICTION_MODELS,
+    ENABLE_PROBABILITY_CALIBRATION,
+    NATIVE_PREDICTION_HORIZON_BARS,
 )
 from db_utils import init_research_tables, ensure_project_directories, save_validation_predictions
 from model_registry import (
@@ -34,11 +37,59 @@ from modeling_utils import (
     classification_metrics,
     compute_economic_metrics,
     probabilities_to_signal,
+    predict_class_probabilities,
 )
+from labels import compute_native_regression_targets
+from prediction_engine import assemble_native_fields
+from train import _train_native_models, _fit_probability_calibrator
 from strategy_evaluator import evaluate_model_acceptance
 from temporal_utils import apply_label_embargo_cutoff
 from historical_trade_simulator import load_market_ohlc, run_historical_trade_lifecycle
 from validation_funnel_report import ValidationFunnelRecorder, write_funnel_report
+
+
+_NATIVE_FIELD_COLUMNS = (
+    "expected_return_pct", "expected_move_pct", "expected_adverse_move_pct",
+    "q05_return_pct", "q25_return_pct", "q50_return_pct", "q75_return_pct", "q95_return_pct",
+    "expected_mfe_pct", "expected_mae_pct",
+)
+
+
+def _native_fields_for_test(native: dict, test_df: pd.DataFrame) -> list[dict]:
+    """Per test-row native distribution fields (cost-adjusted, monotonic), batch-predicted.
+
+    Reuses the same `assemble_native_fields` math as the live native path so persisted validation
+    predictions match what paper trading would have produced for those rows.
+    """
+    X = test_df[native["feature_columns"]]
+    levels = native["quantile_levels"]
+    ret = native["expected_return"].predict(X)
+    qpred = {a: native["quantiles"][f"{a:.2f}"].predict(X) for a in levels}
+    mfe = native["mfe"].predict(X)
+    mae = native["mae"].predict(X)
+    rows: list[dict] = []
+    for i in range(len(X)):
+        f = assemble_native_fields(
+            raw_expected_return=ret[i],
+            quantiles_by_level={a: qpred[a][i] for a in levels},
+            raw_mfe=mfe[i],
+            raw_mae=mae[i],
+        )
+        rows.append(
+            {
+                "expected_return_pct": f["expected_return_pct"],
+                "expected_move_pct": f["expected_move_pct"],
+                "expected_adverse_move_pct": f["expected_adverse_move_pct"],
+                "q05_return_pct": f["q05_return_pct"],
+                "q25_return_pct": f["q25_return_pct"],
+                "q50_return_pct": f["q50_return_pct"],
+                "q75_return_pct": f["q75_return_pct"],
+                "q95_return_pct": f["q95_return_pct"],
+                "expected_mfe_pct": f["expected_max_favorable_excursion_pct"],
+                "expected_mae_pct": f["expected_max_adverse_excursion_pct"],
+            }
+        )
+    return rows
 
 
 def parse_args():
@@ -235,6 +286,15 @@ def main():
     symbol_mapping = build_symbol_mapping(df)
     feature_cols = FEATURE_COLUMNS + ["symbol_code"]
 
+    # Phase B: per-fold native + calibrated predictions so acceptance evaluates the same
+    # native distribution paper trading uses. Targets depend only on the close path, so compute
+    # once and reuse across folds (each fold trains its own native models on its own train slice).
+    native_targets = (
+        compute_native_regression_targets(df, horizon_bars=int(NATIVE_PREDICTION_HORIZON_BARS))
+        if ENABLE_NATIVE_PREDICTION_MODELS
+        else None
+    )
+
     fold_rows = []
     prediction_rows = []
     persist_rows: list[dict] = []
@@ -263,13 +323,38 @@ def main():
         model = LGBMClassifier(**model_params)
         model.fit(train_df[feature_cols], train_df["label_class"])
 
+        # Per-fold calibrator + native models, trained only on this fold's train slice (no leakage,
+        # no mixing with the final artifact). Falls back gracefully when disabled or insufficient.
+        calibrator = (
+            _fit_probability_calibrator(train_df[feature_cols], train_df["label_class"], model_params)
+            if ENABLE_PROBABILITY_CALIBRATION
+            else None
+        )
+        native = (
+            _train_native_models(
+                df=df,
+                train_df=train_df,
+                feature_cols=feature_cols,
+                horizon=int(NATIVE_PREDICTION_HORIZON_BARS),
+                precomputed_targets=native_targets,
+            )
+            if ENABLE_NATIVE_PREDICTION_MODELS
+            else None
+        )
+
         y_true = test_df["label_class"].values
         y_pred = model.predict(test_df[feature_cols])
-        probas = model.predict_proba(test_df[feature_cols])
+        probas = model.predict_proba(test_df[feature_cols])  # raw, for diagnostics below
         signal_position = probabilities_to_signal(
             probas=probas,
             short_threshold=short_threshold,
             long_threshold=long_threshold,
+        )
+        # Calibrated probabilities feed the lifecycle/persisted predictions (consistent with paper).
+        lifecycle_probas = (
+            predict_class_probabilities({"calibrator": calibrator, "model": model}, test_df[feature_cols])
+            if calibrator is not None
+            else probas
         )
 
         accuracy, f1_macro = classification_metrics(y_true=y_true, y_pred=y_pred)
@@ -309,28 +394,39 @@ def main():
         pred_frame["fold_id"] = fold_id
         pred_frame["pred_class"] = y_pred
         pred_frame["signal_position"] = signal_position
-        pred_frame["prob_short"] = probas[:, 0]
-        pred_frame["prob_flat"] = probas[:, 1]
-        pred_frame["prob_long"] = probas[:, 2]
+        pred_frame["prob_short"] = lifecycle_probas[:, 0]
+        pred_frame["prob_flat"] = lifecycle_probas[:, 1]
+        pred_frame["prob_long"] = lifecycle_probas[:, 2]
+        has_native = native is not None
+        if has_native:
+            native_field_rows = _native_fields_for_test(native, test_df)
+            for col in _NATIVE_FIELD_COLUMNS:
+                pred_frame[col] = [r[col] for r in native_field_rows]
+            pred_frame["native_horizon_bars"] = int(NATIVE_PREDICTION_HORIZON_BARS)
+        pred_frame["has_native_prediction"] = 1 if has_native else 0
         prediction_rows.append(pred_frame)
 
         for _, row in pred_frame.iterrows():
-            persist_rows.append(
-                {
-                    "model_id": model_id,
-                    "symbol": row["symbol"],
-                    "timeframe": row["timeframe"],
-                    "datetime_utc": row["datetime_utc"].isoformat(),
-                    "y_true": int(row["label_class"]),
-                    "y_pred": int(row["pred_class"]),
-                    "prob_short": float(row["prob_short"]),
-                    "prob_flat": float(row["prob_flat"]),
-                    "prob_long": float(row["prob_long"]),
-                    "signal_position": int(row["signal_position"]),
-                    "fold_id": int(row["fold_id"]),
-                    "created_at_utc": created_at,
-                }
-            )
+            persist_row = {
+                "model_id": model_id,
+                "symbol": row["symbol"],
+                "timeframe": row["timeframe"],
+                "datetime_utc": row["datetime_utc"].isoformat(),
+                "y_true": int(row["label_class"]),
+                "y_pred": int(row["pred_class"]),
+                "prob_short": float(row["prob_short"]),
+                "prob_flat": float(row["prob_flat"]),
+                "prob_long": float(row["prob_long"]),
+                "signal_position": int(row["signal_position"]),
+                "fold_id": int(row["fold_id"]),
+                "created_at_utc": created_at,
+                "has_native_prediction": bool(has_native),
+            }
+            if has_native:
+                for col in _NATIVE_FIELD_COLUMNS:
+                    persist_row[col] = float(row[col])
+                persist_row["native_horizon_bars"] = int(NATIVE_PREDICTION_HORIZON_BARS)
+            persist_rows.append(persist_row)
 
         print(
             f"fold={fold_id} test=[{test_start} -> {test_end}] "
@@ -459,19 +555,18 @@ def main():
         }
         summary["validation_funnel"] = funnel_report
     else:
+        _wf_base_cols = [
+            "symbol", "timeframe", "datetime_utc",
+            "prob_short", "prob_flat", "prob_long", "signal_position", "fold_id",
+        ]
+        _wf_native_cols = [
+            c for c in (*_NATIVE_FIELD_COLUMNS, "native_horizon_bars", "has_native_prediction")
+            if c in predictions_df.columns
+        ]
         lifecycle_result = run_historical_trade_lifecycle(
-            predictions_df=predictions_df[
-                [
-                    "symbol",
-                    "timeframe",
-                    "datetime_utc",
-                    "prob_short",
-                    "prob_flat",
-                    "prob_long",
-                    "signal_position",
-                    "fold_id",
-                ]
-            ].assign(model_id=model_id, validation_run_id=validation_run_id),
+            predictions_df=predictions_df[_wf_base_cols + _wf_native_cols].assign(
+                model_id=model_id, validation_run_id=validation_run_id
+            ),
             market_df=market_df,
             model_id=model_id,
             timeframe=args.timeframe,

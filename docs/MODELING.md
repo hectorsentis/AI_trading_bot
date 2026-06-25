@@ -44,6 +44,16 @@ trade_quality_model        net trade EV given proposal features (allocator input
 only when a native model is absent. This keeps the architecture intact while removing the
 synthetic crutch.
 
+> **Phase B status (complete):** native expected-return regression, quantile (q05…q95) and
+> MFE/MAE regressors (`train._train_native_models`) plus probability calibration
+> (`train._fit_probability_calibrator`) are trained and stored in the artifact.
+> `prediction_engine.build_structured_prediction` prefers native fields (cost-adjusted, monotonic
+> quantiles); `modeling_utils.predict_class_probabilities` applies the calibrator in the live
+> loop. `validate_model` trains native + calibrated models **per fold** and persists the
+> distribution to `validation_predictions`, so `backtest --mode oos` and the historical simulator
+> evaluate the same native predictions as paper — no mixing of final-artifact models with
+> per-fold probabilities. Native/calibration are flag-gated for fast pool maintenance.
+
 ## Train new models or keep retraining one?
 
 **Maintain a pool. Never collapse to a single retrained model.** The shared-pool, competitive-

@@ -610,6 +610,23 @@ def init_research_tables() -> None:
             )
             """
         )
+        # Phase B: per-fold native (calibrated probs already stored above) distribution fields, so
+        # validation/backtest acceptance evaluates the same native predictions the model produced.
+        for _col in (
+            "expected_return_pct",
+            "expected_move_pct",
+            "expected_adverse_move_pct",
+            "q05_return_pct",
+            "q25_return_pct",
+            "q50_return_pct",
+            "q75_return_pct",
+            "q95_return_pct",
+            "expected_mfe_pct",
+            "expected_mae_pct",
+        ):
+            _ensure_column(conn, VALIDATION_PREDICTIONS_TABLE, _col, "REAL")
+        _ensure_column(conn, VALIDATION_PREDICTIONS_TABLE, "native_horizon_bars", "INTEGER")
+        _ensure_column(conn, VALIDATION_PREDICTIONS_TABLE, "has_native_prediction", "INTEGER")
 
         conn.execute(
             f"""
@@ -1241,8 +1258,19 @@ def save_validation_predictions(
                 (validation_run_id,),
             )
 
+        _native_cols = (
+            "expected_return_pct", "expected_move_pct", "expected_adverse_move_pct",
+            "q05_return_pct", "q25_return_pct", "q50_return_pct", "q75_return_pct", "q95_return_pct",
+            "expected_mfe_pct", "expected_mae_pct",
+        )
+
+        def _opt_float(value):
+            return None if value is None else float(value)
+
         payload = []
         for row in rows:
+            native_values = tuple(_opt_float(row.get(col)) for col in _native_cols)
+            native_horizon = row.get("native_horizon_bars")
             payload.append(
                 (
                     row["model_id"],
@@ -1258,6 +1286,9 @@ def save_validation_predictions(
                     int(row["signal_position"]),
                     int(row["fold_id"]),
                     row["created_at_utc"],
+                    *native_values,
+                    None if native_horizon is None else int(native_horizon),
+                    int(bool(row.get("has_native_prediction", False))),
                 )
             )
 
@@ -1276,9 +1307,21 @@ def save_validation_predictions(
                 prob_long,
                 signal_position,
                 fold_id,
-                created_at_utc
+                created_at_utc,
+                expected_return_pct,
+                expected_move_pct,
+                expected_adverse_move_pct,
+                q05_return_pct,
+                q25_return_pct,
+                q50_return_pct,
+                q75_return_pct,
+                q95_return_pct,
+                expected_mfe_pct,
+                expected_mae_pct,
+                native_horizon_bars,
+                has_native_prediction
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             payload,
         )

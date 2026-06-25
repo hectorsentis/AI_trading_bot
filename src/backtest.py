@@ -169,7 +169,19 @@ def load_oos_predictions(
                 prob_flat,
                 prob_long,
                 signal_position,
-                fold_id
+                fold_id,
+                expected_return_pct,
+                expected_move_pct,
+                expected_adverse_move_pct,
+                q05_return_pct,
+                q25_return_pct,
+                q50_return_pct,
+                q75_return_pct,
+                q95_return_pct,
+                expected_mfe_pct,
+                expected_mae_pct,
+                native_horizon_bars,
+                has_native_prediction
             FROM {VALIDATION_PREDICTIONS_TABLE}
             WHERE {" AND ".join(where)}
             ORDER BY datetime_utc, symbol
@@ -186,8 +198,15 @@ def load_oos_predictions(
     df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True, errors="coerce")
     for col in ["y_true", "y_pred", "signal_position", "fold_id"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    for col in ["prob_short", "prob_flat", "prob_long"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+    _native_numeric = [
+        "prob_short", "prob_flat", "prob_long",
+        "expected_return_pct", "expected_move_pct", "expected_adverse_move_pct",
+        "q05_return_pct", "q25_return_pct", "q50_return_pct", "q75_return_pct", "q95_return_pct",
+        "expected_mfe_pct", "expected_mae_pct", "native_horizon_bars", "has_native_prediction",
+    ]
+    for col in _native_numeric:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
     df = df.dropna(
         subset=["datetime_utc", "y_true", "y_pred", "signal_position", "prob_short", "prob_flat", "prob_long"]
     ).copy()
@@ -509,10 +528,15 @@ def _run_oos(args) -> dict:
         }
         summary["validation_funnel"] = funnel_report
     else:
+        _oos_cols = [
+            "model_id", "validation_run_id", "symbol", "timeframe", "datetime_utc",
+            "prob_short", "prob_flat", "prob_long", "signal_position", "fold_id",
+            "expected_return_pct", "expected_move_pct", "expected_adverse_move_pct",
+            "q05_return_pct", "q25_return_pct", "q50_return_pct", "q75_return_pct", "q95_return_pct",
+            "expected_mfe_pct", "expected_mae_pct", "native_horizon_bars", "has_native_prediction",
+        ]
         lifecycle_result = run_historical_trade_lifecycle(
-            predictions_df=result[
-                ["model_id", "validation_run_id", "symbol", "timeframe", "datetime_utc", "prob_short", "prob_flat", "prob_long", "signal_position", "fold_id"]
-            ],
+            predictions_df=result[[c for c in _oos_cols if c in result.columns]],
             market_df=market_df,
             model_id=model_id,
             timeframe=args.timeframe,

@@ -32,7 +32,7 @@ from config import (
 from db_utils import ensure_project_directories, init_research_tables, save_portfolio_snapshot
 from ledger import create_trade_record, mark_trade_failed, mark_trade_open, refresh_model_performance
 from portfolio_manager import PortfolioManager
-from prediction_engine import build_prediction_from_probabilities, persist_prediction
+from prediction_engine import build_prediction_from_probabilities, build_prediction_from_row_fields, persist_prediction
 from risk_manager import RiskManager
 from trade_builder import BuiltTrade, build_trade_from_allocation
 from trade_proposal_engine import build_trade_proposal, persist_trade_proposal
@@ -171,7 +171,10 @@ def load_validation_predictions_for_simulation(
         df = pd.read_sql_query(
             f"""
             SELECT model_id, validation_run_id, symbol, timeframe, datetime_utc,
-                   prob_short, prob_flat, prob_long, signal_position, fold_id
+                   prob_short, prob_flat, prob_long, signal_position, fold_id,
+                   expected_return_pct, expected_move_pct, expected_adverse_move_pct,
+                   q05_return_pct, q25_return_pct, q50_return_pct, q75_return_pct, q95_return_pct,
+                   expected_mfe_pct, expected_mae_pct, native_horizon_bars, has_native_prediction
             FROM {VALIDATION_PREDICTIONS_TABLE}
             WHERE {" AND ".join(where)}
             ORDER BY datetime_utc, symbol, fold_id
@@ -182,8 +185,15 @@ def load_validation_predictions_for_simulation(
     if df.empty:
         return df
     df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True, errors="coerce")
-    for col in ["prob_short", "prob_flat", "prob_long", "signal_position", "fold_id"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+    numeric_cols = [
+        "prob_short", "prob_flat", "prob_long", "signal_position", "fold_id",
+        "expected_return_pct", "expected_move_pct", "expected_adverse_move_pct",
+        "q05_return_pct", "q25_return_pct", "q50_return_pct", "q75_return_pct", "q95_return_pct",
+        "expected_mfe_pct", "expected_mae_pct", "native_horizon_bars", "has_native_prediction",
+    ]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
     return df.dropna(subset=["datetime_utc", "prob_short", "prob_flat", "prob_long"]).sort_values(
         ["datetime_utc", "symbol", "fold_id"]
     )
@@ -664,6 +674,18 @@ class HistoricalTradeSimulator:
         )
 
     def _prediction_from_row(self, row: pd.Series, close_price: float) -> object:
+        # Prefer the native, calibrated, cost-adjusted prediction the model produced for this
+        # row (persisted per fold). This keeps validation/backtest acceptance consistent with the
+        # live paper path instead of recomputing a synthetic distribution.
+        native = build_prediction_from_row_fields(
+            row,
+            model_id=str(row.get("model_id") or self.model_id),
+            symbol=str(row["symbol"]),
+            timeframe=str(row.get("timeframe") or self.timeframe),
+            timestamp_utc=row["datetime_utc"],
+        )
+        if native is not None:
+            return native
         return build_prediction_from_probabilities(
             model_id=str(row.get("model_id") or self.model_id),
             symbol=str(row["symbol"]),

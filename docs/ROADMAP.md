@@ -34,12 +34,32 @@ Goal: paper PnL/equity is real, persistent, and exits actually execute.
 ## Phase B — Native prediction models
 Goal: replace synthetic distribution fields with trained outputs.
 
-- [ ] Add LightGBM **expected-return regression**, **quantile** models (q05…q95), and
-  **MFE/MAE** regressors as registry artifacts.
-- [ ] `prediction_engine.py` uses native fields when present, falls back to
-  `build_prediction_from_probabilities` otherwise.
-- [ ] Add **probability calibration** for the direction classifier.
-- [ ] Extend `labels.py` with return / MFE / MAE / quantile targets.
+- [x] `labels.compute_native_regression_targets` — leakage-safe forward return / MFE / MAE
+  targets from the per-symbol close path (embargo-protected).
+- [x] `train._train_native_models` trains LightGBM **expected-return regression**, **quantile**
+  models (q05…q95) and **MFE/MAE** regressors, stored in the artifact under `native_models`
+  (gated by `ENABLE_NATIVE_PREDICTION_MODELS`, lighter `NATIVE_MODEL_PARAMS`).
+- [x] `prediction_engine.build_prediction_from_native` + `build_structured_prediction`
+  dispatcher: native fields when present (cost-adjusted, monotonic quantiles), falls back to
+  `build_prediction_from_probabilities` otherwise. `trading_bot.py` passes
+  `native_models` + `feature_frame`. Tests: `tests/test_native_prediction.py`.
+- [x] **Probability calibration** for the direction classifier. `train._fit_probability_calibrator`
+  (cross-validated `CalibratedClassifierCV`, flagged by `ENABLE_PROBABILITY_CALIBRATION`) stores a
+  `calibrator` in the artifact; `modeling_utils.predict_class_probabilities` uses it in the live
+  loop (canonical class order, raw-model fallback). Tests: `tests/test_calibration.py`.
+- [x] **Native models + calibration wired into validation/backtest acceptance** (ADR 0002
+  consistency). `validate_model` trains native + calibrated models **per fold** (no model
+  mixing), computes calibrated probabilities + cost-adjusted, monotonic native distribution per
+  test row, and **persists** them to `validation_predictions` (columns added idempotently via
+  `_ensure_column`). `backtest --mode oos`, `load_oos_predictions` and the
+  `historical_trade_simulator` reload and consume those fields via
+  `prediction_engine.build_prediction_from_row_fields`, falling back to the derived path only
+  when a row lacks native fields. Shared math: `prediction_engine.assemble_native_fields`.
+  Tests: `tests/test_phaseb_closure.py`.
+
+**Phase B is complete.** Native return-distribution models + probability calibration power
+training, the live paper loop, and the validation/backtest acceptance gate end-to-end (per-fold,
+no model mixing). Cost knobs: `ENABLE_NATIVE_PREDICTION_MODELS`, `ENABLE_PROBABILITY_CALIBRATION`.
 
 ## Phase C — Features & external data
 Goal: broaden the feature store with leakage discipline.

@@ -1,11 +1,70 @@
 import argparse
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 
 from config import LOOKAHEAD_BARS, TP_MULTIPLIER, SL_MULTIPLIER
 from modeling_utils import CLASS_FLAT, CLASS_LONG, CLASS_SHORT, CLASS_TO_NAME, CLASS_TO_POSITION
 from trade_protection import build_long_protection
+
+
+def compute_native_regression_targets(
+    frame: pd.DataFrame,
+    horizon_bars: int = LOOKAHEAD_BARS,
+    *,
+    symbol_col: str = "symbol",
+    time_col: str = "datetime_utc",
+    close_col: str = "close",
+) -> pd.DataFrame:
+    """Leakage-safe forward targets for native regression/quantile/MFE-MAE models.
+
+    For each row at time t (per symbol, in time order) over the next ``horizon_bars`` bars:
+      - ``native_ret``  = close[t+h] / close[t] - 1            (horizon return)
+      - ``native_mfe``  = max(close[t+1..t+h]) / close[t] - 1  (favorable excursion, >= 0)
+      - ``native_mae``  = min(close[t+1..t+h]) / close[t] - 1  (adverse excursion, <= 0)
+
+    Excursions use the forward close path (the features table does not persist intrabar
+    high/low); this slightly understates true intrabar excursion but is leakage-safe and
+    a sound first native target. Rows without a full forward horizon get NaN and must be
+    dropped before training. Returns a frame keyed by ``[symbol, datetime_utc]`` plus the
+    three target columns, so it can be merged back onto the training frame.
+    """
+    h = int(horizon_bars)
+    parts: list[pd.DataFrame] = []
+    for symbol, group in frame.sort_values(time_col).groupby(symbol_col):
+        g = group.sort_values(time_col).reset_index(drop=True)
+        close = g[close_col].astype(float).to_numpy()
+        n = len(close)
+        native_ret = np.full(n, np.nan)
+        native_mfe = np.full(n, np.nan)
+        native_mae = np.full(n, np.nan)
+        for i in range(n):
+            j = i + h
+            base = close[i]
+            if j >= n or not np.isfinite(base) or base <= 0:
+                continue
+            window = close[i + 1 : j + 1]
+            if window.size == 0 or not np.isfinite(window).all() or not np.isfinite(close[j]):
+                continue
+            native_ret[i] = close[j] / base - 1.0
+            native_mfe[i] = float(window.max()) / base - 1.0
+            native_mae[i] = float(window.min()) / base - 1.0
+        out = pd.DataFrame(
+            {
+                # Keep the Series (not .values) so tz-aware datetimes survive the round-trip
+                # and merge cleanly against the tz-aware training frame.
+                symbol_col: g[symbol_col],
+                time_col: g[time_col],
+                "native_ret": native_ret,
+                "native_mfe": native_mfe,
+                "native_mae": native_mae,
+            }
+        )
+        parts.append(out)
+    if not parts:
+        return pd.DataFrame(columns=[symbol_col, time_col, "native_ret", "native_mfe", "native_mae"])
+    return pd.concat(parts, ignore_index=True)
 
 
 def parse_args():
