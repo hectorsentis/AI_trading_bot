@@ -80,20 +80,46 @@ Goal: broaden the feature store with leakage discipline.
 - [x] Versioned (`v4_regime_microstructure_crossasset`); strict leakage discipline (tested:
   `tests/test_features_phasec.py`, `tests/test_external_data.py`). New features are additive, so
   existing `v3` models keep working; run `feature_store --full-rebuild` to populate v4 columns.
-- [ ] **Multi-timeframe features** (higher-TF closed-candle as-of into the base TF) — *remaining*;
-  the `attach_external_features_asof` backward as-of merge is the building block. Also wiring
-  external metrics into the training feature contract is opt-in/next.
+- [x] **Multi-timeframe features** (`FEATURE_VERSION=v5`): two strictly-higher timeframes
+  (`htf1`/`htf2` per `HIGHER_TIMEFRAME_MAP`) attached via leakage-safe backward as-of on the
+  higher-TF **close** time (`feature_store.build_higher_timeframe_context` +
+  `features._attach_higher_timeframe_features`); neutral when that TF is absent. Tested.
+- [~] Folding external metrics into the training `FEATURE_COLUMNS` contract is intentionally
+  **opt-in, not default**: forcing external columns into training would break it whenever
+  `ENABLE_EXTERNAL_DATA=false` (the default) since the columns would be NaN. The external layer +
+  `attach_external_features_asof` are ready; auto-inclusion is a config-gated future step.
 
-**Phase C core is deployed** (single-symbol, microstructure, cross-asset, external-data layer).
-Multi-timeframe + folding external metrics into `FEATURE_COLUMNS` remain.
+**Phase C complete** (82 features: single-symbol, microstructure, cross-asset, multi-timeframe;
+plus the external-data layer). External-into-training stays opt-in by design.
 
 ## Phase D — Pool / lifecycle / allocator maturity + walk-forward + CI
 Goal: continuous, self-maintaining model pool.
 
-- [ ] Model degradation detection and lifecycle transitions (`paper_degraded`, `quarantined`).
-- [ ] Shadow-trade analytics surfaced in the dashboard (rejected-but-would-have-won, etc.).
-- [ ] Walk-forward in `backtest.py --walk-forward`.
-- [ ] Expand `tests/`; add GitHub Actions CI.
+- [x] **Degradation detection + lifecycle transitions**: `paper_model_evaluator.assess_lifecycle`
+  maps paper metrics to pass / fail / **degrade** (soft pause, recoverable) / **quarantine**
+  (severe); registry gains `mark_model_paper_degraded`, `mark_model_quarantined`,
+  `reactivate_paper_model`; degraded models are re-evaluated each cycle and recover or worsen.
+  Thresholds in `config.py` (`PAPER_DEGRADE_*`, `PAPER_QUARANTINE_*`). Tested.
+- [x] **Shadow analytics**: `shadow_evaluator` resolves matured `SHADOW_OPEN` trades against OHLC
+  (TP/SL/expire) and books `outcome_pnl_usdt`; `dashboard_data.load_shadow_analytics` +
+  `dashboard.render_shadow_analytics` surface would-have-won rate, missed profit, avoided loss,
+  by-reason. Run each evaluator cycle. Tested.
+- [x] **Walk-forward** in `backtest.py --walk-forward` (`--mode walk_forward`): runs the trade
+  lifecycle per OOS fold and reports stability (mean/std return, profitable-fold fraction, worst
+  fold). Reuses persisted per-fold native predictions (no model mixing).
+- [x] **CI** (`.github/workflows/ci.yml`): pytest + bandit + pip-audit. **Tests expanded** to 36
+  (features/external/lifecycle/shadow/native/calibration/paper-loop/etc.).
+
+**Phase D complete.**
+
+## Phase R — Live paper-run readiness (Binance testnet, local)
+- [x] `src/preflight.py` — one-command readiness check: safety flags, DB schema, risk params,
+  **real Binance connection** (public) + **bidirectional testnet account read**, exchange filters,
+  data coverage/staleness, feature-store version, model pool, pipeline imports. Verified `READY`.
+- [x] `docs/LIVE_PAPER_RUN.md` — the 3-day local run runbook for 15m/1h/4h with the exact
+  verification checklist (bidirectional Binance, live data storage, retraining, profit-seeking).
+- `autonomous_runner` already supervises ingestor + bot + maintenance + evaluator + dashboard,
+  restart-safe, across multiple timeframes.
 
 ## Phase E — Deployment hardening
 Goal: clean Linux server deployment.

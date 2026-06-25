@@ -34,7 +34,8 @@ from validation_funnel_report import ValidationFunnelRecorder, write_funnel_repo
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Economic backtest from feature store or strict OOS predictions.")
-    parser.add_argument("--mode", choices=["in_sample", "oos"], default="in_sample")
+    parser.add_argument("--mode", choices=["in_sample", "oos", "walk_forward"], default="in_sample")
+    parser.add_argument("--walk-forward", action="store_true", help="Shorthand for --mode walk_forward (per-fold stability).")
     parser.add_argument("--model-path", type=str, default=None, help="Path to .joblib model artifact (in_sample mode)")
     parser.add_argument("--model-id", type=str, default=None, help="Model id for OOS prediction backtest")
     parser.add_argument("--validation-run-id", type=str, default=None, help="Specific OOS validation run id")
@@ -580,17 +581,75 @@ def _run_oos(args) -> dict:
     return summary
 
 
+def _run_walk_forward(args) -> dict:
+    """Per-fold walk-forward stability: run the trade lifecycle on each OOS fold separately and
+    aggregate stability metrics (mean/std of returns, fraction of profitable folds, worst fold).
+    Reuses the persisted per-fold native predictions, so no model mixing."""
+    model_id = args.model_id
+    if not model_id:
+        latest = get_latest_model(timeframe=args.timeframe, prefer_active=True)
+        if not latest:
+            raise ValueError("No model_id provided and no model found in registry.")
+        model_id = str(latest["model_id"])
+    symbols = [s.upper().strip() for s in args.symbols] if args.symbols else [s.upper() for s in SYMBOLS]
+    preds, run_id = load_oos_predictions(
+        model_id=model_id, timeframe=args.timeframe, symbols=symbols,
+        validation_run_id=args.validation_run_id, start_date=args.start_date, end_date=args.end_date,
+    )
+    if preds.empty or "fold_id" not in preds.columns:
+        raise ValueError("No OOS predictions with fold_id found; run validate_model first.")
+
+    market_df = load_market_ohlc(
+        timeframe=args.timeframe, symbols=sorted(preds["symbol"].unique().tolist()),
+        start_datetime_utc=preds["datetime_utc"].min().isoformat(), end_datetime_utc=None,
+    )
+    per_fold: list[dict] = []
+    if not market_df.empty:
+        for fold_id, fold_preds in preds.groupby("fold_id"):
+            res = run_historical_trade_lifecycle(
+                predictions_df=fold_preds.assign(model_id=model_id, validation_run_id=run_id),
+                market_df=market_df, model_id=f"{model_id}_fold{int(fold_id)}",
+                timeframe=args.timeframe, simulation_run_id=f"wf_{model_id}_fold{int(fold_id)}",
+                persist_artifacts=False,
+            )
+            m = res.to_summary().get("metrics", {})
+            per_fold.append({"fold_id": int(fold_id), **{k: m.get(k) for k in ["total_return", "profit_factor", "max_drawdown", "trade_count", "win_rate"]}})
+
+    fdf = pd.DataFrame(per_fold)
+    returns = pd.to_numeric(fdf["total_return"], errors="coerce").dropna() if not fdf.empty else pd.Series(dtype=float)
+    stability = {
+        "folds": int(len(fdf)),
+        "mean_return": float(returns.mean()) if len(returns) else 0.0,
+        "std_return": float(returns.std()) if len(returns) > 1 else 0.0,
+        "profitable_fold_fraction": float((returns > 0).mean()) if len(returns) else 0.0,
+        "min_fold_return": float(returns.min()) if len(returns) else 0.0,
+        "worst_fold_drawdown": float(pd.to_numeric(fdf["max_drawdown"], errors="coerce").max()) if not fdf.empty else 0.0,
+    }
+    stamp = pd.Timestamp.now(tz="UTC").strftime("%Y%m%d_%H%M%S")
+    summary_path = REPORTS_DIR / f"backtest_walkforward_summary_{model_id}_{stamp}.json"
+    summary = {
+        "mode": "walk_forward", "model_id": model_id, "validation_run_id": run_id,
+        "timeframe": args.timeframe, "per_fold": per_fold, "stability": stability,
+        "summary_path": str(summary_path), "created_at_utc": pd.Timestamp.now(tz="UTC").isoformat(),
+    }
+    summary_path.write_text(json.dumps(summary, ensure_ascii=True, indent=2), encoding="utf-8")
+    return summary
+
+
 def main():
     args = parse_args()
     ensure_project_directories()
     init_research_tables()
 
-    if args.mode == "in_sample":
+    mode = "walk_forward" if getattr(args, "walk_forward", False) else args.mode
+    if mode == "in_sample":
         summary = _run_in_sample(args)
+    elif mode == "walk_forward":
+        summary = _run_walk_forward(args)
     else:
         summary = _run_oos(args)
 
-    print(f"Backtest completed in mode={args.mode}")
+    print(f"Backtest completed in mode={mode}")
     print(f"Summary: {summary['summary_path']}")
     print(json.dumps(summary, ensure_ascii=True, indent=2))
 

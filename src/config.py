@@ -267,14 +267,31 @@ FEATURE_COLUMNS = [
     "rel_strength_vs_btc_24",
     "corr_btc_50",
     "beta_btc_50",
+    # --- Phase C (v5): multi-timeframe context (two higher TFs, closed candles only) ---
+    "htf1_rsi_14",
+    "htf1_trend_strength",
+    "htf1_volatility",
+    "htf2_rsi_14",
+    "htf2_trend_strength",
+    "htf2_volatility",
 ]
 
-FEATURE_VERSION = "v4_regime_microstructure_crossasset"
+FEATURE_VERSION = "v5_multitimeframe"
 LABEL_VERSION = "triple_barrier_tp_sl_v2"
 
 # Phase C: cross-asset context + optional external data (funding/OI/fear-greed).
 CROSS_ASSET_REFERENCE_SYMBOL = os.getenv("CROSS_ASSET_REFERENCE_SYMBOL", "BTCUSDT")
 ENABLE_CROSS_ASSET_FEATURES = _env_bool("ENABLE_CROSS_ASSET_FEATURES", True)
+
+# Phase C: multi-timeframe features. For each base timeframe, attach context from up to two
+# strictly-higher timeframes (htf1, htf2) using only CLOSED higher-TF candles (leakage-safe).
+ENABLE_MULTI_TIMEFRAME_FEATURES = _env_bool("ENABLE_MULTI_TIMEFRAME_FEATURES", True)
+HIGHER_TIMEFRAME_MAP = {
+    "15m": ["1h", "4h"],
+    "1h": ["4h", "1d"],
+    "4h": ["1d", "1w"],
+    "1d": ["1w", "1M"],
+}
 EXTERNAL_DATA_TABLE = "external_data"
 ENABLE_EXTERNAL_DATA = _env_bool("ENABLE_EXTERNAL_DATA", False)  # opt-in; requires network
 FEAR_GREED_API_URL = os.getenv("FEAR_GREED_API_URL", "https://api.alternative.me/fng/")
@@ -457,6 +474,16 @@ SHADOW_TRADES_TABLE = "shadow_trades"
 SHADOW_TRADE_EVENTS_TABLE = "shadow_trade_events"
 RECONCILIATION_EVENTS_TABLE = "reconciliation_events"
 SYSTEM_STATUS_TABLE = "system_status"
+
+# Phase D: paper degradation / quarantine thresholds (softer than the hard reject gates).
+# A model that drifts below these is paused (paper_degraded) and can recover; severe breaches
+# quarantine it. These are intentionally tighter than PAPER_MAX_DRAWDOWN / PAPER_MIN_PROFIT_FACTOR.
+PAPER_DEGRADE_MIN_TRADES = int(os.getenv("PAPER_DEGRADE_MIN_TRADES", "5"))
+PAPER_DEGRADE_DRAWDOWN = float(os.getenv("PAPER_DEGRADE_DRAWDOWN", "0.06"))
+PAPER_DEGRADE_PROFIT_FACTOR = float(os.getenv("PAPER_DEGRADE_PROFIT_FACTOR", "1.0"))
+PAPER_DEGRADE_MIN_RETURN = float(os.getenv("PAPER_DEGRADE_MIN_RETURN", "-0.02"))
+PAPER_QUARANTINE_DRAWDOWN = float(os.getenv("PAPER_QUARANTINE_DRAWDOWN", "0.10"))
+PAPER_QUARANTINE_MIN_RETURN = float(os.getenv("PAPER_QUARANTINE_MIN_RETURN", "-0.05"))
 
 MODEL_LIFECYCLE_STATUSES = [
     "candidate", "validation_rejected", "validation_accepted", "backtest_rejected",

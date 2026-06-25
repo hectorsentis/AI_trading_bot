@@ -582,6 +582,38 @@ def load_paper_model_metrics(limit: int = 1000) -> pd.DataFrame:
     return _num(read_table("paper_model_metrics", limit, "evaluated_at_utc"), cols)
 
 
+def load_shadow_trades(limit: int = 1000) -> pd.DataFrame:
+    if not table_exists("shadow_trades"):
+        return _empty(missing_table="shadow_trades")
+    return _num(read_table("shadow_trades", limit, "created_at_utc"), ["outcome_pnl_usdt", "requested_notional_usdt"])
+
+
+def load_shadow_analytics() -> dict[str, Any]:
+    """Allocator opportunity-cost analytics from resolved shadow trades (read-only)."""
+    df = load_shadow_trades(limit=100000)
+    if df.empty or "status" not in df.columns:
+        return {"total": 0, "open": 0, "closed": 0, "would_have_won": 0, "would_have_won_rate": 0.0,
+                "avg_outcome_pnl_usdt": 0.0, "missed_profit_usdt": 0.0, "avoided_loss_usdt": 0.0, "by_reason": {}}
+    df["outcome_pnl_usdt"] = pd.to_numeric(df.get("outcome_pnl_usdt"), errors="coerce")
+    status = df["status"].astype(str)
+    closed = df[status == "SHADOW_CLOSED"]
+    wins = closed[closed["outcome_pnl_usdt"] > 0]
+    losses = closed[closed["outcome_pnl_usdt"] < 0]
+    n_closed = int(len(closed))
+    reasons = df["reason"].fillna("unknown") if "reason" in df.columns else pd.Series(dtype=str)
+    return {
+        "total": int(len(df)),
+        "open": int((status == "SHADOW_OPEN").sum()),
+        "closed": n_closed,
+        "would_have_won": int(len(wins)),
+        "would_have_won_rate": float(len(wins) / n_closed) if n_closed else 0.0,
+        "avg_outcome_pnl_usdt": float(closed["outcome_pnl_usdt"].mean()) if n_closed else 0.0,
+        "missed_profit_usdt": float(wins["outcome_pnl_usdt"].sum()) if len(wins) else 0.0,
+        "avoided_loss_usdt": float(losses["outcome_pnl_usdt"].sum()) if len(losses) else 0.0,
+        "by_reason": {str(k): int(v) for k, v in reasons.value_counts().to_dict().items()},
+    }
+
+
 def load_model_control() -> pd.DataFrame:
     return _num(read_table("model_control", 5000, "updated_at_utc"), ["signal_enabled", "paper_enabled", "live_enabled"])
 

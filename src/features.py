@@ -90,6 +90,40 @@ def _attach_cross_asset_features(df: pd.DataFrame, context: pd.DataFrame | None)
     return df
 
 
+# Neutral values used when a higher timeframe's data is unavailable.
+_HTF_NEUTRAL = {"rsi_14": 50.0, "trend_strength": 0.0, "volatility": 0.0}
+
+
+def _attach_higher_timeframe_features(df: pd.DataFrame, higher_timeframes: dict | None) -> pd.DataFrame:
+    """Attach context from up to two higher timeframes (htf1, htf2) via leakage-safe as-of merge.
+
+    ``higher_timeframes`` maps the slot label (``"htf1"``/``"htf2"``) to a frame with an
+    ``available_at`` column (the higher-TF candle's CLOSE time) plus the slot's feature columns
+    (``{slot}_rsi_14``, ``{slot}_trend_strength``, ``{slot}_volatility``). Each base row only sees
+    higher-TF candles that have already closed at or before its timestamp. Missing slots fall back
+    to neutral constants.
+    """
+    higher_timeframes = higher_timeframes or {}
+    for slot in ("htf1", "htf2"):
+        cols = [f"{slot}_rsi_14", f"{slot}_trend_strength", f"{slot}_volatility"]
+        frame = higher_timeframes.get(slot)
+        if frame is None or getattr(frame, "empty", True) or "available_at" not in getattr(frame, "columns", []):
+            for c in cols:
+                df[c] = _HTF_NEUTRAL[c.split(f"{slot}_", 1)[1]]
+            continue
+        m = frame.dropna(subset=["available_at"]).sort_values("available_at")
+        merged = pd.merge_asof(
+            df[["datetime_utc"]].sort_values("datetime_utc"),
+            m,
+            left_on="datetime_utc",
+            right_on="available_at",
+            direction="backward",
+        )
+        for c in cols:
+            df[c] = merged[c].to_numpy() if c in merged.columns else _HTF_NEUTRAL[c.split(f"{slot}_", 1)[1]]
+    return df
+
+
 def _compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     delta = close.diff()
     gain = delta.clip(lower=0).rolling(period, min_periods=period).mean()
@@ -100,7 +134,11 @@ def _compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     return rsi
 
 
-def compute_features(prices_df: pd.DataFrame, context: pd.DataFrame | None = None) -> pd.DataFrame:
+def compute_features(
+    prices_df: pd.DataFrame,
+    context: pd.DataFrame | None = None,
+    higher_timeframes: dict | None = None,
+) -> pd.DataFrame:
     if prices_df.empty:
         return prices_df
 
@@ -325,6 +363,9 @@ def compute_features(prices_df: pd.DataFrame, context: pd.DataFrame | None = Non
 
     # ===== Phase C (v4): cross-asset BTC context (leakage-safe as-of) =====
     df = _attach_cross_asset_features(df, context)
+
+    # ===== Phase C (v5): multi-timeframe context (closed higher-TF candles only) =====
+    df = _attach_higher_timeframe_features(df, higher_timeframes)
 
     df["fwd_return_1"] = close.shift(-1) / close - 1.0
     df["fwd_return_horizon"] = close.shift(-LOOKAHEAD_BARS) / close - 1.0

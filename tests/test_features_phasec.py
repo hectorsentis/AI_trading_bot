@@ -61,6 +61,30 @@ def test_cross_asset_neutral_without_context():
     assert (out["beta_btc_50"] == 1.0).all()
 
 
+def test_multi_timeframe_features_present_and_leakage_safe():
+    df = _ohlcv(n=300)
+    # htf1 (1h) candles with available_at = close time; htf2 absent -> neutral.
+    hn = 80
+    ht = pd.date_range("2025-01-01", periods=hn, freq="1h", tz="UTC")
+    htf1 = pd.DataFrame({
+        "available_at": ht + pd.Timedelta(hours=1),
+        "htf1_rsi_14": np.linspace(40, 60, hn),
+        "htf1_trend_strength": np.linspace(-0.1, 0.1, hn),
+        "htf1_volatility": np.linspace(0.005, 0.02, hn),
+    })
+    out = compute_features(df, higher_timeframes={"htf1": htf1})
+    assert {"htf1_rsi_14", "htf1_trend_strength", "htf1_volatility"} <= set(out.columns)
+    # htf2 absent -> neutral constants.
+    assert (out["htf2_rsi_14"] == 50.0).all()
+    assert (out["htf2_trend_strength"] == 0.0).all()
+    # Each base row only sees higher-TF candles already closed at or before its timestamp.
+    merged = out[["datetime_utc", "htf1_rsi_14"]].dropna()
+    for _, r in merged.tail(20).iterrows():
+        eligible = htf1[htf1["available_at"] <= r["datetime_utc"]]
+        if not eligible.empty:
+            assert abs(r["htf1_rsi_14"] - eligible.iloc[-1]["htf1_rsi_14"]) < 1e-9
+
+
 def test_features_are_leakage_safe():
     df = _ohlcv()
     ctx = _context()

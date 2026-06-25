@@ -17,10 +17,9 @@
   **opt-in and off by default** (`ENABLE_EXTERNAL_DATA=false`; ingestion needs network) and is not
   yet folded into the training `FEATURE_COLUMNS` contract. No order book or news.
 
-## Current features (v4 — Phase C)
+## Current features (v5 — Phase C complete)
 
-**76 features** (`FEATURE_VERSION = v4_regime_microstructure_crossasset`, `config.py`), computed
-in `features.py`:
+**82 features** (`FEATURE_VERSION = v5_multitimeframe`, `config.py`), computed in `features.py`:
 
 - **Core (v3):** returns, range/spread, volatility/ATR, volume, moving-average distance & slope,
   MACD, Bollinger, stochastic, price-action/breakouts, candlestick patterns, statistics/z-scores,
@@ -32,6 +31,9 @@ in `features.py`:
   `taker_imbalance_zscore_20`, `avg_trade_size_zscore_20` (neutral fallback if taker columns absent).
 - **v4 cross-asset BTC context:** `btc_ret_24`, `rel_strength_vs_btc_24`, `corr_btc_50`,
   `beta_btc_50` (leakage-safe backward as-of merge of the reference close; neutral if absent).
+- **v5 multi-timeframe:** `htf1_*` / `htf2_*` (`rsi_14`, `trend_strength`, `volatility`) from the
+  two strictly-higher timeframes in `HIGHER_TIMEFRAME_MAP`, attached via backward as-of on the
+  higher-TF **close** time (only closed candles); neutral when that timeframe isn't ingested.
 
 v4 is additive over v3, so existing v3 models keep working; run `feature_store --full-rebuild` to
 populate the new columns before training v4 models. The [`initial_roadmap`](initial_roadmap)

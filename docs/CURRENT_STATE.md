@@ -28,11 +28,14 @@ This is a code-grounded snapshot. It distinguishes what runs today from what the
 - **Model:** `LGBMClassifier`, `objective=multiclass`, 3 classes SHORT/FLAT/LONG. Labels are
   `triple_barrier_tp_sl_v2` (TP = 1.5x ATR, SL = 1.0x ATR, lookahead 6 bars).
   See `config.py:262-278` (MODEL_PARAMS) and `labels.py`.
-- **Features (Phase C, v4):** **76 features** including volatility/regime/momentum,
-  microstructure from taker data, and leakage-safe cross-asset BTC context. A leakage-safe
-  external-data layer (`external_data.py`: funding/OI/fear-greed) exists but is opt-in
-  (`ENABLE_EXTERNAL_DATA=false`) and not yet in the training contract. Multi-timeframe features
-  remain. See [DATA_AND_FEATURES.md](DATA_AND_FEATURES.md).
+- **Features (Phase C complete, v5):** **82 features** — volatility/regime/momentum,
+  microstructure from taker data, leakage-safe cross-asset BTC context, and **multi-timeframe**
+  (two higher TFs via close-time as-of). A leakage-safe external-data layer (`external_data.py`:
+  funding/OI/fear-greed) exists but is opt-in (`ENABLE_EXTERNAL_DATA=false`) and not in the default
+  training contract by design. See [DATA_AND_FEATURES.md](DATA_AND_FEATURES.md).
+- **Phase D complete:** model degradation/quarantine lifecycle, shadow-trade outcome analytics,
+  walk-forward stability mode, and CI. A `preflight.py` readiness check + `docs/LIVE_PAPER_RUN.md`
+  prepare the 3-day local Binance-testnet paper run (15m/1h/4h).
 - **Prediction distribution (Phase B native models):** `train._train_native_models` now trains
   LightGBM expected-return regression, quantile (q05…q95) and MFE/MAE regressors, stored in the
   artifact under `native_models`. `prediction_engine.build_structured_prediction` prefers these

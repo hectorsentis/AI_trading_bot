@@ -26,16 +26,56 @@ from config import (
     TIMEFRAME,
     TIMEFRAMES,
     MODEL_EVALUATION_INTERVAL_SECONDS,
+    PAPER_DEGRADE_MIN_TRADES,
+    PAPER_DEGRADE_DRAWDOWN,
+    PAPER_DEGRADE_PROFIT_FACTOR,
+    PAPER_DEGRADE_MIN_RETURN,
+    PAPER_QUARANTINE_DRAWDOWN,
+    PAPER_QUARANTINE_MIN_RETURN,
 )
 from db_utils import init_research_tables
 from runtime_status import record_event, update_status
 from model_registry import (
     get_model_by_id,
     list_paper_active_models,
+    list_paper_degraded_models,
     mark_model_paper_rejected,
     mark_model_paper_validated,
+    mark_model_paper_degraded,
+    mark_model_quarantined,
+    reactivate_paper_model,
     mark_model_real_ready,
 )
+
+
+def assess_lifecycle(metrics: dict) -> str:
+    """Map paper metrics to a lifecycle decision (Phase D).
+
+    Returns one of: ``pass`` (validate + real-ready), ``fail`` (hard reject),
+    ``quarantine`` (severe degradation, stop), ``degrade`` (soft pause, recoverable),
+    or ``hold`` (insufficient evidence; leave as-is).
+    """
+    filled = int(metrics.get("filled_trades", 0))
+    enough = bool(metrics.get("enough_sample", False))
+    max_dd = float(metrics.get("max_drawdown", 0.0))
+    pf = float(metrics.get("profit_factor", 0.0))
+    total_return = float(metrics.get("total_return", 0.0))
+    passes = metrics.get("validation_status") == "passed"
+
+    # Severe breaches quarantine immediately (even before the full sample window).
+    if filled >= PAPER_DEGRADE_MIN_TRADES and (max_dd >= PAPER_QUARANTINE_DRAWDOWN or total_return <= PAPER_QUARANTINE_MIN_RETURN):
+        return "quarantine"
+    if enough and passes:
+        return "pass"
+    if enough and metrics.get("validation_status") == "failed":
+        return "fail"
+    if filled >= PAPER_DEGRADE_MIN_TRADES and (
+        max_dd >= PAPER_DEGRADE_DRAWDOWN
+        or pf < PAPER_DEGRADE_PROFIT_FACTOR
+        or total_return <= PAPER_DEGRADE_MIN_RETURN
+    ):
+        return "degrade"
+    return "hold"
 
 
 def _read(sql: str, params: tuple = ()) -> pd.DataFrame:
@@ -186,17 +226,47 @@ def _persist_metrics(metrics: dict, timeframe: str | None = None) -> None:
 
 def evaluate_active_models(account_mode: str | None = None, timeframe: str = TIMEFRAME) -> list[dict]:
     init_research_tables()
-    models = list_paper_active_models(timeframe=timeframe)
+    # Resolve any matured shadow trades so allocator opportunity-cost analytics stay current.
+    try:
+        from shadow_evaluator import evaluate_open_shadow_trades
+        evaluate_open_shadow_trades()
+    except Exception as exc:  # pragma: no cover - shadow resolution must never block evaluation
+        record_event("paper_model_evaluator", "warning", f"shadow evaluation failed: {exc}")
     results: list[dict] = []
-    for model in models:
+
+    # Active models: promote, reject, degrade or quarantine.
+    for model in list_paper_active_models(timeframe=timeframe):
         mode = account_mode or model.get("account_mode") or ACCOUNT_MODE_TESTNET_PAPER
         metrics = evaluate_model_paper(model["model_id"], account_mode=mode, timeframe=timeframe)
+        decision = assess_lifecycle(metrics)
+        metrics["lifecycle_decision"] = decision
         results.append(metrics)
-        if metrics["validation_status"] == "passed":
+        if decision == "pass":
             mark_model_paper_validated(model["model_id"], metrics=metrics)
             mark_model_real_ready(model["model_id"], metrics=metrics)
-        elif metrics["validation_status"] == "failed":
+        elif decision == "fail":
             mark_model_paper_rejected(model["model_id"], reason="paper_validation_failed", metrics=metrics)
+        elif decision == "quarantine":
+            mark_model_quarantined(model["model_id"], reason="paper_severe_degradation", metrics=metrics)
+            record_event("paper_model_evaluator", "warning", f"quarantined {model['model_id']}", metadata={"max_drawdown": metrics["max_drawdown"], "total_return": metrics["total_return"]})
+        elif decision == "degrade":
+            mark_model_paper_degraded(model["model_id"], reason="paper_degradation_detected", metrics=metrics)
+            record_event("paper_model_evaluator", "warning", f"degraded {model['model_id']}", metadata={"max_drawdown": metrics["max_drawdown"], "profit_factor": metrics["profit_factor"]})
+
+    # Degraded models: recover to active, quarantine if worse, else stay degraded.
+    for model in list_paper_degraded_models(timeframe=timeframe):
+        mode = account_mode or model.get("account_mode") or ACCOUNT_MODE_TESTNET_PAPER
+        metrics = evaluate_model_paper(model["model_id"], account_mode=mode, timeframe=timeframe)
+        decision = assess_lifecycle(metrics)
+        metrics["lifecycle_decision"] = f"degraded::{decision}"
+        results.append(metrics)
+        if decision in {"pass", "hold"} and metrics["max_drawdown"] < PAPER_DEGRADE_DRAWDOWN:
+            reactivate_paper_model(model["model_id"], account_mode=mode, metrics=metrics)
+            record_event("paper_model_evaluator", "info", f"recovered {model['model_id']} to paper_active")
+        elif decision == "quarantine":
+            mark_model_quarantined(model["model_id"], reason="degraded_then_severe", metrics=metrics)
+        elif decision == "fail":
+            mark_model_paper_rejected(model["model_id"], reason="degraded_then_failed", metrics=metrics)
     return results
 
 

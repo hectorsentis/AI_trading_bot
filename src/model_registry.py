@@ -434,6 +434,30 @@ def mark_model_real_ready(model_id: str, metrics: Optional[dict] = None) -> None
     update_model_status(model_id, "real_ready", reason="paper_validated_real_ready", metadata=metrics or {})
 
 
+def mark_model_paper_degraded(model_id: str, reason: str = "paper_degraded", metrics: Optional[dict] = None) -> None:
+    """Pause a degrading paper model (no new entries) but keep it recoverable."""
+    update_model_status(model_id, "paper_degraded", reason=reason, metadata=metrics or {}, is_active=False)
+
+
+def mark_model_quarantined(model_id: str, reason: str = "quarantined", metrics: Optional[dict] = None) -> None:
+    """Quarantine a model after severe degradation. Preserved for audit; not deleted."""
+    update_model_status(model_id, "quarantined", reason=reason, metadata=metrics or {}, is_active=False)
+
+
+def reactivate_paper_model(
+    model_id: str,
+    reason: str = "recovered_to_paper_active",
+    account_mode: str = ACCOUNT_MODE_TESTNET_PAPER,
+    metrics: Optional[dict] = None,
+) -> None:
+    """Return a recovered degraded model to paper_active so it can trade again."""
+    update_model_status(model_id, "paper_active", reason=reason, metadata=metrics or {}, is_active=True, account_mode=account_mode)
+
+
+def list_paper_degraded_models(timeframe: Optional[str] = None, training_scope: Optional[str] = None, symbols: Optional[list[str]] = None) -> list[dict]:
+    return list_models_by_status("paper_degraded", timeframe=timeframe, training_scope=training_scope, symbols=symbols)
+
+
 def mark_model_real_active(model_id: str, reason: str = "explicit_real_activation") -> None:
     update_model_status(model_id, "real_active", reason=reason, is_active=True)
 

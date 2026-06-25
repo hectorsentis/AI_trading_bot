@@ -1343,8 +1343,32 @@ def json_safe_value(value: Any) -> Any:
     return str(value)
 
 
+def render_shadow_analytics(st) -> None:
+    """Allocator opportunity-cost: did rejected/resized proposals (shadow trades) play out well?"""
+    try:
+        sa = data.load_shadow_analytics()
+    except Exception:
+        return
+    if not sa or int(sa.get("total", 0)) == 0:
+        return
+    with st.expander("Shadow analytics — allocator opportunity cost", expanded=False):
+        cols = st.columns(5)
+        cols[0].metric("Shadow trades", f"{sa['total']:,}")
+        cols[1].metric("Resolved", f"{sa['closed']:,}")
+        cols[2].metric("Would-have-won", f"{sa['would_have_won_rate']:.0%}")
+        cols[3].metric("Missed profit", f"${sa['missed_profit_usdt']:,.2f}")
+        cols[4].metric("Avoided loss", f"${sa['avoided_loss_usdt']:,.2f}")
+        if sa.get("by_reason"):
+            st.caption("Rejections/shadows by reason")
+            st.dataframe(
+                pd.DataFrame(sorted(sa["by_reason"].items(), key=lambda kv: -kv[1]), columns=["reason", "count"]),
+                hide_index=True, use_container_width=True,
+            )
+
+
 def render_models_tab(st, registry: pd.DataFrame, model_control: pd.DataFrame, requested_by: str, selected_models: list[str]) -> None:
     st.subheader("Model registry, metrics and safe controls")
+    render_shadow_analytics(st)
     merged = merge_model_controls(registry, model_control)
     if not merged.empty:
         merged = apply_selection_filters(merged, model_ids=selected_models)

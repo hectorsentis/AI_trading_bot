@@ -22,9 +22,11 @@ from config import (
     FEATURE_STORE_WARMUP_BARS,
     CROSS_ASSET_REFERENCE_SYMBOL,
     ENABLE_CROSS_ASSET_FEATURES,
+    ENABLE_MULTI_TIMEFRAME_FEATURES,
+    HIGHER_TIMEFRAME_MAP,
 )
 from db_utils import init_research_tables, refresh_coverage_from_table
-from features import compute_features
+from features import compute_features, _compute_rsi
 from labels import generate_triple_barrier_labels
 
 LABEL_METADATA_COLUMNS = [
@@ -199,6 +201,44 @@ def load_reference_close(timeframe: str) -> pd.DataFrame | None:
     return df.dropna(subset=["datetime_utc", "ref_close"]).sort_values("datetime_utc").reset_index(drop=True)
 
 
+def _compute_higher_tf_slot(prices_df: pd.DataFrame, slot: str, tf_delta: pd.Timedelta) -> pd.DataFrame:
+    """Compute one higher-TF slot's features, timestamped at the candle CLOSE (leakage-safe)."""
+    close = prices_df["close"].astype(float)
+    high = prices_df["high"].astype(float)
+    low = prices_df["low"].astype(float)
+    prev_close = close.shift(1)
+    true_range = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    atr = true_range.rolling(14, min_periods=14).mean()
+    ma_20 = close.rolling(20, min_periods=20).mean()
+    out = pd.DataFrame({"available_at": prices_df["datetime_utc"] + tf_delta})
+    out[f"{slot}_rsi_14"] = _compute_rsi(close, period=14).to_numpy()
+    out[f"{slot}_trend_strength"] = ((close - ma_20) / (20.0 * atr.replace(0, float("nan")))).to_numpy()
+    out[f"{slot}_volatility"] = close.pct_change().rolling(20, min_periods=20).std().to_numpy()
+    return out
+
+
+def build_higher_timeframe_context(symbol: str, base_timeframe: str) -> dict:
+    """Build htf1/htf2 context frames from strictly-higher timeframes for a base timeframe."""
+    if not ENABLE_MULTI_TIMEFRAME_FEATURES:
+        return {}
+    base_delta = timeframe_to_timedelta(base_timeframe)
+    higher = HIGHER_TIMEFRAME_MAP.get(base_timeframe, [])
+    context: dict = {}
+    for idx, htf in enumerate(higher[:2], start=1):
+        slot = f"htf{idx}"
+        try:
+            htf_delta = timeframe_to_timedelta(htf)
+        except ValueError:
+            continue
+        if htf_delta <= base_delta:
+            continue  # only strictly-higher timeframes
+        htf_prices = load_prices(symbol, htf)
+        if htf_prices.empty:
+            continue
+        context[slot] = _compute_higher_tf_slot(htf_prices, slot, htf_delta)
+    return context
+
+
 def _db_value(value):
     if pd.isna(value):
         return None
@@ -277,8 +317,9 @@ def build_feature_frame(
     tp_multiplier: float,
     sl_multiplier: float,
     context: pd.DataFrame | None = None,
+    higher_timeframes: dict | None = None,
 ) -> pd.DataFrame:
-    feature_df = compute_features(prices_df, context=context)
+    feature_df = compute_features(prices_df, context=context, higher_timeframes=higher_timeframes)
     labeled_df = generate_triple_barrier_labels(
         feature_df,
         lookahead_bars=lookahead_bars,
@@ -298,6 +339,7 @@ def run_feature_store(symbols: Iterable[str], timeframe: str, args) -> None:
     reference_context = load_reference_close(timeframe)
 
     for symbol in symbols:
+        higher_timeframes = build_higher_timeframe_context(symbol, timeframe)
         latest_feature_dt = None if args.full_rebuild else get_latest_feature_datetime(symbol, timeframe)
 
         if latest_feature_dt is None:
@@ -320,6 +362,7 @@ def run_feature_store(symbols: Iterable[str], timeframe: str, args) -> None:
             tp_multiplier=args.tp_multiplier,
             sl_multiplier=args.sl_multiplier,
             context=reference_context,
+            higher_timeframes=higher_timeframes,
         )
 
         if write_start_dt is not None:
