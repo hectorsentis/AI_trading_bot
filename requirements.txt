@@ -2,6 +2,8 @@
 numpy
 scikit-learn
 lightgbm
+xgboost
+catboost
 joblib
 requests
 streamlit

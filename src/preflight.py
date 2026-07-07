@@ -78,6 +78,23 @@ def _check_db(rep: Report) -> None:
         rep.add("db_schema", FAIL, f"schema check failed: {exc}")
 
 
+def _check_sqlite_concurrency(rep: Report) -> None:
+    # Multi-process runs need WAL + a long busy_timeout or concurrent writers hit "database is locked".
+    try:
+        conn = sqlite3.connect(str(config.DB_FILE))
+        try:
+            bt = int(conn.execute("PRAGMA busy_timeout").fetchone()[0])
+            jm = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+        finally:
+            conn.close()
+        ok = jm == "wal" and bt >= 5000
+        rep.add("sqlite_concurrency", OK if ok else FAIL,
+                f"journal_mode={jm} busy_timeout_ms={bt} (multi-process safe)" if ok
+                else f"journal_mode={jm} busy_timeout_ms={bt} — expected WAL + long timeout; set ENABLE_SQLITE_WAL=true")
+    except Exception as exc:
+        rep.add("sqlite_concurrency", WARN, f"could not verify pragmas: {exc}")
+
+
 def _check_params(rep: Report, symbols: list[str], timeframes: list[str]) -> None:
     issues = []
     for name in ["MAX_TOTAL_EXPOSURE_USDT", "MAX_DAILY_LOSS_USDT", "MAX_TRADE_LOSS_USDT", "MIN_ORDER_NOTIONAL_USDT", "MIN_CASH_RESERVE_USDT"]:
@@ -222,6 +239,7 @@ def run_preflight(symbols: list[str], timeframes: list[str]) -> Report:
     rep = Report()
     _check_safety(rep)
     _check_db(rep)
+    _check_sqlite_concurrency(rep)
     _check_params(rep, symbols, timeframes)
     _check_pipeline_imports(rep)
     _check_binance_public(rep)

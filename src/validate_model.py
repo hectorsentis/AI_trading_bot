@@ -3,6 +3,7 @@ import base64
 import json
 import sqlite3
 
+import numpy as np
 import pandas as pd
 from lightgbm import LGBMClassifier
 
@@ -41,7 +42,7 @@ from modeling_utils import (
 )
 from labels import compute_native_regression_targets
 from prediction_engine import assemble_native_fields
-from train import _train_native_models, _fit_probability_calibrator
+from train import _train_native_models, _fit_probability_calibrator, instantiate_classifier, _family_base_params
 from strategy_evaluator import evaluate_model_acceptance
 from temporal_utils import apply_label_embargo_cutoff
 from historical_trade_simulator import load_market_ohlc, run_historical_trade_lifecycle
@@ -116,13 +117,14 @@ def parse_args():
         "--model-params-b64",
         type=str,
         default=None,
-        help="Base64-encoded JSON object for LightGBM params (PowerShell-safe alternative).",
+        help="Base64-encoded JSON object for model params (PowerShell-safe alternative).",
     )
+    parser.add_argument("--model-family", default="lgbm", help="Classifier family (must match training).")
     return parser.parse_args()
 
 
-def _resolve_model_params(model_params_json: str | None, model_params_b64: str | None) -> dict:
-    params = dict(MODEL_PARAMS)
+def _resolve_model_params(model_params_json: str | None, model_params_b64: str | None, family: str = "lgbm") -> dict:
+    params = _family_base_params(family)
     payload = model_params_json
     if model_params_b64:
         payload = base64.b64decode(model_params_b64.encode("utf-8")).decode("utf-8")
@@ -130,6 +132,8 @@ def _resolve_model_params(model_params_json: str | None, model_params_b64: str |
     if not payload:
         return params
     overrides = json.loads(payload)
+    if isinstance(overrides, dict):
+        overrides = {k: v for k, v in overrides.items() if k != "model_family"}
     if not isinstance(overrides, dict):
         raise ValueError("--model-params-json must decode to a JSON object.")
     params.update(overrides)
@@ -269,7 +273,8 @@ def main():
 
     model_id, model_entry = _resolve_model_for_validation(args.model_id, args.timeframe, symbols)
     validation_run_id = args.validation_run_id or f"{model_id}_wf_{pd.Timestamp.now(tz='UTC').strftime('%Y%m%d_%H%M%S')}"
-    model_params = _resolve_model_params(args.model_params_json, args.model_params_b64)
+    family = (getattr(args, "model_family", None) or "lgbm").lower()
+    model_params = _resolve_model_params(args.model_params_json, args.model_params_b64, family=family)
     short_threshold = float(args.short_threshold) if args.short_threshold is not None else float(SHORT_THRESHOLD)
     long_threshold = float(args.long_threshold) if args.long_threshold is not None else float(LONG_THRESHOLD)
 
@@ -320,13 +325,13 @@ def main():
         if not has_min_classes(train_df["label_class"], 2):
             continue
 
-        model = LGBMClassifier(**model_params)
+        model = instantiate_classifier(family, model_params)
         model.fit(train_df[feature_cols], train_df["label_class"])
 
         # Per-fold calibrator + native models, trained only on this fold's train slice (no leakage,
         # no mixing with the final artifact). Falls back gracefully when disabled or insufficient.
         calibrator = (
-            _fit_probability_calibrator(train_df[feature_cols], train_df["label_class"], model_params)
+            _fit_probability_calibrator(train_df[feature_cols], train_df["label_class"], model_params, family=family)
             if ENABLE_PROBABILITY_CALIBRATION
             else None
         )
@@ -343,8 +348,8 @@ def main():
         )
 
         y_true = test_df["label_class"].values
-        y_pred = model.predict(test_df[feature_cols])
-        probas = model.predict_proba(test_df[feature_cols])  # raw, for diagnostics below
+        y_pred = np.asarray(model.predict(test_df[feature_cols])).ravel()
+        probas = predict_class_probabilities({"model": model}, test_df[feature_cols])  # canonical 3-col
         signal_position = probabilities_to_signal(
             probas=probas,
             short_threshold=short_threshold,

@@ -1,5 +1,32 @@
 # UI / control-panel specification (Phase G)
 
+Detailed Phase G design foundation:
+
+- [ui/CONTROL_PANEL_DESIGN_MODEL.md](ui/CONTROL_PANEL_DESIGN_MODEL.md)
+- [ui/MAIN_COCKPIT_WIREFRAME.md](ui/MAIN_COCKPIT_WIREFRAME.md)
+- [ui/COMPONENT_MODEL.md](ui/COMPONENT_MODEL.md)
+- [ui/VISUAL_SYSTEM.md](ui/VISUAL_SYSTEM.md)
+- [ui/DATA_CONTRACTS.md](ui/DATA_CONTRACTS.md)
+- [ui/IMPLEMENTATION_PLAN.md](ui/IMPLEMENTATION_PLAN.md)
+
+Detailed Phase G design foundation:
+
+- [ui/CONTROL_PANEL_DESIGN_MODEL.md](ui/CONTROL_PANEL_DESIGN_MODEL.md)
+- [ui/MAIN_COCKPIT_WIREFRAME.md](ui/MAIN_COCKPIT_WIREFRAME.md)
+- [ui/COMPONENT_MODEL.md](ui/COMPONENT_MODEL.md)
+- [ui/VISUAL_SYSTEM.md](ui/VISUAL_SYSTEM.md)
+- [ui/DATA_CONTRACTS.md](ui/DATA_CONTRACTS.md)
+- [ui/IMPLEMENTATION_PLAN.md](ui/IMPLEMENTATION_PLAN.md)
+
+Detailed Phase G design foundation:
+
+- [ui/CONTROL_PANEL_DESIGN_MODEL.md](ui/CONTROL_PANEL_DESIGN_MODEL.md)
+- [ui/MAIN_COCKPIT_WIREFRAME.md](ui/MAIN_COCKPIT_WIREFRAME.md)
+- [ui/COMPONENT_MODEL.md](ui/COMPONENT_MODEL.md)
+- [ui/VISUAL_SYSTEM.md](ui/VISUAL_SYSTEM.md)
+- [ui/DATA_CONTRACTS.md](ui/DATA_CONTRACTS.md)
+- [ui/IMPLEMENTATION_PLAN.md](ui/IMPLEMENTATION_PLAN.md)
+
 Goal: replace the current read-mostly Streamlit report with a **real, user-oriented operations
 control panel** — the thing the operator actually runs the bot from. It must feel like an
 internal trading-ops console, not a toy app.

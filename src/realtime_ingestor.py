@@ -42,8 +42,25 @@ def main():
     if not args.loop:
         print(json.dumps(run_once_many(symbols, timeframes, args.recent_bars), ensure_ascii=True, indent=2))
         return
+
+    # Resilient loop: a transient error (DB contention, network blip) must not kill ingestion.
+    try:
+        from runtime_status import record_event, update_status
+    except Exception:  # pragma: no cover - status is best-effort
+        record_event = update_status = None
+
     while True:
-        print(json.dumps(run_once_many(symbols, timeframes, args.recent_bars), ensure_ascii=True, indent=2))
+        try:
+            result = run_once_many(symbols, timeframes, args.recent_bars)
+            print(json.dumps(result, ensure_ascii=True, indent=2), flush=True)
+            if update_status:
+                update_status("realtime_ingestor", "running", message="ingested latest candles", metadata={"timeframes": timeframes})
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            print(json.dumps({"component": "realtime_ingestor", "error": str(exc)}, ensure_ascii=True), flush=True)
+            if record_event:
+                record_event("realtime_ingestor", "error", str(exc))
         time.sleep(max(1, int(args.poll_seconds)))
 
 

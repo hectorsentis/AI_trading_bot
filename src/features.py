@@ -120,7 +120,10 @@ def _attach_higher_timeframe_features(df: pd.DataFrame, higher_timeframes: dict 
             direction="backward",
         )
         for c in cols:
-            df[c] = merged[c].to_numpy() if c in merged.columns else _HTF_NEUTRAL[c.split(f"{slot}_", 1)[1]]
+            neutral = _HTF_NEUTRAL[c.split(f"{slot}_", 1)[1]]
+            # Rows before the first closed higher-TF candle (partial/missing higher-TF coverage)
+            # get the neutral value, not NaN — otherwise they'd be dropped from training entirely.
+            df[c] = pd.Series(merged[c]).fillna(neutral).to_numpy() if c in merged.columns else neutral
     return df
 
 

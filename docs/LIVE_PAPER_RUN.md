@@ -19,19 +19,28 @@ SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT
 TIMEFRAMES=15m,1h,4h
 ```
 
-## 1. One-time preparation
+## 1. One click does everything
+
+`.tools/run.cmd` → `autonomous_runner` now **bootstraps automatically** before starting: it
+downloads/backfills history, gap-checks, and rebuilds the feature store to the current version for
+every symbol×timeframe (idempotent — skips work that's already current), then launches the
+services (ingestor, paper trading-bot, model maintenance → trains a diverse model pool, evaluator,
+dashboard). So the minimal path is literally:
 
 ```powershell
-# DB schema
-python src/db_utils.py --init --check-schema
+.tools\install.cmd   # first time only: venv, .env, schema
+.tools\run.cmd       # bootstraps data + features, then runs everything
+```
 
-# Backfill history for all three timeframes (training needs history)
+The manual steps below are optional (run them yourself if you prefer, or to prepare faster before
+launch). Use `--no-bootstrap` on `autonomous_runner` to skip the bootstrap when data is ready.
+
+```powershell
+# Optional explicit preparation (otherwise the runner does this on start):
+python src/db_utils.py --init --check-schema
 python src/download_data.py --symbols BTCUSDT ETHUSDT SOLUSDT --timeframe 15m --mode full
 python src/download_data.py --symbols BTCUSDT ETHUSDT SOLUSDT --timeframe 1h  --mode full
 python src/download_data.py --symbols BTCUSDT ETHUSDT SOLUSDT --timeframe 4h  --mode full
-
-# Build the feature store at the CURRENT feature version (full rebuild — the feature set was
-# expanded to v5; older rows must be repopulated so models can train on the full contract)
 python src/feature_store.py --symbols BTCUSDT ETHUSDT SOLUSDT --timeframes 15m 1h 4h --full-rebuild
 ```
 
@@ -88,6 +97,20 @@ Get-Content logs\services\trading_bot.log -Tail 40
 sqlite3 data\db\market_data.sqlite "SELECT status, COUNT(*) FROM model_registry GROUP BY status;"
 sqlite3 data\db\market_data.sqlite "SELECT model_id, account_mode, status, realized_pnl_usdt FROM trades ORDER BY updated_at_utc DESC LIMIT 20;"
 ```
+
+## Troubleshooting
+
+**`sqlite3.OperationalError: database is locked`** (seen in the first run): the runner drives 5
+processes against one SQLite file. Fixed by running SQLite in **WAL** journal mode with a **60s
+busy_timeout**, installed process-wide in `config.py` for every connection (`SQLITE_BUSY_TIMEOUT_MS`,
+`ENABLE_SQLITE_WAL`). The ingestor loop is also now resilient (a transient error is logged and the
+loop continues instead of crashing). Preflight verifies this via the `sqlite_concurrency` check.
+WAL creates `market_data.sqlite-wal` / `-shm` sidecar files next to the DB — keep them with it.
+
+**"No valid model found for timeframe=…"** early on is expected: the pool is empty until
+`model_maintenance` trains and *accepts* candidates. The bot logs it and keeps looping. If it
+persists, models are being trained but rejected by the acceptance gates (check
+`model_maintenance.log` and `model_registry`); loosen gates only deliberately.
 
 ## Notes & honest expectations
 

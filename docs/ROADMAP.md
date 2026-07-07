@@ -152,12 +152,19 @@ Goal: defense-in-depth, full test coverage, hardened attack surface. See [SECURI
 ## Phase G — Full UI / control-panel rebuild (mandatory before real money)
 Goal: a real operator control panel, not a report. See [UI_SPEC.md](UI_SPEC.md).
 
-- [ ] Operator-first IA covering the 13 sections; answers running/safe/connected/capital/
-  winners/open/failed/action-needed at a glance.
+Design status (2026-06-25): the Phase G product model, cockpit wireframe, component model,
+visual system, data contracts, implementation sequence, and acceptance criteria are complete
+under `docs/ui/`. Runtime implementation remains pending. ADR 0004 now recommends the hybrid
+Streamlit-to-FastAPI/Next.js transition.
+
+- [~] Operator-first IA covering the 13 sections; design model, cockpit wireframe, component
+  model, visual system, data contracts, and acceptance criteria are complete under `docs/ui/`.
+  Runtime implementation remains pending.
 - [ ] Real, audited, re-auth-gated controls (pause/resume/quarantine/archive, disable entries,
   shadow-only, manual close with confirmation, kill switch). Live trading never a casual button.
 - [ ] Live data from Phase-A persisted snapshots; UTC + units + color semantics; no raw JSON.
-- [ ] ADR on Streamlit-harden vs web-stack migration ([DECISIONS/0004-ui-stack-choice.md](DECISIONS/0004-ui-stack-choice.md)).
+- [x] ADR on Streamlit hardening vs FastAPI + Next.js and hybrid migration
+  ([DECISIONS/0004-ui-stack-choice.md](DECISIONS/0004-ui-stack-choice.md)).
 
 ---
 

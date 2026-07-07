@@ -41,6 +41,7 @@ from config import (
     PROBABILITY_CALIBRATION_METHOD,
     PROBABILITY_CALIBRATION_CV,
     PROBABILITY_CALIBRATION_MIN_ROWS,
+    MODEL_FAMILY_PARAMS,
 )
 from labels import compute_native_regression_targets
 from db_utils import init_research_tables, ensure_project_directories
@@ -49,7 +50,39 @@ from modeling_utils import (
     classification_metrics,
     compute_economic_metrics,
     probabilities_to_signal,
+    predict_class_probabilities,
 )
+
+
+def instantiate_classifier(family: str, params: dict):
+    """Factory for a sklearn-compatible classifier by family. Lazy imports keep optional
+    dependencies (xgboost/catboost) out of the import path when a family isn't used."""
+    fam = (family or "lgbm").lower()
+    if fam == "lgbm":
+        return LGBMClassifier(**params)
+    if fam in ("xgb", "xgboost"):
+        from xgboost import XGBClassifier
+        return XGBClassifier(**params)
+    if fam in ("catboost", "cat"):
+        from catboost import CatBoostClassifier
+        return CatBoostClassifier(**params)
+    if fam in ("rf", "random_forest", "randomforest"):
+        from sklearn.ensemble import RandomForestClassifier
+        return RandomForestClassifier(**params)
+    if fam in ("et", "extra_trees", "extratrees"):
+        from sklearn.ensemble import ExtraTreesClassifier
+        return ExtraTreesClassifier(**params)
+    if fam in ("lr", "logreg", "logistic"):
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import StandardScaler
+        # Scale-sensitive; wrap in a pipeline that still exposes predict_proba/classes_.
+        return Pipeline([("scaler", StandardScaler()), ("clf", LogisticRegression(**params))])
+    raise ValueError(f"Unknown model family: {family}")
+
+
+def _family_base_params(family: str) -> dict:
+    return dict(MODEL_FAMILY_PARAMS.get((family or "lgbm").lower(), MODEL_PARAMS))
 from strategy_evaluator import evaluate_model_acceptance
 from temporal_utils import apply_label_embargo_cutoff, strict_train_validation_split
 
@@ -79,7 +112,12 @@ def parse_args():
         "--model-params-b64",
         type=str,
         default=None,
-        help="Base64-encoded JSON object for LightGBM params (PowerShell-safe alternative).",
+        help="Base64-encoded JSON object for model params (PowerShell-safe alternative).",
+    )
+    parser.add_argument(
+        "--model-family",
+        default="lgbm",
+        help="Classifier family: lgbm | xgb | catboost | rf | et | lr. Base params come from MODEL_FAMILY_PARAMS.",
     )
     return parser.parse_args()
 
@@ -88,8 +126,8 @@ def _normalize_training_scope(raw: str) -> str:
     return (raw or "multi_symbol").replace("-", "_")
 
 
-def _resolve_model_params(model_params_json: str | None, model_params_b64: str | None) -> dict:
-    params = dict(MODEL_PARAMS)
+def _resolve_model_params(model_params_json: str | None, model_params_b64: str | None, family: str = "lgbm") -> dict:
+    params = _family_base_params(family)
     payload = model_params_json
     if model_params_b64:
         payload = base64.b64decode(model_params_b64.encode("utf-8")).decode("utf-8")
@@ -97,6 +135,9 @@ def _resolve_model_params(model_params_json: str | None, model_params_b64: str |
     if not payload:
         return params
     overrides = json.loads(payload)
+    # A stray 'model_family' key may ride along in the overrides payload; it is not a hyperparam.
+    if isinstance(overrides, dict):
+        overrides = {k: v for k, v in overrides.items() if k != "model_family"}
     if not isinstance(overrides, dict):
         raise ValueError("--model-params-json must decode to a JSON object.")
     params.update(overrides)
@@ -200,6 +241,7 @@ def _calibrate_thresholds(
     timeframe: str,
     user_short_threshold: float | None,
     user_long_threshold: float | None,
+    family: str = "lgbm",
 ) -> tuple[float, float, dict]:
     default_short = float(user_short_threshold) if user_short_threshold is not None else float(SHORT_THRESHOLD)
     default_long = float(user_long_threshold) if user_long_threshold is not None else float(LONG_THRESHOLD)
@@ -228,11 +270,11 @@ def _calibrate_thresholds(
             "calibration_rows": int(len(calib_df)),
         }
 
-    tmp_model = LGBMClassifier(**model_params)
+    tmp_model = instantiate_classifier(family, model_params)
     tmp_model.fit(fit_df[feature_cols], fit_df["label_class"])
-    probas = tmp_model.predict_proba(calib_df[feature_cols])
+    probas = predict_class_probabilities({"model": tmp_model}, calib_df[feature_cols])
 
-    grid = [0.34, 0.38, 0.42, 0.46, 0.50, 0.55, 0.60, 0.65]
+    grid = [0.30, 0.34, 0.38, 0.42, 0.46, 0.50, 0.55, 0.60]
     best = {
         "short_threshold": default_short,
         "long_threshold": default_long,
@@ -351,7 +393,7 @@ def _train_native_models(
     }
 
 
-def _fit_probability_calibrator(X_train, y_train, model_params: dict):
+def _fit_probability_calibrator(X_train, y_train, model_params: dict, family: str = "lgbm"):
     """Fit a calibrated multiclass classifier so reported probabilities are trustworthy.
 
     Uses internal cross-validated calibration (no leakage). Returns ``None`` (and the system
@@ -364,8 +406,8 @@ def _fit_probability_calibrator(X_train, y_train, model_params: dict):
     if len(X_train) < int(PROBABILITY_CALIBRATION_MIN_ROWS) or not _has_all_classes(y_train):
         return None
     for kwargs in (
-        {"estimator": LGBMClassifier(**model_params)},
-        {"base_estimator": LGBMClassifier(**model_params)},
+        {"estimator": instantiate_classifier(family, model_params)},
+        {"base_estimator": instantiate_classifier(family, model_params)},
     ):
         try:
             calibrator = CalibratedClassifierCV(
@@ -408,7 +450,8 @@ def train_one_scope(args, symbols: list[str], model_id_override: str | None = No
     X_test = test_df[feature_cols]
     y_test = test_df["label_class"]
 
-    model_params = _resolve_model_params(args.model_params_json, args.model_params_b64)
+    family = (getattr(args, "model_family", None) or "lgbm").lower()
+    model_params = _resolve_model_params(args.model_params_json, args.model_params_b64, family=family)
     short_threshold, long_threshold, threshold_calibration = _calibrate_thresholds(
         train_df=train_df,
         feature_cols=feature_cols,
@@ -416,6 +459,7 @@ def train_one_scope(args, symbols: list[str], model_id_override: str | None = No
         timeframe=args.timeframe,
         user_short_threshold=args.short_threshold,
         user_long_threshold=args.long_threshold,
+        family=family,
     )
     if not _has_min_classes(y_train, 2):
         raise ValueError(
@@ -423,7 +467,7 @@ def train_one_scope(args, symbols: list[str], model_id_override: str | None = No
             "refusing to train a brittle model."
         )
 
-    model = LGBMClassifier(**model_params)
+    model = instantiate_classifier(family, model_params)
     model.fit(X_train, y_train)
 
     native_models = None
@@ -435,10 +479,12 @@ def train_one_scope(args, symbols: list[str], model_id_override: str | None = No
             horizon=int(NATIVE_PREDICTION_HORIZON_BARS),
         )
 
-    calibrator = _fit_probability_calibrator(X_train, y_train, model_params)
+    calibrator = _fit_probability_calibrator(X_train, y_train, model_params, family=family)
 
-    y_pred = model.predict(X_test)
-    probas = model.predict_proba(X_test)
+    # Canonical [SHORT, FLAT, LONG] probabilities regardless of family/classes_ ordering.
+    import numpy as _np
+    y_pred = _np.asarray(model.predict(X_test)).ravel()
+    probas = predict_class_probabilities({"model": model}, X_test)
     signal_position = probabilities_to_signal(
         probas=probas,
         short_threshold=short_threshold,
@@ -462,7 +508,7 @@ def train_one_scope(args, symbols: list[str], model_id_override: str | None = No
         model_id = args.model_id
     else:
         scope_tag = "multi" if training_scope == "multi_symbol" else included_symbols[0].lower()
-        model_id = f"lgbm_{scope_tag}_{args.timeframe}_{training_ts.strftime('%Y%m%d_%H%M%S')}"
+        model_id = f"{family}_{scope_tag}_{args.timeframe}_{training_ts.strftime('%Y%m%d_%H%M%S')}"
     model_path = MODELS_DIR / f"{model_id}.joblib"
 
     artifact = {
@@ -479,6 +525,7 @@ def train_one_scope(args, symbols: list[str], model_id_override: str | None = No
         "short_threshold": short_threshold,
         "feature_version": FEATURE_VERSION,
         "label_version": LABEL_VERSION,
+        "model_family": family,
         "model_params": model_params,
         "label_policy": {
             "type": "atr_triple_barrier_with_mandatory_entry_tp_sl",
@@ -568,6 +615,7 @@ def train_one_scope(args, symbols: list[str], model_id_override: str | None = No
         model_path=str(model_path),
         metrics={"holdout": metrics},
         params={
+            "model_family": family,
             "model_params": model_params,
             "short_threshold": short_threshold,
             "long_threshold": long_threshold,

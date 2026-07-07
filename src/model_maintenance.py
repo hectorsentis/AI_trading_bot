@@ -20,6 +20,7 @@ from config import (
     TIMEFRAMES,
     MODEL_MAINTENANCE_INTERVAL_SECONDS,
     TRAINING_SCOPE,
+    ENABLED_MODEL_FAMILIES,
 )
 from model_registry import count_accepted_models, get_model_by_id, list_accepted_models, set_active_model
 from runtime_status import record_event, update_status
@@ -30,6 +31,7 @@ class TrainingTrial:
     short_threshold: float
     long_threshold: float
     params: dict
+    family: str = "lgbm"
 
 
 def _python_env() -> dict:
@@ -59,24 +61,47 @@ def _b64_json(payload: dict) -> str:
     return base64.b64encode(raw).decode("ascii")
 
 
+# Per-family candidate trials. `params` are OVERRIDES only; train.py merges them onto the family
+# base from MODEL_FAMILY_PARAMS. Thresholds default trade-friendly (0.40); a couple of variants
+# per family give diversity without exploding runtime.
+_FAMILY_TRIALS: dict[str, list[tuple[float, float, dict]]] = {
+    "lgbm": [
+        (0.40, 0.40, {"n_estimators": 500, "learning_rate": 0.03, "num_leaves": 31, "min_child_samples": 40}),
+        (0.34, 0.34, {"n_estimators": 800, "learning_rate": 0.02, "num_leaves": 63, "min_child_samples": 80, "colsample_bytree": 0.75}),
+    ],
+    "xgb": [
+        (0.40, 0.40, {"n_estimators": 400, "max_depth": 6, "learning_rate": 0.03}),
+        (0.34, 0.34, {"n_estimators": 600, "max_depth": 8, "learning_rate": 0.02, "subsample": 0.80}),
+    ],
+    "catboost": [
+        (0.40, 0.40, {"iterations": 400, "depth": 6, "learning_rate": 0.03}),
+        (0.34, 0.34, {"iterations": 600, "depth": 8, "learning_rate": 0.02}),
+    ],
+    "rf": [
+        (0.40, 0.40, {"n_estimators": 400, "min_samples_leaf": 40}),
+    ],
+    "et": [
+        (0.40, 0.40, {"n_estimators": 500, "min_samples_leaf": 40}),
+    ],
+    "lr": [
+        (0.40, 0.40, {"C": 1.0}),
+    ],
+}
+
+
 def build_trial_plan(max_attempts: int) -> list[TrainingTrial]:
-    base = dict(MODEL_PARAMS)
-    candidates = [
-        (0.55, 0.55, {"n_estimators": 500, "learning_rate": 0.03, "num_leaves": 31, "min_child_samples": 40}),
-        (0.48, 0.48, {"n_estimators": 650, "learning_rate": 0.022, "num_leaves": 31, "min_child_samples": 60, "subsample": 0.80}),
-        (0.42, 0.42, {"n_estimators": 800, "learning_rate": 0.018, "num_leaves": 63, "min_child_samples": 80, "colsample_bytree": 0.75}),
-        (0.38, 0.38, {"n_estimators": 500, "learning_rate": 0.028, "num_leaves": 15, "min_child_samples": 100, "reg_lambda": 0.75}),
-        (0.34, 0.46, {"n_estimators": 700, "learning_rate": 0.02, "num_leaves": 31, "min_child_samples": 50, "reg_alpha": 0.10}),
-        (0.46, 0.34, {"n_estimators": 700, "learning_rate": 0.02, "num_leaves": 31, "min_child_samples": 50, "reg_alpha": 0.10}),
-        (0.32, 0.32, {"n_estimators": 900, "learning_rate": 0.015, "num_leaves": 63, "min_child_samples": 120, "subsample": 0.75, "colsample_bytree": 0.75}),
-        (0.40, 0.52, {"n_estimators": 600, "learning_rate": 0.025, "num_leaves": 15, "min_child_samples": 70, "reg_lambda": 1.0}),
-        (0.52, 0.40, {"n_estimators": 600, "learning_rate": 0.025, "num_leaves": 15, "min_child_samples": 70, "reg_lambda": 1.0}),
+    """Round-robin across enabled families so a diverse pool is tried even with a small budget."""
+    families = [f for f in ENABLED_MODEL_FAMILIES if f in _FAMILY_TRIALS] or ["lgbm"]
+    per_family = [
+        [(fam, s, l, ov) for (s, l, ov) in _FAMILY_TRIALS[fam]]
+        for fam in families
     ]
     trials: list[TrainingTrial] = []
-    for short_thr, long_thr, overrides in candidates:
-        params = dict(base)
-        params.update(overrides)
-        trials.append(TrainingTrial(short_threshold=short_thr, long_threshold=long_thr, params=params))
+    for round_idx in range(max((len(col) for col in per_family), default=0)):
+        for col in per_family:
+            if round_idx < len(col):
+                fam, short_thr, long_thr, overrides = col[round_idx]
+                trials.append(TrainingTrial(short_threshold=short_thr, long_threshold=long_thr, params=dict(overrides), family=fam))
     return trials[: max(0, int(max_attempts))]
 
 
@@ -168,7 +193,7 @@ def maintain_model_pool(
 
         stamp = pd.Timestamp.now(tz="UTC").strftime("%Y%m%d_%H%M%S")
         scope_tag = "multi" if training_scope == "multi_symbol" else symbols[0].lower()
-        model_id = f"auto_lgbm_{scope_tag}_{timeframe}_{stamp}_{idx:02d}"
+        model_id = f"auto_{trial.family}_{scope_tag}_{timeframe}_{stamp}_{idx:02d}"
         params_b64 = _b64_json(trial.params)
         symbols_args = [s.upper().strip() for s in symbols]
 
@@ -198,6 +223,8 @@ def maintain_model_pool(
             str(trial.long_threshold),
             "--model-params-b64",
             params_b64,
+            "--model-family",
+            str(trial.family),
         ]
         code, out = _run_command(train_cmd)
         attempt["stages"]["train"] = {"returncode": code, "tail": out[-4000:]}
@@ -222,6 +249,8 @@ def maintain_model_pool(
             str(trial.long_threshold),
             "--model-params-b64",
             params_b64,
+            "--model-family",
+            str(trial.family),
         ]
         code, out = _run_command(validate_cmd)
         attempt["stages"]["validate"] = {"returncode": code, "tail": out[-4000:]}

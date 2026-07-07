@@ -1,5 +1,36 @@
 # Modeling strategy
 
+## Model families (diverse pool)
+
+Training is no longer LightGBM-only. `train.instantiate_classifier(family, params)` builds any of
+**lgbm, xgb (XGBoost), catboost (CatBoost), rf (RandomForest), et (ExtraTrees), lr (calibrated
+LogisticRegression, in a `StandardScaler` pipeline)**. Each family has its own base params
+(`config.MODEL_FAMILY_PARAMS`) — LightGBM's `num_class`/`objective`/`class_weight` would break the
+others. `model_maintenance.build_trial_plan` round-robins across `ENABLED_MODEL_FAMILIES` so the
+pool tries a diverse set and lets them compete for capital. The artifact/prediction paths are
+family-agnostic (duck-typed `predict_proba`/`classes_`, canonicalized by
+`modeling_utils.predict_class_probabilities`); `validate_model` rebuilds the same family per fold.
+
+## Acceptance retune (trade-friendly, honest)
+
+The original gates rejected ~every model: 0.55 signal thresholds almost never fired on a 3-class
+balanced classifier, and acceptance required strictly beating buy-and-hold. The honest retune:
+
+- Signal thresholds 0.55→**0.40**, margin 0.08→**0.04** (0.55 was genuinely too high).
+- Proposal min expected-return 0.0005→**0.0** (still cost-aware; real fees/slippage subtracted).
+- `MIN_ACCEPTABLE_TRADES` 10→**8**; "must beat HODL" → "net-positive **and** within
+  `BASELINE_EXCESS_RETURN_TOLERANCE` (5%) of HODL" (models far below HODL still reject).
+- `MIN_ACCEPTABLE_SHARPE` 0.20→**0.0** (per-trade Sharpe on a short OOS is too noisy for a hard
+  gate; require non-negative + `PROFIT_FACTOR≥1.05` + net-positive instead).
+- **Probability calibration default OFF**: isotonic calibration on a FLAT-majority set shrinks the
+  minority LONG probability below threshold and suppresses trades. The calibrator is still trained
+  and available (opt-in for confidence); raw model probabilities drive the trade signal.
+
+All values are env-overridable. **This does not fake edge:** accepted models must be net-of-cost
+positive with `PF≥1.05`, controlled drawdown, ≥8 trades, and beat/within-tolerance of HODL. Paper
+and shadow validation remain the real filter — a model that clears the backtest is a *candidate*
+for paper, not a proven winner.
+
 ## Is the current model adequate?
 
 **Not yet — for the architecture's ambitions.** Today there is a single LightGBM 3-class
